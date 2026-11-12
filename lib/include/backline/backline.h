@@ -228,6 +228,60 @@ int bl_clock_link(bl_client *c, bool enable);
 int bl_clock_timecode(bl_client *c, bool ltc, const char *mode, double fps, const char *target, const char *source);
 int bl_clock_get(bl_client *c, bl_clock_status *st);
 
+/* ---------------------------------------------------------------- Control1 */
+/* docs/api/Control1.md: OSC and MIDI mapped to any parameter. */
+typedef struct bl_map_options {
+	double min, max;            /* output range (has_min / has_max) */
+	bool has_min, has_max, invert;
+	double in_min, in_max;      /* OSC input range (has_in) */
+	bool has_in;
+	const char *const *args;    /* recorder:arm sources, recorder:marker name */
+	size_t n_args;
+	const char *id;             /* NULL: the service picks one */
+} bl_map_options;
+#define BL_MAP_OPTIONS_INIT { 0, 0, false, false, false, 0, 1, false, NULL, 0, NULL }
+
+/* source: midi:cc:CH:NUM, midi:note:CH:KEY, midi:pitchbend:CH,
+ * midi:program:CH, osc:/ADDRESS. target: instance:NODE/PARAM,
+ * transport:play|stop|toggle|tempo|locate:POS, recorder:arm|record|stop|marker,
+ * volume:NODE, mute:NODE, control:NODE/NAME. */
+int bl_control_map(bl_client *c, const char *source, const char *target, const bl_map_options *o, char *id, size_t n);
+int bl_control_add_json(bl_client *c, const char *json, char *id, size_t n);
+int bl_control_remove(bl_client *c, const char *id);
+/* JSON, schema backline.control/1; release with bl_free. */
+int bl_control_mappings(bl_client *c, char **json);
+/* Learns the next MIDI or OSC input for target and waits for it (timeout_s:
+ * 0 = 30 s). from: "midi", "osc" or NULL for either. Returns -ETIMEDOUT
+ * if nothing came. */
+int bl_control_learn(bl_client *c, const char *target, const bl_map_options *o, const char *from, unsigned timeout_s,
+		     char *id, size_t id_size, char *source, size_t source_size);
+int bl_control_cancel_learn(bl_client *c);
+
+typedef struct bl_listen_options {
+	const char *const *allow;   /* CIDRs; required for a non-loopback address */
+	size_t n_allow;
+	const char *secret;         /* TCP: required for a non-loopback address */
+	bool insecure_udp;          /* UDP on a non-loopback address */
+	unsigned max_rate, max_clients, max_size; /* 0: the defaults */
+} bl_listen_options;
+#define BL_LISTEN_OPTIONS_INIT { NULL, 0, NULL, false, 0, 0, 0 }
+/* proto "udp" or "tcp"; address a literal IP; port 0 picks one. id is
+ * "udp:127.0.0.1:9000". */
+int bl_control_listen(bl_client *c, const char *proto, const char *address, uint16_t port, const bl_listen_options *o,
+		      char *id, size_t n);
+int bl_control_unlisten(bl_client *c, const char *id);
+int bl_control_set_midi_follow(bl_client *c, const char *regex);
+int bl_control_save(bl_client *c, char *path, size_t n);
+
+typedef struct bl_control_status {
+	uint32_t mappings;
+	char learning[600], midi_follow[256], node[128], config_dir[600];
+	char listeners[8][128];
+	size_t n_listeners;
+	uint64_t received, midi_events, rejected, auth_failures, malformed, dispatched, target_errors;
+} bl_control_status;
+int bl_control_get_status(bl_client *c, bl_control_status *st);
+
 /* --------------------------------------------------------------- helpers */
 /* The worker's bus name for a node name (non-alphanumerics become '_'). */
 void bl_bus_name_for_node(const char *node, char *out, size_t n);

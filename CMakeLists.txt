@@ -150,11 +150,11 @@ add_executable(backline-hostd hostd/hostd.c)
 target_link_libraries(backline-hostd PRIVATE bl_hostd_policy PkgConfig::SYSTEMD PkgConfig::JSONC)
 
 # libbackline: the MIT C client library (D-Bus only), and the backline CLI.
-add_library(backline SHARED lib/backline.c lib/services.c)
+add_library(backline SHARED lib/backline.c lib/services.c lib/control.c)
 set_target_properties(backline PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 0 C_VISIBILITY_PRESET default)
 target_include_directories(backline PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/lib/include> $<INSTALL_INTERFACE:include>)
 target_link_libraries(backline PRIVATE PkgConfig::SYSTEMD)
-add_executable(backline-cli cli/backline.c cli/services.c)
+add_executable(backline-cli cli/backline.c cli/services.c cli/control.c)
 set_target_properties(backline-cli PROPERTIES OUTPUT_NAME backline)
 target_link_libraries(backline-cli PRIVATE backline PkgConfig::JSONC)
 
@@ -192,6 +192,12 @@ if(BACKLINE_CLOCK)
 endif()
 
 # Plugin registry: sandboxed probes, grades, cache, D-Bus query service.
+# Control service: OSC and MIDI to any parameter (control/).
+option(BACKLINE_CONTROL "Build the control service (OSC and MIDI mapping)" ON)
+if(BACKLINE_CONTROL)
+  add_subdirectory(control)
+endif()
+
 option(BACKLINE_REGISTRY "Build the plugin registry" ON)
 if(BACKLINE_REGISTRY)
   add_subdirectory(registry)
@@ -210,6 +216,9 @@ if(TARGET backline-registry)
 endif()
 if(TARGET backline-clockd)
   list(APPEND _svcs Clock)
+endif()
+if(TARGET backline-controld)
+  list(APPEND _svcs Control)
 endif()
 foreach(svc ${_svcs})
   configure_file(data/dbus/io.github.manuaudio.Backline.${svc}.service.in

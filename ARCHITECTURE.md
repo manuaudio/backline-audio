@@ -70,7 +70,7 @@ effect-insert component.
 | `backline-recorderd` | Records any set of nodes to sample-aligned, timestamped multitrack WAV/BWF (RF64 past 4 GB) or FLAC; virtual soundcheck | C | **Built and measured** (§4.2, §4.6, §4.7): `Recorder1`, markers, takes, input-latency compensation, stall-proof disk thread, soundcheck |
 | `backline-playerd` | Plays files into the graph, locked to the shared timeline | C | Design |
 | `backline-clockd` | Transport, tempo and timecode: the PipeWire timeline owner, Ableton Link, LTC/MTC generation and chase | C++ (Link is C++) | **Built and measured** (§4.8): `Clock1`, LTC/MTC to the sample, Link |
-| `backline-controld` | Maps OSC and MIDI to any parameter in the system: Backline instances, filter-chain/clap-pipewire controls, volumes, transport | C | Design (the worker already speaks OSC) |
+| `backline-controld` | Maps OSC and MIDI to any parameter in the system: Backline instances, filter-chain/clap-pipewire controls, volumes, transport, recorder | C | **Built and measured** (§4.9): `Control1`, MIDI and OSC learn, no socket unless asked, allow-lists and TCP secrets |
 | `libbackline` + `backline` CLI + `Backline` QML module | The client surface for apps and Omarchy panels | C (lib), C (CLI), C++/QML (module) | Library skeleton and CLI built (host, instance, plugins, rec); QML is design |
 | clap-pipewire (separate project) | CLAP effects inside filter-chain: device effects and virtual sinks, in-graph | C | v0.1, separate project |
 
@@ -445,21 +445,40 @@ effect-insert component.
 
 ### 2.6 Control: `backline-controld`
 
-- **Job.** Map OSC and MIDI to *any* parameter in the system:
-  - Backline instance params, via their D-Bus or OSC;
-  - filter-chain and clap-pipewire controls, via `Props` on the node;
-  - node and device volumes and mutes;
-  - transport (clockd) and recorder actions.
-- **Process model.** One daemon, all on the main loop. It has a MIDI input
-  port in PipeWire (a `pw_filter` with no realtime work: it drains into a
-  ring that main reads), an OSC server (UDP and TCP), and a map file
-  (`$XDG_CONFIG_HOME/backline/control/*.json`) with MIDI-learn.
-- **Security.** It's the only component that listens beyond localhost. It
-  needs an explicit bind address and an allow-list, and OSC-over-TCP with
-  a shared secret for remote surfaces.
+- **Job.** Map OSC and MIDI to *any* parameter in the system (built, §4.9):
+  - Backline instance params (`instance:NODE/PARAM`, through `Instance1`);
+  - filter-chain and clap-pipewire controls (`control:NODE/NAME`, `Props`
+    `params` on the node);
+  - node volumes and mutes (`volume:NODE`, `mute:NODE`: the node's
+    `channelVolumes` and `mute`, the same gain `wpctl` and the mixer set);
+  - transport (`transport:play|stop|toggle|tempo|locate:POS`, `Clock1`) and
+    recorder actions (`recorder:arm|record|stop|marker`, `Recorder1`).
+- **Process model.** One daemon, all on the main loop. One PipeWire node
+  (`backline.control`, `Midi/Sink`) with a MIDI input port; its process
+  callback only copies MIDI 1.0 (or UMP, converted) into a wait-free ring and
+  wakes main. MIDI sources reach it through `SetMidiFollow(regex)`, as with
+  the worker. OSC listeners (UDP, and TCP with OSC 1.0 size-prefix framing)
+  are sources on the same loop. Mappings live in
+  `$XDG_CONFIG_HOME/backline/control/*.json` (`backline.control/1`); `Save`
+  writes `control.json`. MIDI and OSC learn (`Learn`, signal `Learned`).
+- **Delivery.** D-Bus targets are called asynchronously; while a mapping's
+  call is in flight, newer values replace each other and only the latest is
+  sent, so a fast fader can't queue up a backlog. An instance parameter's
+  range is read once with `ListParams`.
+- **Security** ([Control1.md](docs/api/Control1.md#security)). It's the only
+  component that can listen beyond localhost, so: **no network socket at all
+  by default** (not even loopback); listeners only by config or `Listen`, on
+  a literal IP (no host names, no wildcards); beyond loopback an allow-list
+  is required, TCP needs a shared secret (`/backline/auth` first, constant-time
+  compare, 30 s block after 3 failures), UDP needs an explicit
+  `insecure-udp`; the network can only move existing mappings (nothing
+  received creates or changes one); per-peer rate limits, size limits,
+  client limits; whole-packet validation before use.
 - **Reuse.**
-  - liblo (LGPL) for OSC servers.
-  - The worker's OSC codec is enough for the localhost endpoints.
+  - Its own OSC codec (`control/osc.c`, bundles included) and network policy
+    (`control/policy.c`), unit-tested with malformed and random packets:
+    liblo would have been a new dependency, and owning the sockets keeps the
+    security rules in one small file.
   - mididings (GPL) only as a design reference for mapping rules.
 - **Omarchy.** Nothing directly.
 
@@ -522,7 +541,7 @@ effect-insert component.
 | Transport | PipeWire `spa_io_position` segment + pipewire-jack transport | Already the shared timeline |
 | Tempo sync | Ableton Link | GPL: stays in clockd |
 | LTC | libltc | |
-| OSC | liblo for servers; a 150-line codec in the worker | |
+| OSC | small codecs of our own: the worker's (localhost) and controld's (bundles, TCP framing, unit-tested) | liblo would be a new dependency for what the codecs already do |
 | D-Bus | sd-bus (libsystemd) | Already on every systemd box |
 | Process isolation | systemd transient user units and scopes | cgroup cleanup, limits, coredumps |
 
@@ -777,6 +796,44 @@ test node in one `node.group` driven by a test sink.
   Link timeline stays within 0.63 ms (two ticks) while rolling, excluding the one cycle in
   which a tempo change was still crossing the network.
 
+### 4.9 Control (`tests/controld-proof`)
+
+In its own network namespace (only loopback and three test addresses, so no
+listener can reach a real network), on a private bus, against throwaway
+nodes, with a watchdog that stops the proof if any of its nodes is linked to a
+non-Backline node. Full report in `docs/proofs/controld-proof.txt`.
+
+- **Nothing listens by default.** With an empty config controld has no
+  network socket. Eight unsafe listeners are refused with their reason:
+  `0.0.0.0`, `::`, a host name, a LAN address without an allow-list, UDP
+  without `insecure-udp`, TCP without a secret, a short secret, a secret on
+  UDP.
+- **MIDI CC → plugin parameter.** A virtual keyboard through PipeWire's MIDI
+  bridge, CC 7 → Surge XT "Global Volume" in its worker: the value reads
+  back exactly (CC 100 → 0.787402 = 100/127), the level for each CC equals
+  the level the same value gives over D-Bus (worst 0.00 dB), keyboard send to
+  controld's main loop about 2 ms, `SetParam` answered in 0.1-0.2 ms, send to
+  sound 5-7 ms.
+- **OSC → transport, recorder.** Play, locate to 10 s, tempo, stop over UDP;
+  toggle twice over TCP with a secret; arm, record, marker and stop of
+  recorderd (the take has the marker). controld to clockd answered in
+  about 0.1-0.2 ms.
+- **Volume and mute** of a throwaway sink, re the tone's own level: CC 64 →
+  −29.764 dB, CC 100 → −12.756 dB, OSC 0.5 on a −40..0 range → −20.000 dB,
+  each exact to 0.001 dB; CC 0 and mute are digital silence; unmute restores
+  −20.000 dB. `wpctl` (what the mixer reads) shows the same volume.
+- **Learn.** The first CC moved and the first OSC address sent became
+  mappings that work; a learn with nothing coming times out.
+- **Security, 10 cases.** A wrong secret gets `/backline/auth 0` and is
+  closed; a mapped message before authenticating is closed and does nothing;
+  a peer off the allow-list is dropped over TCP and UDP even with the right
+  secret; a malformed packet is counted and does nothing; a flood of 2 000
+  messages to a 100 msg/s listener gets 100 through; OSC messages that look
+  like management (`/backline/map`, …) change nothing; after 3 wrong secrets
+  an address is refused even with the right one, while another allowed
+  address still gets in. `Save` writes mode 0600; a restart restores the same
+  mappings and listeners; no socket is left after exit.
+
 ## 5. Build order
 
 1. **Host supervisor and client skeleton.** *Done (§4.3).*
@@ -810,8 +867,11 @@ test node in one `node.group` driven by a test sink.
      (Surge XT's LV2 has only two control ports), saving LV2/CLAP presets,
      GUIs last.
 6. **Player.** Files on the timeline, chasing clockd.
-7. **Control service.** OSC and MIDI mapping across Backline, filter-chain
-   controls and volumes, with MIDI-learn.
+7. **Control service.** *Done (§4.9)*: OSC and MIDI mapping across
+   Backline, filter-chain controls and volumes, with MIDI and OSC learn.
+   - Still open: OSC replies (a surface reading values back), relative
+     encoders and 14-bit CC pairs, and `Clock1.Tempo` reading the anchor
+     while the transport is stopped (today it shows the last rolled tempo).
 8. **Omarchy PRs**, each one problem with measured evidence, in this order:
    - "Record this app or device" (a panel action over `backline rec`);
    - "Play a system instrument from any MIDI keyboard" (an instrument

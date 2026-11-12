@@ -79,9 +79,10 @@ See [omarchy/README.md](omarchy/README.md) (panels, commands, menu, hotkeys, ins
 | `backline-recorder` | N nodes into one take: WAV float/24-bit (RF64 past 4 GB) or FLAC, BWF `bext`, markers as cue points, a sidecar with UTC, monotonic and graph timestamps. Signal alignment across driver and follower sinks, input-latency compensation, pre-roll | Built, measured |
 | `backline-recorderd` | The recorder as a D-Bus service ([`Recorder1`](docs/api/Recorder1.md)): arm, record, stop, markers, takes, a disk thread behind large rings, and virtual soundcheck (a take played back as its inputs, switched per input) | Built, measured |
 | `backline-clockd` | Transport, tempo and meter as PipeWire's position segment ([`Clock1`](docs/api/Clock1.md)), LTC and MTC generate and chase, Ableton Link (in its own process: Link is GPL) | Built, measured |
-| `libbackline` | The MIT C client library (sd-bus only, no PipeWire dependency): `Host1`, `Instance1`, `Registry1`, `Recorder1` and `Clock1` calls and a signal watcher | Skeleton, used by the CLI |
+| `backline-controld` | OSC and MIDI mapped to any parameter ([`Control1`](docs/api/Control1.md)): plugin parameters, volumes and mutes, filter-chain controls, transport and recorder; MIDI and OSC learn. Opens no network socket unless asked; beyond localhost it needs an allow-list, and TCP a shared secret | Built, measured |
+| `libbackline` | The MIT C client library (sd-bus only, no PipeWire dependency): `Host1`, `Instance1`, `Registry1`, `Recorder1`, `Clock1` and `Control1` calls and a signal watcher | Skeleton, used by the CLI |
 | `backline` | The command line over `libbackline`; `--json` on every command | Built |
-| Player, control mapping, QML module | Playing files on the timeline, OSC/MIDI mapping | Design only ([ARCHITECTURE.md](ARCHITECTURE.md)) |
+| Player, QML module | Playing files on the timeline | Design only ([ARCHITECTURE.md](ARCHITECTURE.md)) |
 
 In-graph CLAP effects (a plugin inside PipeWire's filter-chain, for device
 effects) are a separate project,
@@ -157,17 +158,20 @@ in [`docs/proofs/`](docs/proofs/).
 | [`recorderd-proof`](docs/proofs/recorderd-proof.txt) | The D-Bus recorder: API and markers; input-latency compensation with fake devices of known latency; 12 s and 8 s disk stalls during a 40 s take; virtual soundcheck and a crash while switched | Each track lines up by exactly its latency. 0 frames lost to the stalls (every frame equals an unstalled reference). Playback bit-exact and in lockstep; links restored, even after SIGKILL |
 | [`rf64-proof`](docs/proofs/rf64-proof.txt) | A live 16-channel take of 1460 s (4.2 GiB in one file), with an independent second recorder | A valid RF64 file (ds64 sizes match), every frame there, bext and cue markers intact, 0 ring overruns; continuity is only as good as the graph's scheduling (see the report) |
 | [`rescan-proof`](docs/proofs/rescan-proof.txt) | The shipped rescan units verified; the same watch as a transient unit over throwaway plugin directories | An install, a pacman-style stamp and a removal each rescan once, ≈ 2.1 s after the change |
+| [`controld-proof`](docs/proofs/controld-proof.txt) | MIDI CC and OSC to a plugin parameter, the transport, the recorder, a sink's volume and mute; MIDI and OSC learn; the network rules, in its own network namespace | No socket by default; 8 unsafe listeners refused. A CC lands on exactly the value D-Bus would set (0.00 dB apart), 5-7 ms from keyboard to sound. Volume exact to 0.001 dB. Wrong secrets, peers off the allow-list, malformed packets and floods change nothing |
 | [`clockd-proof`](docs/proofs/clockd-proof.txt) | Transport and bar seen by a native PipeWire node; LTC/MTC generate and chase (25, 29.97 DF, 24, 30 fps), through a sink monitor and a jump; Link with a second peer | Frames and bar exact to the tick. LTC/MTC frame starts within 2 samples (0 at 25/30 fps); chase locked in 37-75 ms with 0 samples of error. Link: tempo both ways, beat phase within 0.63 ms |
 
 ```sh
 tests/host-proof; tests/hostd-proof; tests/formats-proof; tests/registry-proof; tests/recorder-proof
-tests/recorderd-proof; tests/rf64-proof; tests/clockd-proof; tests/rescan-proof
+tests/recorderd-proof; tests/rf64-proof; tests/clockd-proof; tests/rescan-proof; tests/controld-proof
 ```
 
 The proofs need a running PipeWire (≥ 1.4) with WirePlumber, a systemd user
 session, `pw-cli`, `pw-play`, `pw-record`, `jq`, `busctl`, `python3` and
-`metaflac`. `host-proof` and `hostd-proof` also need Surge XT (CLAP) in
-`~/.clap` or `/usr/lib/clap`. `formats-proof` needs Surge XT (CLAP, VST3),
+`metaflac`. `host-proof`, `hostd-proof` and `controld-proof` also need Surge
+XT (CLAP) in `~/.clap` or `/usr/lib/clap`; `controld-proof` and
+`clockd-proof` run in their own user and network namespace (`unshare -rn`,
+`ip`, `ss`). `formats-proof` needs Surge XT (CLAP, VST3),
 Dexed, Dragonfly Hall Reverb (VST3), Odin2, CHOW Tape Model and Cardinal
 (LV2) in the user plugin directories.
 

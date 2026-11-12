@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+# controld-proof: the control service (docs/api/Control1.md), measured.
+#
+#  1. Nothing listens by default: controld starts with an empty config and
+#     opens no network socket. Every listener the security rules refuse is
+#     refused, with its reason, and still nothing listens.
+#  2. MIDI CC -> a hosted plugin parameter. A virtual keyboard (an ALSA
+#     sequencer client, like a USB keyboard) reaches controld through
+#     PipeWire's MIDI bridge (controld links it itself, --midi-follow). CC 7
+#     moves Surge XT's "Global Volume" in its own worker process; the worker
+#     plays a held note into a throwaway sink that is recorded. Measured: the
+#     value read back, the level change, and CC-to-sound latency.
+#  3. OSC -> transport on clockd: play, locate, tempo, stop over UDP on
+#     loopback, and play/stop over TCP with a secret on a non-loopback
+#     address. Clock1 properties checked after each.
+#  4. OSC -> recorder: arm, record, marker, stop on recorderd; the take and
+#     its marker are checked.
+#  5. MIDI CC and OSC -> volume and mute of a throwaway sink (what the mixer
+#     sets): the level on the sink's monitor follows to the hundredth of a dB.
+#  6. MIDI learn and OSC learn.
+#  7. Security: a wrong TCP secret, a message before authentication, a peer
+#     off the allow-list (UDP and TCP), a malformed packet, a flood over the
+#     rate limit, blocking after repeated failures, and that nothing received
+#     over the network can create a mapping. Then Save, a restart from the
+#     saved file, and no socket left when controld exits.
+#
+# Throwaway: own network namespace (only loopback plus test addresses
+# 10.77.0.1, 10.77.0.2 and 10.88.0.5 on it, so no listener can reach a real
+# network), a private D-Bus, null sinks owned by this script with
+# object.linger = false, explicit links only, and a watchdog that stops the
+# proof if any of its nodes is ever linked to a node that isn't Backline's.
+set -euo pipefail
+if [[ -z ${BL_CTL_NS:-} ]]; then
+  BL_CTL_NS=1 exec unshare -rn bash -c 'ip link set lo up && for a in 10.77.0.1/24 10.77.0.2/24 10.88.0.5/24; do ip addr add $a dev lo; done && exec dbus-run-session -- "$0" "$@"' "$0" "$@"
+fi
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+out=$here/out/controld
+rm -rf "$out"; mkdir -p "$out"/{config,data,takes}
+exec > >(tee "$out/report.txt") 2>&1
+CTL=; WD=
+cleanup() {
+  [[ -n $CTL ]] && kill "$CTL" 2>/dev/null
+  bl_cleanup
+  kill ${BL_WATCH:-} ${WD:-} 2>/dev/null || true
+  wait 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+want() { [[ " ${SECTIONS:-1 2 3 4 5 6 7} " == *" $1 "* ]]; }
+C=(io.github.manuaudio.Backline.Control /io/github/manuaudio/Backline/Control io.github.manuaudio.Backline.Control1)
+K=(io.github.manuaudio.Backline.Clock /io/github/manuaudio/Backline/Clock io.github.manuaudio.Backline.Clock1)
+R=(io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder io.github.manuaudio.Backline.Recorder1)
+ctl() { busctl --user call -- "${C[@]}" "$@"; }
+cprop() { busctl --user get-property "${C[@]}" "$1" | cut -d' ' -f2-; }
+kprop() { busctl --user get-property "${K[@]}" "$1" | cut -d' ' -f2-; }
+rprop() { busctl --user get-property "${R[@]}" "$1" | cut -d' ' -f2-; }
+osc() { python3 -I "$here/oscclient.py" "$@"; }
+BL="$BL_BIN/backline"
+sockets() { # controld's inet sockets (the worker and clockd have their own loopback OSC ports)
+  { ss -Hlunp; ss -Hltnp; } 2>/dev/null | grep 'backline-contro' | awk '{print $1, $4}' | sed 's/^UNCONN/udp/; s/^LISTEN/tcp/' | sort | tr '\n' ';' || true
+}
+all_sockets() { { ss -Hlunp; ss -Hltnp; } 2>/dev/null | wc -l; }
+wait_log() { for _ in $(seq 200); do grep -q "$2" "$1" 2>/dev/null && return 0; sleep 0.05; done; echo "timed out waiting for '$2' in $1"; return 1; }
+start_controld() { # extra args...
+  "$BL_BIN/control/backline-controld" --verbose --name backline.ctl-control --idle-exit 0 "$@" 2>>"$out/controld.log" &
+  CTL=$!
+  for _ in $(seq 100); do busctl --user status io.github.manuaudio.Backline.Control >/dev/null 2>&1 && break; sleep 0.05; done
+}
+ensure_clockd() { # clockd in the test group, driven by backline-test.ctl-clk
+  busctl --user status io.github.manuaudio.Backline.Clock >/dev/null 2>&1 && return 0
+  PIPEWIRE_PROPS='{ node.group = backline-test.ctl-clock }' "$BL_BIN/clock/backline-clockd" --name backline-test.ctl-clockd 2>>"$out/clockd.log" &
+  BL_PIDS+=($!)
+  for _ in $(seq 100); do busctl --user status io.github.manuaudio.Backline.Clock >/dev/null 2>&1 && break; sleep 0.05; done
+  sleep 0.3
+}
+stop_controld() { kill "$CTL"; wait "$CTL" 2>/dev/null || true; CTL=; }
+
+echo "== controld-proof $(date -Is)"
+echo "pipewire $(pipewire --version | sed -n 's/.*libpipewire \(.*\)/\1/p' | tail -1), kernel $(uname -r), load $(cut -d' ' -f1-3 /proc/loadavg)"
+echo "network: $(ip -br a | tr -s ' ' | tr '\n' ' ')(own namespace)"
+default_before=$(bl_default_sink); source_before=$(bl_default_source)
+pw_pids_before="$(pidof pipewire) / $(pidof wireplumber)"
+bl_foreign_nodes >"$out/nodes-before.txt"
+bl_watch_defaults "$default_before" "$source_before" "$out/defaults-moved.txt"
+echo "default sink: $default_before; other nodes: $(wc -l <"$out/nodes-before.txt")"
+
+# The leak watchdog: a link from one of this proof's nodes to a node that
+# isn't Backline's (a real device, another app) stops everything at once.
+( while sleep 0.3; do
+    l=$(pw-dump 2>/dev/null | jq -r '
+      ([.[] | select(.type=="PipeWire:Interface:Node") | {key: (.id|tostring), value: (.info.props["node.name"] // "")}] | from_entries) as $n
+      | .[] | select(.type=="PipeWire:Interface:Link")
+      | [$n[(.info["output-node-id"]|tostring)] // "?", $n[(.info["input-node-id"]|tostring)] // "?"]
+      | select((.[0] | test("^backline(-test)?\\.ctl")) and (.[1] | test("^backline") | not)
+            or (.[1] | test("^backline(-test)?\\.ctl")) and ((.[0] | test("^backline")) or .[0] == "Midi-Bridge" | not))
+      | join(" -> ")' 2>/dev/null)
+    if [[ -n $l ]]; then echo "LEAK: $l" >>"$out/leaks.txt"; kill -TERM $$; exit; fi
+  done ) &
+WD=$!
+
+# Throwaway sinks, one pw-cli holds them. ctl-sink: the instrument plays here
+# (recorded). ctl-vol: the volume target (its monitor applies the channel
+# volumes, like a real device's output does). ctl-clk: drives the clock's
+# test group.
+{ printf '%s\n' \
+  'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.ctl-sink media.class = Audio/Sink audio.position = [ FL FR ] audio.rate = 48000 object.linger = false priority.session = 1 monitor.channel-volumes = false node.virtual = true }' \
+  'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.ctl-vol media.class = Audio/Sink audio.position = [ FL FR ] audio.rate = 48000 object.linger = false priority.session = 1 monitor.channel-volumes = true node.virtual = true }' \
+  'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.ctl-clk media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true node.group = backline-test.ctl-clock }'
+  exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+BL_PIDS+=($!)
+for n in backline-test.ctl-sink backline-test.ctl-vol backline-test.ctl-clk; do bl_wait_node $n; done
+
+########################################################################## 1
+echo; echo "-- 1. nothing listens by default; refused listeners"
+echo "  inet sockets in the namespace before controld: $(all_sockets)"
+start_controld --config-dir "$out/config" --midi-follow '^Midi-Bridge:backline-test-ctlkbd'
+wait_log "$out/controld.log" "on the session bus"
+echo "  controld: $(grep 'on the session bus' "$out/controld.log" | sed 's/^backline-controld: //')"
+s1=$(sockets)
+echo "  sockets with controld running and an empty config: '${s1}'"
+refuse() { local what=$1; shift; echo "  $what: $(busctl --user call "${C[@]}" Listen 'ssqa{sv}' "$@" 2>&1 | sed 's/^Call failed: /refused: /')"; }
+refuse "UDP on the wildcard 0.0.0.0" udp 0.0.0.0 9000 0
+refuse "UDP on the wildcard ::" udp :: 9000 0
+refuse "UDP on a host name" udp localhost 9000 0
+refuse "UDP on 10.77.0.1 without an allow-list" udp 10.77.0.1 9000 0
+refuse "UDP on 10.77.0.1 with an allow-list, no insecure-udp" udp 10.77.0.1 9000 1 allow as 1 10.77.0.2/32
+refuse "TCP on 10.77.0.1 with an allow-list, no secret" tcp 10.77.0.1 9000 1 allow as 1 10.77.0.0/24
+refuse "TCP on 10.77.0.1 with a short secret" tcp 10.77.0.1 9000 2 allow as 1 10.77.0.0/24 secret s short
+refuse "a secret on UDP" udp 127.0.0.1 9000 1 secret s 0123456789abcdef0123
+s2=$(sockets)
+echo "  sockets after the refusals: '${s2}'"
+[[ -z $s1 && -z $s2 ]] && echo "  RESULT: PASS (no network socket by default; 8 of 8 unsafe listeners refused with a reason)" || echo "  RESULT: FAIL"
+
+# The listeners the rest of the proof uses.
+SECRET=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
+UDP_ID=$(ctl Listen 'ssqa{sv}' udp 127.0.0.1 0 0 | cut -d'"' -f2); UDP_PORT=${UDP_ID##*:}
+TCP_ID=$(ctl Listen 'ssqa{sv}' tcp 10.77.0.1 0 3 allow as 1 10.77.0.0/24 secret s "$SECRET" max-rate u 200 | cut -d'"' -f2); TCP_PORT=${TCP_ID##*:}
+RUDP_ID=$(ctl Listen 'ssqa{sv}' udp 10.77.0.1 0 3 allow as 1 10.77.0.2/32 insecure-udp b true max-rate u 100 | cut -d'"' -f2); RUDP_PORT=${RUDP_ID##*:}
+echo "  opened for the proof: $UDP_ID (loopback), $TCP_ID (allow 10.77.0.0/24, secret), $RUDP_ID (allow 10.77.0.2/32, insecure-udp, 100 msg/s)"
+echo "  sockets now: '$(sockets)'"
+
+########################################################################## 2
+if want 2; then
+echo; echo "-- 2. MIDI CC 7 -> Surge XT 'Global Volume' (CLAP, own process), through PipeWire's MIDI bridge"
+bl_spawn "$BL_BIN/backline-plugin-worker" -p "Surge XT" -n backline.ctl-surge -t backline-test.ctl-sink >"$out/surge.json" 2>"$out/surge.log"
+bl_wait_node backline.ctl-surge 200
+SB=$(jq -r .dbus "$out/surge.json")
+IB=(/io/github/manuaudio/Backline/Instance io.github.manuaudio.Backline.Instance1)
+ctl Map 'ssa{sv}' midi:cc:1:7 'instance:backline.ctl-surge/Global Volume' 0 >/dev/null
+busctl --user call "$SB" "${IB[@]}" SetParam sd "Global Volume" 1.0 >/dev/null
+busctl --user call "$SB" "${IB[@]}" NoteOn yyy 0 69 100
+"$BL_BIN/backline-recorder" -s backline-test.ctl-sink -o "$out" -n take-cc -d 6.5 >/dev/null 2>"$out/rec-cc.log" &
+rec=$!
+wait_log "$out/rec-cc.log" armed
+"$BL_BIN/backline-test-keyboard" --name backline-test-ctlkbd wait=1.0 cc=7,64 wait=1.0 cc=7,127 wait=1.0 cc=7,32 wait=1.0 cc=7,100 wait=1.0 \
+  >"$out/kbd-cc.jsonl" 2>"$out/kbd-cc.err"
+read_back=$(busctl --user call "$SB" "${IB[@]}" GetParam s "Global Volume" | cut -d' ' -f2)
+wait $rec
+busctl --user call "$SB" "${IB[@]}" NoteOff yy 0 69
+grep 'midi-follow' "$out/controld.log" | head -2 | sed 's/^backline-controld: /  /'
+echo "  after CC 7 = 100: Global Volume reads back $read_back (100/127 = $(python3 -I -c 'print(f"{100/127:.6f}")'))"
+python3 -I - "$here" "$out" <<'EOF'
+import glob, json, math, re, sys
+here, out = sys.argv[1], sys.argv[2]
+sys.path.insert(0, here)
+import analyze as A
+wav = glob.glob(f"{out}/take-cc-01-*.wav")[0]
+take = json.load(open(f"{out}/take-cc.json"))
+w = A.read_wav(wav); rate = w["rate"]; x = A.mono(w)
+t0 = take["start"]["monotonic_ns"]
+kbd = [json.loads(l) for l in open(f"{out}/kbd-cc.jsonl") if '"cc=' in l]
+log = open(f"{out}/controld.log").read()
+# controld's own timestamps: MIDI cycle time, arrival on main, SetParam answered
+midi = [(int(a), int(b)) for a, b in re.findall(r"midi midi:cc:1:7 [0-9.]+ \(cycle t=(\d+), main t=(\d+)\)", log)]
+done = [float(d) for d in re.findall(r"midi:cc:1:7 -> instance:\S+ Volume: done in ([0-9.]+) ms", log)]
+lv = lambda a, b: A.db(A.rms(x[max(0, a):b]))
+print(f"  {'CC':>4} {'value':>7} {'level before':>12} {'level after':>11} {'change':>8} {'send->main':>10} {'SetParam':>9} {'send->sound':>11}")
+rows, ok = [], True
+for i, e in enumerate(kbd):
+    v = e["b"] / 127
+    i_send = int((e["sent_ns"] - t0) * rate / 1e9)
+    before = lv(i_send - int(0.3 * rate), i_send - int(0.05 * rate))
+    after = lv(i_send + int(0.3 * rate), i_send + int(0.8 * rate))
+    prev = kbd[i - 1]["b"] / 127 if i else 1.0
+    # Surge's Global Volume is a gain in its own curve: compare with the
+    # level the same value gives when set over D-Bus (the reference column)
+    hop = rate // 1000
+    k = next((k for k in range(i_send, i_send + rate // 2, hop) if abs(lv(k, k + hop) - before) > 0.5 * abs(after - before)), None)
+    lat = (k - i_send) / rate * 1000 if k is not None else None
+    m = next(((c, mn) for c, mn in midi if c >= e["sent_ns"]), (None, None))
+    s2m = (m[1] - e["sent_ns"]) / 1e6 if m[1] else None
+    rows.append({"cc": e["b"], "value": round(v, 6), "before_dbfs": round(before, 2), "after_dbfs": round(after, 2),
+                 "change_db": round(after - before, 2), "send_to_main_ms": s2m, "setparam_ms": done[i] if i < len(done) else None,
+                 "send_to_sound_ms": lat})
+    f = lambda v, w, d: f"{v:{w}.{d}f} ms" if v is not None else f"{'?':>{w + 3}}"
+    print(f"  {e['b']:4d} {v:7.4f} {before:9.2f} dB {after:8.2f} dB {after-before:+7.2f} {f(s2m, 8, 2)} {f(done[i] if i < len(done) else None, 6, 2)} {f(lat, 8, 1)}")
+    ok &= lat is not None and abs(after - before) > 1
+json.dump(rows, open(f"{out}/result-cc.json", "w"), indent=1)
+# the level for each value must be the level Surge gives for that value
+levels = {r["cc"]: r["after_dbfs"] for r in rows}
+print(f"  levels by CC value: {levels}")
+mono = levels[32] < levels[64] < levels[100] < levels[127]
+print("  RESULT:", "PASS" if ok and mono else "FAIL", "(each CC moved the parameter; louder with every higher value; latency measured from the keyboard's send)")
+EOF
+# the same values set straight over D-Bus, as a reference for the levels
+"$BL_BIN/backline-recorder" -s backline-test.ctl-sink -o "$out" -n take-ref -d 6 >/dev/null 2>"$out/rec-ref.log" &
+rec=$!
+wait_log "$out/rec-ref.log" armed
+busctl --user call "$SB" "${IB[@]}" NoteOn yyy 0 69 100
+for v in 64 127 32 100; do sleep 1; busctl --user call "$SB" "${IB[@]}" SetParam sd "Global Volume" "$(python3 -I -c "print($v/127)")" >/dev/null; done
+sleep 0.5; wait $rec
+busctl --user call "$SB" "${IB[@]}" NoteOff yy 0 69
+python3 -I - "$here" "$out" <<'EOF'
+import glob, json, sys
+here, out = sys.argv[1], sys.argv[2]
+sys.path.insert(0, here)
+import analyze as A
+w = A.read_wav(glob.glob(f"{out}/take-ref-01-*.wav")[0]); rate = w["rate"]; x = A.mono(w)
+cc = json.load(open(f"{out}/result-cc.json"))
+ref = []
+for k, v in enumerate([64, 127, 32, 100]):
+    a = int((1.0 + k + 0.35) * rate); ref.append((v, A.db(A.rms(x[a:a + int(0.4 * rate)]))))
+d = [abs(dict(ref)[r["cc"]] - r["after_dbfs"]) for r in cc]
+print(f"  reference (same values over D-Bus SetParam): {[(v, round(l, 2)) for v, l in ref]}")
+print(f"  CC level vs D-Bus level for the same value: worst {max(d):.2f} dB")
+print("  RESULT:", "PASS" if max(d) < 0.1 else "FAIL", "(a CC lands on exactly the value D-Bus would set)")
+EOF
+fi
+
+########################################################################## 3
+if want 3; then
+echo; echo "-- 3. OSC -> transport on clockd (test group driven by a test sink)"
+ensure_clockd
+busctl --user call "${K[@]}" Stop; busctl --user call "${K[@]}" Locate s 0 >/dev/null; busctl --user call "${K[@]}" SetTempo d 100
+for m in "osc:/transport/play transport:play" "osc:/transport/stop transport:stop" "osc:/transport/ten transport:locate:tc:00:00:10:00" "osc:/transport/toggle transport:toggle"; do
+  ctl Map 'ssa{sv}' $m 0 >/dev/null; done
+ctl Map 'ssa{sv}' osc:/transport/tempo transport:tempo 2 min d 60 max d 180 >/dev/null
+step() { local what=$1; shift; "$@" >/dev/null; sleep 0.25; echo "  $what -> Rolling $(kprop Rolling), Frame $(kprop Frame), Tempo $(kprop Tempo)"; }
+step "UDP /transport/play (no argument)" osc udp 127.0.0.1 "$UDP_PORT" /transport/play
+step "UDP /transport/ten (locate tc:00:00:10:00)" osc udp 127.0.0.1 "$UDP_PORT" /transport/ten
+f_loc=$(kprop Frame)
+step "UDP /transport/tempo 0.5 (60..180 BPM)" osc udp 127.0.0.1 "$UDP_PORT" /transport/tempo 0.5
+step "UDP /transport/stop" osc udp 127.0.0.1 "$UDP_PORT" /transport/stop
+r_stop=$(kprop Rolling)
+step "TCP 10.77.0.2 -> 10.77.0.1, secret, /transport/toggle" osc tcp 10.77.0.1 "$TCP_PORT" --from 10.77.0.2 --secret "$SECRET" /transport/toggle
+r_tog1=$(kprop Rolling)
+step "TCP, secret, /transport/toggle again" osc tcp 10.77.0.1 "$TCP_PORT" --from 10.77.0.2 --secret "$SECRET" /transport/toggle
+r_tog2=$(kprop Rolling)
+tempo=$(kprop Tempo)
+grep -E 'osc:/transport/(play|stop|ten|tempo) -> .*done in' "$out/controld.log" | sed -E 's/.*(osc:\S+) -> (\S+).*done in ([0-9.]+) ms.*/\1 \2 \3/' |
+  awk '{s[$1]=$3} END {printf "  controld send -> clockd answered:"; for (k in s) printf " %s %s ms;", k, s[k]; print ""}'
+# 480000 frames = 10 s at 48 kHz, plus the 0.25 s rolled before the read
+ok=1
+[[ $r_stop == false && $r_tog1 == true && $r_tog2 == false ]] || ok=0
+python3 -I -c "import sys; f=int('$f_loc'); sys.exit(0 if 480000 <= f < 480000 + 48000 else 1)" || ok=0
+[[ $tempo == 120 ]] || ok=0
+[[ $ok == 1 ]] && echo "  RESULT: PASS (play, locate to 10 s, tempo 0.5 -> 120 BPM, stop, toggle twice over TCP with a secret)" || echo "  RESULT: FAIL"
+fi
+
+########################################################################## 4
+if want 4; then
+echo; echo "-- 4. OSC -> recorder (recorderd on the private bus)"
+XDG_DATA_HOME=$out/data "$BL_BIN/backline-recorderd" --idle-exit 0 2>"$out/recorderd.log" &
+BL_PIDS+=($!)
+for _ in $(seq 100); do busctl --user status io.github.manuaudio.Backline.Recorder >/dev/null 2>&1 && break; sleep 0.05; done
+ctl Map 'ssa{sv}' osc:/rec/arm recorder:arm 1 args as 1 backline-test.ctl-vol >/dev/null
+ctl Map 'ssa{sv}' osc:/rec/go recorder:record 0 >/dev/null
+ctl Map 'ssa{sv}' osc:/rec/mark recorder:marker 1 args as 1 from-osc >/dev/null
+ctl Map 'ssa{sv}' osc:/rec/stop recorder:stop 0 >/dev/null
+osc udp 127.0.0.1 "$UDP_PORT" /rec/arm >/dev/null; sleep 0.6; s_arm=$(rprop State)
+osc udp 127.0.0.1 "$UDP_PORT" /rec/go >/dev/null; sleep 0.6; s_rec=$(rprop State)
+osc udp 127.0.0.1 "$UDP_PORT" /rec/mark >/dev/null; sleep 0.5
+osc udp 127.0.0.1 "$UDP_PORT" /rec/stop >/dev/null; sleep 0.8; s_stop=$(rprop State)
+last=$(rprop LastTake | tr -d '"')
+echo "  /rec/arm -> State $s_arm; /rec/go -> $s_rec; /rec/stop -> $s_stop"
+echo "  take: ${last#$out/}"
+jq -r '"  sidecar: \(.frames) frames, tracks \([.tracks[].node]), markers \([.markers[]? | "\(.name)@\(.frame)"])"' "$last"
+[[ $s_arm == '"armed"' && $s_rec == '"recording"' && $s_stop == '"idle"' ]] && jq -e '.frames > 0 and ([.markers[]?.name] | index("from-osc"))' "$last" >/dev/null &&
+  echo "  RESULT: PASS (arm, record, marker, stop from OSC; the take has the marker)" || echo "  RESULT: FAIL"
+fi
+
+########################################################################## 5
+if want 5; then
+echo; echo "-- 5. MIDI CC 20 and OSC -> volume and mute of a throwaway sink"
+python3 -I -c '
+import math, struct, sys
+r = 48000
+one = b"".join(struct.pack("<ff", *(2 * [0.5 * math.sin(2 * math.pi * 1000 * i / r)])) for i in range(r))
+sys.stdout.buffer.write(one * 20)' >"$out/tone.raw"
+bl_spawn pw-cat --playback --raw --format f32 --rate 48000 --channels 2 \
+   -P '{ node.name = backline-test.ctl-tone node.autoconnect = false node.dont-fallback = true node.dont-reconnect = true }' "$out/tone.raw"
+for _ in $(seq 100); do pw-link -o 2>/dev/null | grep -q '^backline-test.ctl-tone:output_FR' && break; sleep 0.05; done
+pw-link backline-test.ctl-tone:output_FL backline-test.ctl-vol:playback_FL
+pw-link backline-test.ctl-tone:output_FR backline-test.ctl-vol:playback_FR
+ctl Map 'ssa{sv}' midi:cc:1:20 volume:backline-test.ctl-vol 0 >/dev/null
+ctl Map 'ssa{sv}' osc:/vol volume:backline-test.ctl-vol 2 min d -40 max d 0 >/dev/null
+ctl Map 'ssa{sv}' osc:/mute mute:backline-test.ctl-vol 0 >/dev/null
+vid=$(bl_node_id backline-test.ctl-vol)
+"$BL_BIN/backline-recorder" -s backline-test.ctl-vol -o "$out" -n take-vol -d 8.5 >/dev/null 2>"$out/rec-vol.log" &
+rec=$!
+wait_log "$out/rec-vol.log" armed
+"$BL_BIN/backline-test-keyboard" --name backline-test-ctlkbd wait=1.0 cc=20,127 wait=1.0 cc=20,64 wait=1.0 cc=20,0 wait=1.0 cc=20,100 wait=0.2 \
+  >"$out/kbd-vol.jsonl" 2>"$out/kbd-vol.err"
+wp_cc100=$(wpctl get-volume "$vid" 2>/dev/null || echo "?")
+sleep 0.8; osc udp 127.0.0.1 "$UDP_PORT" /vol 0.5 >"$out/osc-vol.json"
+sleep 1.0; osc udp 127.0.0.1 "$UDP_PORT" /mute >"$out/osc-mute1.json"
+wp_mute=$(wpctl get-volume "$vid" 2>/dev/null || echo "?")
+sleep 1.0; osc udp 127.0.0.1 "$UDP_PORT" /mute >"$out/osc-mute2.json"
+wait $rec
+echo "  wpctl (what the mixer reads) after CC 20 = 100: $wp_cc100; after /mute: $wp_mute"
+python3 -I - "$here" "$out" <<'EOF'
+import glob, json, math, sys
+here, out = sys.argv[1], sys.argv[2]
+sys.path.insert(0, here)
+import analyze as A
+take = json.load(open(f"{out}/take-vol.json")); t0 = take["start"]["monotonic_ns"]
+w = A.read_wav(glob.glob(f"{out}/take-vol-01-*.wav")[0]); rate = w["rate"]; x = A.mono(w)
+ev = [(f"CC 20 = {e['b']}", e["sent_ns"], -60 + 60 * e["b"] / 127 if e["b"] else None)
+      for e in (json.loads(l) for l in open(f"{out}/kbd-vol.jsonl") if '"cc=' in l)]
+for f, name, exp in (("osc-vol.json", "OSC /vol 0.5", -20.0), ("osc-mute1.json", "OSC /mute (on)", None), ("osc-mute2.json", "OSC /mute (off)", "back")):
+    ev.append((name, json.load(open(f"{out}/{f}"))["t_ns"], exp))
+ref = 20 * math.log10(0.5 / math.sqrt(2))  # the tone's own level: a 0.5 sine, -9.031 dBFS
+rows, ok, prev = [], True, None
+for k, (name, t, exp) in enumerate(ev):
+    i = int((t - t0) * rate / 1e9)
+    end = int((ev[k + 1][1] - t0) * rate / 1e9) if k + 1 < len(ev) else len(x)
+    seg = x[i + int(0.15 * rate): end - int(0.05 * rate)]
+    # the median of 10 ms windows: one playback glitch can't move it, and
+    # glitches are counted and shown, not hidden
+    win = [seg[k:k + rate // 100] for k in range(0, len(seg) - rate // 100, rate // 100)]
+    wl_ = sorted(A.db(A.rms(w_)) if max(abs(v) for v in w_) > 0 else float("-inf") for w_ in win)
+    lvl = wl_[len(wl_) // 2]
+    glitches = sum(1 for v in wl_ if math.isfinite(lvl) and (not math.isfinite(v) or abs(v - lvl) > 0.5))
+    hop = rate // 1000
+    def wl(j):
+        w = x[j:j + hop]
+        return A.db(A.rms(w)) if w and max(abs(v) for v in w) > 0 else float("-inf")
+    lat = None
+    if prev is not None:
+        for j in range(i, i + rate // 2, hop):
+            l = wl(j)
+            if (not math.isfinite(lvl) and not math.isfinite(l)) or (math.isfinite(lvl) and math.isfinite(l) and abs(l - lvl) < 1.0):
+                lat = (j - i) / rate * 1000
+                break
+    rel = lvl - ref if ref is not None and math.isfinite(lvl) else lvl
+    if exp == "back": exp = rows[-2]["expected_db"] if rows else None
+    good = (exp is None and not math.isfinite(lvl)) or (exp is not None and math.isfinite(lvl) and abs(rel - exp) < 0.01)
+    ok &= good
+    rows.append({"event": name, "rel_db": None if not math.isfinite(rel) else round(rel, 3), "expected_db": exp, "latency_ms": lat, "glitch_windows": glitches})
+    print(f"  {name:16} level {('%7.3f dB' % rel) if math.isfinite(rel) else '  silence'} re 0 dB; expected {('%7.3f dB' % exp) if isinstance(exp, float) else ' silence' if exp is None else exp}"
+          f"{'' if lat is None else f'; send -> level change {lat:.1f} ms'}{f'; {glitches} of {len(wl_)} 10 ms windows off (playback glitch)' if glitches else ''}{'' if good else '  <-- MISMATCH'}")
+    prev = lvl
+json.dump(rows, open(f"{out}/result-vol.json", "w"), indent=1)
+print("  RESULT:", "PASS" if ok else "FAIL", "(the monitor's level, re the tone's own -9.031 dBFS, follows the mapped dB to 0.01 dB; the bottom of the fader and mute are digital silence; unmute restores it)")
+EOF
+fi
+
+########################################################################## 6
+if want 6; then
+echo; echo "-- 6. MIDI learn and OSC learn"
+ensure_clockd
+"$BL" --json map learn volume:backline-test.ctl-vol --from midi --timeout 10 >"$out/learn-midi.json" 2>&1 &
+lp=$!; sleep 0.5
+echo "  Learning (property): $(cprop Learning)"
+"$BL_BIN/backline-test-keyboard" --name backline-test-ctlkbd wait=0.3 cc=21,90 wait=0.5 cc=21,127 wait=0.3 >"$out/kbd-learn.jsonl" 2>/dev/null
+wait $lp || true
+echo "  MIDI learn: $(cat "$out/learn-midi.json")"
+"$BL" --json map learn transport:play --from osc --timeout 10 >"$out/learn-osc.json" 2>&1 &
+lp=$!; sleep 0.5
+busctl --user call "${K[@]}" Stop 2>/dev/null || true
+osc udp 127.0.0.1 "$UDP_PORT" /learned/play >/dev/null
+wait $lp || true
+echo "  OSC learn: $(cat "$out/learn-osc.json")"
+r_before=$(kprop Rolling 2>/dev/null || echo "?")
+osc udp 127.0.0.1 "$UDP_PORT" /learned/play >/dev/null; sleep 0.3
+r_after=$(kprop Rolling 2>/dev/null || echo "?")
+echo "  the learned OSC mapping: Rolling $r_before -> $r_after"
+busctl --user call "${K[@]}" Stop 2>/dev/null || true
+"$BL" --json map learn transport:stop --timeout 1 >/dev/null 2>"$out/learn-timeout.txt" || true
+echo "  learn with nothing coming: $(cat "$out/learn-timeout.txt")"
+echo "  mappings now: $(cprop MappingCount)"
+jq -e '.source == "midi:cc:1:21"' "$out/learn-midi.json" >/dev/null && jq -e '.source == "osc:/learned/play"' "$out/learn-osc.json" >/dev/null &&
+  [[ $r_after == true ]] && echo "  RESULT: PASS (the first control moved and the first OSC address sent became mappings that work)" || echo "  RESULT: FAIL"
+fi
+
+########################################################################## 7
+if want 7; then
+echo; echo "-- 7. security"
+ensure_clockd
+ctl Map 'ssa{sv}' osc:/sec/count transport:tempo 2 min d 60 max d 180 >/dev/null
+st() { echo "Received $(cprop Received), Rejected $(cprop Rejected), AuthFailures $(cprop AuthFailures), Malformed $(cprop Malformed)"; }
+bad=()
+check() { "$@" || bad+=("$CASE"); }
+echo "  counters: $(st)"
+maps0=$(cprop MappingCount)
+busctl --user call "${K[@]}" Stop
+CASE="wrong secret"
+r=$(osc tcp 10.77.0.1 "$TCP_PORT" --from 10.77.0.2 --secret wrong-secret-of-enough-length /transport/play)
+echo "  TCP, wrong secret: replies $(jq -c .replies <<<"$r"), closed by controld: $(jq .closed_by_server <<<"$r"); $(st)"
+check jq -e '.closed_by_server and .replies == [["/backline/auth", 0]]' <<<"$r" >/dev/null
+CASE="before auth"
+r=$(osc tcp 10.77.0.1 "$TCP_PORT" --from 10.77.0.2 /transport/play); sleep 0.2
+echo "  TCP, a mapped message before authenticating: closed by controld: $(jq .closed_by_server <<<"$r"); Rolling $(kprop Rolling)"
+check jq -e '.closed_by_server' <<<"$r" >/dev/null; check test "$(kprop Rolling)" = false
+CASE="TCP off the allow-list"
+r=$(osc tcp 10.77.0.1 "$TCP_PORT" --from 10.88.0.5 --secret "$SECRET" /transport/play); sleep 0.2
+echo "  TCP from 10.88.0.5 (not on the allow-list), right secret: replies $(jq -c .replies <<<"$r"), closed: $(jq .closed_by_server <<<"$r"); Rolling $(kprop Rolling)"
+check jq -e '.closed_by_server and .replies == []' <<<"$r" >/dev/null; check test "$(kprop Rolling)" = false
+busctl --user call "${K[@]}" Play  # Clock1.Tempo follows the published bar, which moves while rolling
+sleep 0.2; t0=$(kprop Tempo)
+CASE="UDP off the allow-list"
+osc udp 10.77.0.1 "$RUDP_PORT" --from 10.88.0.5 /sec/count 1.0 >/dev/null; sleep 0.2
+echo "  UDP from 10.88.0.5 (not allowed) /sec/count 1.0 (would be 180 BPM): Tempo $t0 -> $(kprop Tempo); $(st)"
+check test "$(kprop Tempo)" = "$t0"
+CASE="UDP allowed"
+osc udp 10.77.0.1 "$RUDP_PORT" --from 10.77.0.2 /sec/count 0.25 >/dev/null; sleep 0.2
+echo "  UDP from 10.77.0.2 (allowed) /sec/count 0.25: Tempo -> $(kprop Tempo)"
+check test "$(kprop Tempo)" = 90
+CASE="malformed"
+m0=$(cprop Malformed | cut -d' ' -f1)
+osc udp 10.77.0.1 "$RUDP_PORT" --from 10.77.0.2 --raw 2f7365632f636f756e7400002c6600 /x >/dev/null; sleep 0.2
+echo "  UDP malformed packet (/sec/count with its float cut off): Tempo $(kprop Tempo); $(st)"
+check test "$(kprop Tempo)" = 90; check test "$(cprop Malformed | cut -d' ' -f1)" = $((m0 + 1))
+CASE="rate limit"
+rx0=$(cprop Received | cut -d' ' -f1); rj0=$(cprop Rejected | cut -d' ' -f1)
+sleep 1.1
+osc udp 10.77.0.1 "$RUDP_PORT" --from 10.77.0.2 --count 2000 /sec/count 0.5 >/dev/null; sleep 0.5
+rx1=$(cprop Received | cut -d' ' -f1); rj1=$(cprop Rejected | cut -d' ' -f1)
+echo "  flood: 2000 messages at once to a 100 msg/s listener: accepted $((rx1 - rx0)), refused over the rate $((rj1 - rj0)), the other $((2000 - (rx1 - rx0) - (rj1 - rj0))) dropped by the kernel's socket buffer before controld read them"
+check test $((rx1 - rx0)) -le 105
+CASE="no management over OSC"
+for p in /backline/map /backline/learn /backline/listen /backline/control/Map /backline/auth; do
+  osc udp 127.0.0.1 "$UDP_PORT" "$p" "osc:/evil" "transport:play" >/dev/null
+  osc tcp 10.77.0.1 "$TCP_PORT" --from 10.77.0.2 --secret "$SECRET" "$p" "osc:/evil" "transport:play" >/dev/null
+done
+sleep 0.3
+echo "  OSC messages that look like management (/backline/map, /learn, /listen, ...): mappings $maps0 -> $(cprop MappingCount), listeners $(cprop Listeners | cut -d' ' -f1), learning '$(cprop Learning)'"
+check test "$(cprop MappingCount)" = "$maps0"; check test "$(cprop Listeners | cut -d' ' -f1)" = "3"
+busctl --user call "${K[@]}" Stop
+CASE="blocked after 3 failures"
+for i in 1 2 3; do osc tcp 10.77.0.1 "$TCP_PORT" --from 10.77.0.2 --secret "another-wrong-secret-$i-xxxxxxxx" /x >/dev/null; done
+r=$(osc tcp 10.77.0.1 "$TCP_PORT" --from 10.77.0.2 --secret "$SECRET" /transport/play); sleep 0.2
+echo "  3 wrong secrets in a row from 10.77.0.2, then the right one: replies $(jq -c .replies <<<"$r"), closed: $(jq .closed_by_server <<<"$r"), Rolling $(kprop Rolling) (the address is refused for 30 s); $(st)"
+check jq -e '.closed_by_server and .replies == []' <<<"$r" >/dev/null; check test "$(kprop Rolling)" = false
+CASE="another allowed peer"
+r=$(osc tcp 10.77.0.1 "$TCP_PORT" --from 10.77.0.1 --secret "$SECRET" /transport/play); sleep 0.2
+echo "  meanwhile another allowed address (10.77.0.1) with the secret: replies $(jq -c .replies <<<"$r"); Rolling $(kprop Rolling)"
+check test "$(kprop Rolling)" = true
+busctl --user call "${K[@]}" Stop
+echo "  final: $(st)"
+[[ ${#bad[@]} == 0 ]] && echo "  RESULT: PASS (10 cases: every refused input changed nothing, every allowed one took effect)" || echo "  RESULT: FAIL (${bad[*]})"
+
+echo; echo "-- 7b. Save, restart from the file, exit"
+ctl RemoveMapping s m1 >/dev/null 2>&1 || true
+path=$(ctl Save | cut -d'"' -f2)
+echo "  saved ${path#"$out"/}: mode $(stat -c %a "$path"), $(jq '.mappings | length' "$path") mappings, $(jq '.listeners | length' "$path") listeners (secret kept in the file: $(jq '[.listeners[] | has("secret")] | any' "$path"))"
+before=$(cprop Listeners); mbefore=$(cprop MappingCount)
+stop_controld
+echo "  controld stopped; sockets now: '$(sockets)'"
+start_controld --config-dir "$out/config"
+mafter=$(cprop MappingCount); lafter=$(cprop Listeners)
+echo "  restarted from the file: mappings $mbefore -> $mafter; listeners $(sed 's/:[0-9]*"/:PORT"/g' <<<"$lafter")"
+s_run=$(sockets)
+echo "  sockets now: '$s_run'"
+stop_controld
+s_end=$(sockets)
+echo "  controld stopped; sockets now: '${s_end}'"
+[[ $(stat -c %a "$path") == 600 && $mafter == "$mbefore" && $lafter == "$before" && -n $s_run && -z $s_end ]] &&
+  echo "  RESULT: PASS (saved 0600 with its secret, restored the same mappings and listeners on the same ports, no socket after exit)" || echo "  RESULT: FAIL"
+fi
+
+########################################################################## end
+echo; echo "-- afterwards"
+cleanup_nodes() { pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // ""' | grep -E '^backline(-test)?\.ctl' || true; }
+kill $WD 2>/dev/null || true; WD=
+bl_cleanup
+sleep 0.5
+echo "  nodes of this proof left: '$(cleanup_nodes | tr '\n' ' ')'"
+bl_foreign_nodes >"$out/nodes-after.txt"
+# the desktop's own peak meters (quickshell) come and go with its panels
+echo "  other nodes unchanged: $(bl_same_nodes <(grep -v ' quickshell$' "$out/nodes-before.txt") <(grep -v ' quickshell$' "$out/nodes-after.txt")) (the desktop's quickshell meters not compared)"
+echo "  default sink: $(bl_default_sink) (before: $default_before); moved during the run: $([[ -s $out/defaults-moved.txt ]] && cat "$out/defaults-moved.txt" || echo no)"
+echo "  pipewire/wireplumber pids: $(pidof pipewire) / $(pidof wireplumber) (before: $pw_pids_before)"
+echo "  leaks: $([[ -s $out/leaks.txt ]] && cat "$out/leaks.txt" || echo none)"

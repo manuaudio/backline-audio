@@ -1,0 +1,101 @@
+== controld-proof 2026-11-12T01:06:29-08:00
+pipewire 1.6.8, kernel 7.2.5-3-omarchy, load 4.67 3.36 3.76
+network: lo UNKNOWN 127.0.0.1/8 10.77.0.1/24 10.88.0.5/24 10.77.0.2/24 ::1/128  (own namespace)
+default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}; other nodes: 6
+
+-- 1. nothing listens by default; refused listeners
+  inet sockets in the namespace before controld: 0
+  controld: on the session bus as io.github.manuaudio.Backline.Control; node backline.ctl-control; 0 mappings, 0 listeners (no network socket)
+  sockets with controld running and an empty config: ''
+  UDP on the wildcard 0.0.0.0: refused: 0.0.0.0 is the wildcard address; name the one interface address to listen on
+  UDP on the wildcard ::: refused: :: is the wildcard address; name the one interface address to listen on
+  UDP on a host name: refused: 'localhost' is not a literal IP address (host names are not resolved, so a DNS answer can't move the listener)
+  UDP on 10.77.0.1 without an allow-list: refused: 10.77.0.1 is not a loopback address, so it needs an allow-list of the peers that may send (option allow, e.g. 192.168.1.20/32)
+  UDP on 10.77.0.1 with an allow-list, no insecure-udp: refused: UDP on 10.77.0.1 (not loopback) can't be authenticated and its source address can be forged; use TCP with a secret, or set insecure-udp to accept that
+  TCP on 10.77.0.1 with an allow-list, no secret: refused: TCP on 10.77.0.1 (not loopback) needs a shared secret (option secret, 16+ characters)
+  TCP on 10.77.0.1 with a short secret: refused: the secret must be at least 16 characters
+  a secret on UDP: refused: a secret needs TCP: UDP has no connection to authenticate
+  sockets after the refusals: ''
+  RESULT: PASS (no network socket by default; 8 of 8 unsafe listeners refused with a reason)
+  opened for the proof: udp:127.0.0.1:56093 (loopback), tcp:10.77.0.1:45395 (allow 10.77.0.0/24, secret), udp:10.77.0.1:49646 (allow 10.77.0.2/32, insecure-udp, 100 msg/s)
+  sockets now: 'tcp 10.77.0.1:45395;udp 10.77.0.1:49646;udp 127.0.0.1:56093;'
+
+-- 2. MIDI CC 7 -> Surge XT 'Global Volume' (CLAP, own process), through PipeWire's MIDI bridge
+  midi-follow: linking Midi-Bridge:backline-test-ctlkbd:keys (capture) | backline-test-ctlkbd:keys
+  after CC 7 = 100: Global Volume reads back 0.787402 (100/127 = 0.787402)
+    CC   value level before level after   change send->main  SetParam send->sound
+    64  0.5039    -19.90 dB   -43.71 dB  -23.80     0.52 ms   0.15 ms      4.0 ms
+   127  1.0000    -43.71 dB   -19.90 dB  +23.80     0.43 ms   0.14 ms      3.0 ms
+    32  0.2520    -19.90 dB   -55.80 dB  -35.90     0.35 ms   0.15 ms      6.0 ms
+   100  0.7874    -55.80 dB   -30.10 dB  +25.70     0.27 ms   0.17 ms      3.0 ms
+  levels by CC value: {64: -43.71, 127: -19.9, 32: -55.8, 100: -30.1}
+  RESULT: PASS (each CC moved the parameter; louder with every higher value; latency measured from the keyboard's send)
+  reference (same values over D-Bus SetParam): [(64, -43.71), (127, -19.9), (32, -55.8), (100, -30.1)]
+  CC level vs D-Bus level for the same value: worst 0.00 dB
+  RESULT: PASS (a CC lands on exactly the value D-Bus would set)
+
+-- 3. OSC -> transport on clockd (test group driven by a test sink)
+  UDP /transport/play (no argument) -> Rolling true, Frame 12288, Tempo 100
+  UDP /transport/ten (locate tc:00:00:10:00) -> Rolling true, Frame 492288, Tempo 100
+  UDP /transport/tempo 0.5 (60..180 BPM) -> Rolling true, Frame 506240, Tempo 120
+  UDP /transport/stop -> Rolling false, Frame 507648, Tempo 120
+  TCP 10.77.0.2 -> 10.77.0.1, secret, /transport/toggle -> Rolling true, Frame 1772331, Tempo 120
+  TCP, secret, /transport/toggle again -> Rolling false, Frame 1773611, Tempo 120
+  controld send -> clockd answered: osc:/transport/ten 0.11 ms; osc:/transport/tempo 0.12 ms; osc:/transport/play 0.12 ms; osc:/transport/stop 0.19 ms;
+  RESULT: PASS (play, locate to 10 s, tempo 0.5 -> 120 BPM, stop, toggle twice over TCP with a secret)
+
+-- 4. OSC -> recorder (recorderd on the private bus)
+  /rec/arm -> State "armed"; /rec/go -> "recording"; /rec/stop -> "idle"
+  take: data/backline/takes/take-20261112-010645.json
+  sidecar: 55168 frames, tracks ["backline-test.ctl-vol"], markers ["from-osc@30080"]
+  RESULT: PASS (arm, record, marker, stop from OSC; the take has the marker)
+
+-- 5. MIDI CC 20 and OSC -> volume and mute of a throwaway sink
+  wpctl (what the mixer reads) after CC 20 = 100: Volume: 0.61; after /mute: Volume: 0.46 [MUTED]
+  CC 20 = 127      level  -0.000 dB re 0 dB; expected   0.000 dB
+  CC 20 = 64       level -29.764 dB re 0 dB; expected -29.764 dB; send -> level change 5.0 ms
+  CC 20 = 0        level   silence re 0 dB; expected  silence; send -> level change 5.0 ms
+  CC 20 = 100      level -12.756 dB re 0 dB; expected -12.756 dB; send -> level change 5.0 ms
+  OSC /vol 0.5     level -20.000 dB re 0 dB; expected -20.000 dB; send -> level change 2.0 ms
+  OSC /mute (on)   level   silence re 0 dB; expected  silence; send -> level change 1.0 ms
+  OSC /mute (off)  level -20.000 dB re 0 dB; expected -20.000 dB; send -> level change 2.0 ms
+  RESULT: PASS (the monitor's level, re the tone's own -9.031 dBFS, follows the mapped dB to 0.01 dB; the bottom of the fader and mute are digital silence; unmute restores it)
+
+-- 6. MIDI learn and OSC learn
+  Learning (property): "volume:backline-test.ctl-vol"
+  MIDI learn: {"id": "m14", "source": "midi:cc:1:21", "target": "volume:backline-test.ctl-vol"}
+  OSC learn: {"id": "m15", "source": "osc:/learned/play", "target": "transport:play"}
+  the learned OSC mapping: Rolling false -> true
+  learn with nothing coming: backline: map learn: Control Learn: nothing learned (timeout)
+  mappings now: 15
+  RESULT: PASS (the first control moved and the first OSC address sent became mappings that work)
+
+-- 7. security
+  counters: Received 15, Rejected 0, AuthFailures 0, Malformed 0
+  TCP, wrong secret: replies [["/backline/auth",0]], closed by controld: true; Received 15, Rejected 1, AuthFailures 1, Malformed 0
+  TCP, a mapped message before authenticating: closed by controld: true; Rolling false
+  TCP from 10.88.0.5 (not on the allow-list), right secret: replies [], closed: true; Rolling false
+  UDP from 10.88.0.5 (not allowed) /sec/count 1.0 (would be 180 BPM): Tempo 120 -> 120; Received 15, Rejected 4, AuthFailures 2, Malformed 0
+  UDP from 10.77.0.2 (allowed) /sec/count 0.25: Tempo -> 90
+  UDP malformed packet (/sec/count with its float cut off): Tempo 90; Received 16, Rejected 5, AuthFailures 2, Malformed 1
+  flood: 2000 messages at once to a 100 msg/s listener: accepted 100, refused over the rate 621, the other 1279 dropped by the kernel's socket buffer before controld read them
+  OSC messages that look like management (/backline/map, /learn, /listen, ...): mappings 16 -> 16, listeners 3, learning '""'
+  3 wrong secrets in a row from 10.77.0.2, then the right one: replies [], closed: true, Rolling false (the address is refused for 30 s); Received 124, Rejected 630, AuthFailures 5, Malformed 1
+  meanwhile another allowed address (10.77.0.1) with the secret: replies [["/backline/auth",1]]; Rolling true
+  final: Received 125, Rejected 630, AuthFailures 5, Malformed 1
+  RESULT: PASS (10 cases: every refused input changed nothing, every allowed one took effect)
+
+-- 7b. Save, restart from the file, exit
+  saved config/control.json: mode 600, 15 mappings, 3 listeners (secret kept in the file: true)
+  controld stopped; sockets now: ''
+  restarted from the file: mappings 15 -> 15; listeners 3 "udp:127.0.0.1:PORT" "tcp:10.77.0.1:PORT" "udp:10.77.0.1:PORT"
+  sockets now: 'tcp 10.77.0.1:45395;udp 10.77.0.1:49646;udp 127.0.0.1:56093;'
+  controld stopped; sockets now: ''
+  RESULT: PASS (saved 0600 with its secret, restored the same mappings and listeners on the same ports, no socket after exit)
+
+-- afterwards
+  nodes of this proof left: ''
+  other nodes unchanged: yes (6 nodes) (the desktop's quickshell meters not compared)
+  default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} (before: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}); moved during the run: no
+  pipewire/wireplumber pids: 20754 / 20755 (before: 20754 / 20755)
+  leaks: none
