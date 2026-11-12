@@ -61,6 +61,9 @@ static void usage(FILE *f)
 	      "  transport ltc|mtc off|generate|chase [--fps F] [--target NODE] [--source NODE]\n"
 	      "  play load FILE [--at POS] [--gain DB] [--target NODE] [--id ID]   a file on the timeline\n"
 	      "  play unload ID|gain ID DB|start ID POS|list|show ID\n"
+	      "  map add SOURCE TARGET [--min X --max Y ...] | learn TARGET | list | remove ID | status\n"
+	      "  map listen udp|tcp ADDRESS PORT [--allow CIDR] [--secret S] | unlisten ID | follow REGEX | save\n"
+	      "     OSC and MIDI to any parameter (backline map -h; docs/api/Control1.md)\n"
 	      "  version\n",
 	      f);
 }
@@ -675,6 +678,8 @@ int main(int argc, char **argv)
 		r = cli_transport(C, g_json, n - 1, args + 1);
 	else if (!strcmp(cmd, "play"))
 		r = cli_play(C, g_json, n - 1, args + 1);
+	else if (!strcmp(cmd, "map"))
+		r = cli_map(C, g_json, n - 1, args + 1);
 	else if (!strcmp(cmd, "params"))
 		r = cmd_params(n, args);
 	else if (!strcmp(cmd, "get"))

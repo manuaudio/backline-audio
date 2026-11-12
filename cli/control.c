@@ -1,0 +1,261 @@
+/* backline CLI: the control service (map ...). docs/api/Control1.md.
+ * SPDX-License-Identifier: MIT
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <json-c/json.h>
+
+#include "backline/backline.h"
+#include "services.h"
+
+static int fail(bl_client *c, const char *what)
+{
+	fprintf(stderr, "backline: %s: %s\n", what, bl_client_error(c));
+	return 1;
+}
+
+static void out_kv(bool json, const char *key, const char *val, const char *text_fmt)
+{
+	if (json) {
+		json_object *o = json_object_new_object();
+		json_object_object_add(o, key, json_object_new_string(val));
+		puts(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
+		json_object_put(o);
+	} else {
+		printf(text_fmt, val);
+		putchar('\n');
+	}
+}
+
+static int usage_map(void)
+{
+	fputs("usage: backline map add SOURCE TARGET [--min X] [--max Y] [--invert] [--in-min A --in-max B] [--arg S]... [--id ID]\n"
+	      "       backline map learn TARGET [--from midi|osc] [--timeout S] [same options]\n"
+	      "       backline map list | remove ID | cancel | save | status\n"
+	      "       backline map follow REGEX        link matching MIDI sources to controld ('' = none)\n"
+	      "       backline map listen udp|tcp ADDRESS PORT [--allow CIDR]... [--secret S | --secret-file F]\n"
+	      "                                        [--insecure-udp] [--max-rate N] [--max-clients N]\n"
+	      "       backline map unlisten ID\n"
+	      "  SOURCE: midi:cc:CH:NUM  midi:note:CH:KEY  midi:pitchbend:CH  midi:program:CH  osc:/ADDRESS  (CH 1-16 or *)\n"
+	      "  TARGET: instance:NODE/PARAM  transport:play|stop|toggle|tempo|locate:POS  recorder:arm|record|stop|marker\n"
+	      "          volume:NODE  mute:NODE  control:NODE/NAME\n", stderr);
+	return 2;
+}
+
+/* Parses the mapping options from argv[i...]; returns the index after them,
+ * or -1. args points into argv. */
+static int map_opts(int argc, char **argv, int i, bl_map_options *o, const char **args, const char **from, unsigned *timeout)
+{
+	for (; i < argc; i++) {
+		const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
+		if (!strcmp(a, "--min") && v) { o->min = atof(v); o->has_min = true; i++; }
+		else if (!strcmp(a, "--max") && v) { o->max = atof(v); o->has_max = true; i++; }
+		else if (!strcmp(a, "--invert")) o->invert = true;
+		else if (!strcmp(a, "--in-min") && v) { o->in_min = atof(v); o->has_in = true; i++; }
+		else if (!strcmp(a, "--in-max") && v) { o->in_max = atof(v); o->has_in = true; i++; }
+		else if (!strcmp(a, "--arg") && v) { if (o->n_args < 8) args[o->n_args++] = v; i++; }
+		else if (!strcmp(a, "--id") && v) { o->id = v; i++; }
+		else if (from && !strcmp(a, "--from") && v) { *from = v; i++; }
+		else if (timeout && !strcmp(a, "--timeout") && v) { *timeout = (unsigned)atoi(v); i++; }
+		else {
+			fprintf(stderr, "backline map: unknown option '%s'\n", a);
+			return -1;
+		}
+	}
+	o->args = args;
+	return i;
+}
+
+static int read_secret_file(const char *path, char *out, size_t n)
+{
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return -errno;
+	size_t k = fread(out, 1, n - 1, f);
+	fclose(f);
+	out[k] = 0;
+	while (k && (out[k - 1] == '\n' || out[k - 1] == '\r'))
+		out[--k] = 0;
+	return 0;
+}
+
+static void print_status_text(const bl_control_status *s)
+{
+	printf("mappings %u, listeners %zu%s\n", s->mappings, s->n_listeners, s->n_listeners ? "" : " (no network socket)");
+	for (size_t i = 0; i < s->n_listeners; i++)
+		printf("  %s\n", s->listeners[i]);
+	printf("node %s, midi-follow '%s'%s%s\n", s->node, s->midi_follow, s->learning[0] ? ", learning " : "", s->learning);
+	printf("received %" PRIu64 " OSC, %" PRIu64 " MIDI; dispatched %" PRIu64 ", target errors %" PRIu64 "\n", s->received,
+	       s->midi_events, s->dispatched, s->target_errors);
+	printf("rejected %" PRIu64 " (auth failures %" PRIu64 ", malformed %" PRIu64 ")\n", s->rejected, s->auth_failures,
+	       s->malformed);
+}
+
+static void print_status_json(const bl_control_status *s)
+{
+	json_object *o = json_object_new_object();
+	json_object_object_add(o, "mappings", json_object_new_int64(s->mappings));
+	json_object *l = json_object_new_array();
+	for (size_t i = 0; i < s->n_listeners; i++)
+		json_object_array_add(l, json_object_new_string(s->listeners[i]));
+	json_object_object_add(o, "listeners", l);
+	json_object_object_add(o, "node", json_object_new_string(s->node));
+	json_object_object_add(o, "midi_follow", json_object_new_string(s->midi_follow));
+	json_object_object_add(o, "learning", json_object_new_string(s->learning));
+	json_object_object_add(o, "config_dir", json_object_new_string(s->config_dir));
+	json_object_object_add(o, "received", json_object_new_int64((int64_t)s->received));
+	json_object_object_add(o, "midi_events", json_object_new_int64((int64_t)s->midi_events));
+	json_object_object_add(o, "dispatched", json_object_new_int64((int64_t)s->dispatched));
+	json_object_object_add(o, "target_errors", json_object_new_int64((int64_t)s->target_errors));
+	json_object_object_add(o, "rejected", json_object_new_int64((int64_t)s->rejected));
+	json_object_object_add(o, "auth_failures", json_object_new_int64((int64_t)s->auth_failures));
+	json_object_object_add(o, "malformed", json_object_new_int64((int64_t)s->malformed));
+	puts(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE));
+	json_object_put(o);
+}
+
+int cli_map(bl_client *c, bool json, int argc, char **argv)
+{
+	if (argc < 1)
+		return usage_map();
+	const char *sub = argv[0];
+	char id[160];
+	if (!strcmp(sub, "add")) {
+		if (argc < 3)
+			return usage_map();
+		bl_map_options o = BL_MAP_OPTIONS_INIT;
+		const char *args[8];
+		if (map_opts(argc, argv, 3, &o, args, NULL, NULL) < 0)
+			return 2;
+		if (bl_control_map(c, argv[1], argv[2], &o, id, sizeof(id)) < 0)
+			return fail(c, "map add");
+		out_kv(json, "id", id, "%s");
+		return 0;
+	}
+	if (!strcmp(sub, "learn")) {
+		if (argc < 2)
+			return usage_map();
+		bl_map_options o = BL_MAP_OPTIONS_INIT;
+		const char *args[8], *from = NULL;
+		unsigned timeout = 30;
+		if (map_opts(argc, argv, 2, &o, args, &from, &timeout) < 0)
+			return 2;
+		if (!json)
+			fprintf(stderr, "move a control or send an OSC message (%u s)...\n", timeout);
+		char source[160];
+		if (bl_control_learn(c, argv[1], &o, from, timeout, id, sizeof(id), source, sizeof(source)) < 0)
+			return fail(c, "map learn");
+		if (json) {
+			printf("{\"id\": \"%s\", \"source\": \"%s\", \"target\": \"%s\"}\n", id, source, argv[1]);
+		} else {
+			printf("%s: %s -> %s\n", id, source, argv[1]);
+		}
+		return 0;
+	}
+	if (!strcmp(sub, "list")) {
+		char *js = NULL;
+		if (bl_control_mappings(c, &js) < 0)
+			return fail(c, "map list");
+		json_object *o = json_tokener_parse(js);
+		if (json || !o) {
+			puts(o ? json_object_to_json_string_ext(o, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE) : js);
+		} else {
+			json_object *ms, *ls;
+			if (json_object_object_get_ex(o, "mappings", &ms))
+				for (size_t i = 0; i < json_object_array_length(ms); i++) {
+					json_object *m = json_object_array_get_idx(ms, i), *v;
+					const char *mid = json_object_object_get_ex(m, "id", &v) ? json_object_get_string(v) : "";
+					const char *s = json_object_object_get_ex(m, "source", &v) ? json_object_get_string(v) : "";
+					const char *t = json_object_object_get_ex(m, "target", &v) ? json_object_get_string(v) : "";
+					printf("%-8s %-24s -> %s\n", mid, s, t);
+				}
+			if (json_object_object_get_ex(o, "listeners", &ls))
+				for (size_t i = 0; i < json_object_array_length(ls); i++) {
+					json_object *l = json_object_array_get_idx(ls, i), *v;
+					printf("listening %s%s\n", json_object_object_get_ex(l, "id", &v) ? json_object_get_string(v) : "",
+					       json_object_object_get_ex(l, "auth", &v) && json_object_get_boolean(v) ? " (secret)" : "");
+				}
+		}
+		json_object_put(o);
+		bl_free(js);
+		return 0;
+	}
+	if (!strcmp(sub, "remove") && argc == 2) {
+		if (bl_control_remove(c, argv[1]) < 0)
+			return fail(c, "map remove");
+		out_kv(json, "removed", argv[1], "removed %s");
+		return 0;
+	}
+	if (!strcmp(sub, "cancel")) {
+		if (bl_control_cancel_learn(c) < 0)
+			return fail(c, "map cancel");
+		return 0;
+	}
+	if (!strcmp(sub, "save")) {
+		char path[800];
+		if (bl_control_save(c, path, sizeof(path)) < 0)
+			return fail(c, "map save");
+		out_kv(json, "path", path, "saved %s");
+		return 0;
+	}
+	if (!strcmp(sub, "follow") && argc == 2) {
+		if (bl_control_set_midi_follow(c, argv[1]) < 0)
+			return fail(c, "map follow");
+		return 0;
+	}
+	if (!strcmp(sub, "status")) {
+		bl_control_status s;
+		if (bl_control_get_status(c, &s) < 0)
+			return fail(c, "map status");
+		if (json)
+			print_status_json(&s);
+		else
+			print_status_text(&s);
+		return 0;
+	}
+	if (!strcmp(sub, "listen")) {
+		if (argc < 4)
+			return usage_map();
+		bl_listen_options o = BL_LISTEN_OPTIONS_INIT;
+		const char *allow[16];
+		static char secret[300];
+		for (int i = 4; i < argc; i++) {
+			const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
+			if (!strcmp(a, "--allow") && v) { if (o.n_allow < 16) allow[o.n_allow++] = v; i++; }
+			else if (!strcmp(a, "--secret") && v) { o.secret = v; i++; }
+			else if (!strcmp(a, "--secret-file") && v) {
+				int r = read_secret_file(v, secret, sizeof(secret));
+				if (r < 0) {
+					fprintf(stderr, "backline map listen: %s: %s\n", v, strerror(-r));
+					return 1;
+				}
+				o.secret = secret;
+				i++;
+			}
+			else if (!strcmp(a, "--insecure-udp")) o.insecure_udp = true;
+			else if (!strcmp(a, "--max-rate") && v) { o.max_rate = (unsigned)atoi(v); i++; }
+			else if (!strcmp(a, "--max-clients") && v) { o.max_clients = (unsigned)atoi(v); i++; }
+			else if (!strcmp(a, "--max-size") && v) { o.max_size = (unsigned)atoi(v); i++; }
+			else {
+				fprintf(stderr, "backline map listen: unknown option '%s'\n", a);
+				return 2;
+			}
+		}
+		o.allow = allow;
+		if (bl_control_listen(c, argv[1], argv[2], (uint16_t)atoi(argv[3]), &o, id, sizeof(id)) < 0)
+			return fail(c, "map listen");
+		out_kv(json, "id", id, "listening on %s");
+		return 0;
+	}
+	if (!strcmp(sub, "unlisten") && argc == 2) {
+		if (bl_control_unlisten(c, argv[1]) < 0)
+			return fail(c, "map unlisten");
+		return 0;
+	}
+	return usage_map();
+}

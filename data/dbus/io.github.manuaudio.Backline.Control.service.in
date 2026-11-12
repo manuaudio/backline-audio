@@ -1,0 +1,7 @@
+# D-Bus activation for the Backline control service (session bus).
+# Installed as /usr/share/dbus-1/services/io.github.manuaudio.Backline.Control.service
+# with @bindir@ replaced (CMake does this at install time).
+# SPDX-License-Identifier: MIT
+[D-BUS Service]
+Name=io.github.manuaudio.Backline.Control
+Exec=@bindir@/backline-controld --idle-exit 60

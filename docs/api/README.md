@@ -11,6 +11,7 @@ all of them:
 | Recorder | `io.github.manuaudio.Backline.Recorder` | `/io/github/manuaudio/Backline/Recorder` | `io.github.manuaudio.Backline.Recorder1` ([Recorder1.md](Recorder1.md)) |
 | Player | `io.github.manuaudio.Backline.Player` | `/io/github/manuaudio/Backline/Player` | `io.github.manuaudio.Backline.Player1` ([Player1.md](Player1.md)) |
 | Clock and transport | `io.github.manuaudio.Backline.Clock` | `/io/github/manuaudio/Backline/Clock` | `io.github.manuaudio.Backline.Clock1` ([Clock1.md](Clock1.md)) |
+| OSC and MIDI control | `io.github.manuaudio.Backline.Control` | `/io/github/manuaudio/Backline/Control` | `io.github.manuaudio.Backline.Control1` ([Control1.md](Control1.md)) |
 
 The **bus name has no version number; the interface does.** A later,
 incompatible `Recorder2` would be served on the same bus name and object,

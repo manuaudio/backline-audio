@@ -1,0 +1,2187 @@
+/* backline-controld: OSC and MIDI to any parameter (docs/api/Control1.md).
+ * SPDX-License-Identifier: MIT
+ *
+ * One process on the PipeWire main loop. sd-bus, the OSC sockets and the
+ * MIDI ring's wake-up are all sources on that loop. The only realtime code is
+ * the MIDI input port's process callback, which copies MIDI 1.0 messages
+ * into a wait-free SPSC ring and signals main.
+ *
+ * Security (Control1.md "Security"): no socket is opened unless a listener is
+ * configured or asked for over the session bus; every listener names a
+ * literal IP; a non-loopback listener needs an allow-list, TCP needs a
+ * shared secret, UDP needs insecure-udp. A peer can only move existing
+ * mappings: nothing received over the network creates, changes or removes a
+ * mapping or a listener.
+ */
+#define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <inttypes.h>
+#include <math.h>
+#include <netinet/in.h>
+#include <regex.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <json-c/json.h>
+#include <pipewire/filter.h>
+#include <pipewire/pipewire.h>
+#include <spa/control/control.h>
+#include <spa/control/ump-utils.h>
+#include <spa/param/props.h>
+#include <spa/pod/builder.h>
+#include <spa/pod/iter.h>
+#include <spa/pod/parser.h>
+#include <spa/utils/result.h>
+#include <systemd/sd-bus.h>
+
+#include "bl_graph.h"
+#include "mapping.h"
+#include "osc.h"
+#include "policy.h"
+
+#define BUS_NAME "io.github.manuaudio.Backline.Control"
+#define OBJ_PATH "/io/github/manuaudio/Backline/Control"
+#define IFACE "io.github.manuaudio.Backline.Control1"
+#define ERR_BUSY "io.github.manuaudio.Backline.Error.Busy"
+#define ERR_NOTFOUND "io.github.manuaudio.Backline.Error.NotFound"
+#define ERR_STATE "io.github.manuaudio.Backline.Error.State"
+#define INST_PREFIX "io.github.manuaudio.Backline.Instance."
+#define INST_PATH "/io/github/manuaudio/Backline/Instance"
+#define INST_IFACE "io.github.manuaudio.Backline.Instance1"
+#define CLK_NAME "io.github.manuaudio.Backline.Clock"
+#define CLK_PATH "/io/github/manuaudio/Backline/Clock"
+#define CLK_IFACE "io.github.manuaudio.Backline.Clock1"
+#define REC_NAME "io.github.manuaudio.Backline.Recorder"
+#define REC_PATH "/io/github/manuaudio/Backline/Recorder"
+#define REC_IFACE "io.github.manuaudio.Backline.Recorder1"
+#define SCHEMA "backline.control/1"
+
+#define MAX_MAPPINGS 512
+#define MAX_ARGS 8
+#define MAX_LISTENERS 8
+#define MAX_CONNS 64
+#define MAX_PEERS 64
+#define MAX_VNODES 64
+#define MIDI_RING 1024           /* power of two */
+#define AUTH_TIMEOUT_NS (5ull * 1000000000ull)
+#define BLOCK_AFTER_FAILS 3
+#define BLOCK_NS (30ull * 1000000000ull)
+
+/* ------------------------------------------------------------------ types */
+struct mapping {
+	bool used;
+	char id[48];
+	char source_str[160];
+	char target_str[600];
+	struct ctl_source src;
+	struct ctl_target tgt;
+	bool has_min, has_max, invert;
+	double min, max, in_min, in_max;
+	char args[MAX_ARGS][256];
+	int nargs;
+	char origin[256];        /* the config file it came from; "" = made at run time */
+	/* run time */
+	bool pressed;
+	int last_mute;           /* -1 unknown */
+	bool inflight, has_pending;
+	double pending;          /* the latest output value while a call is in flight */
+	bool range_known, range_inflight, have_norm;
+	double rmin, rmax, norm_pending;
+	uint64_t sends;
+};
+
+struct peer {
+	bool used;
+	struct sockaddr_storage addr;
+	uint64_t last_ns, blocked_until;
+	struct ctl_bucket bucket;
+	int fails;
+};
+
+struct listener;
+struct conn {
+	int fd;
+	struct spa_source *src;
+	struct sockaddr_storage peer;
+	uint8_t *buf;
+	size_t have;
+	bool authed;
+	uint64_t opened_ns;
+	struct listener *l;
+};
+
+struct listener {
+	bool used;
+	char id[128];
+	struct ctl_listen_spec spec;
+	bool loopback;
+	int fd;
+	struct spa_source *src;
+	struct conn *conns[MAX_CONNS];
+	int n_conns;
+	struct peer peers[MAX_PEERS];
+	char origin[256];
+	uint8_t *udp_buf;
+};
+
+struct vnode {
+	bool used;
+	char name[256];
+	uint32_t id;
+	struct pw_proxy *proxy;
+	struct spa_hook listener, proxy_listener;
+	int nch;                 /* channel volumes; 0 = not known yet */
+	int muted;               /* -1 unknown */
+	bool pend_vol;
+	float pend_gain;
+};
+
+struct midi_ev {
+	uint64_t ns;
+	uint8_t size;
+	uint8_t data[3];
+};
+
+static struct {
+	struct pw_main_loop *loop;
+	struct pw_loop *l;
+	struct pw_context *context;
+	struct pw_core *core;
+	struct pw_registry *registry;
+	struct bl_graph *graph;
+	struct pw_filter *filter;
+	struct spa_hook filter_listener;
+	void *midi_port;
+	uint32_t node_id, midi_port_id;
+	char node_name[128];
+	sd_bus *bus;
+	struct spa_source *bus_io, *midi_ev, *house_timer, *learn_timer;
+
+	struct mapping maps[MAX_MAPPINGS];
+	int next_id;
+	struct listener lis[MAX_LISTENERS];
+	struct vnode vnodes[MAX_VNODES];
+
+	/* MIDI ring: data thread writes, main reads */
+	struct midi_ev ring[MIDI_RING];
+	atomic_uint ring_w, ring_r;
+	atomic_uint_fast64_t midi_dropped;
+
+	/* MIDI follow */
+	char follow[256];
+	regex_t follow_re;
+	bool follow_on;
+	uint32_t followed[64];
+	int n_followed;
+
+	/* learn */
+	bool learning;
+	char learn_id[48], learn_target[600], learn_from[8];
+	struct mapping learn_tmpl;
+
+	char config_dir[600];
+	bool no_config;
+	int idle_exit;
+	uint64_t idle_since;
+	bool verbose;
+
+	uint64_t received, midi_events, rejected, auth_failures, malformed, dispatched, target_errors;
+} D;
+
+static uint64_t now_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void logf_(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void logf_(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	fprintf(stderr, "backline-controld: ");
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+}
+#define LOG(...) logf_(__VA_ARGS__)
+#define VLOG(...) do { if (D.verbose) logf_(__VA_ARGS__); } while (0)
+
+static void props_changed(const char *first, ...)
+{
+	if (!D.bus)
+		return;
+	char *names[8];
+	int n = 0;
+	va_list ap;
+	va_start(ap, first);
+	for (const char *s = first; s && n < 7; s = va_arg(ap, const char *))
+		names[n++] = (char *)s;
+	va_end(ap);
+	names[n] = NULL;
+	sd_bus_emit_properties_changed_strv(D.bus, OBJ_PATH, IFACE, names);
+}
+
+static int n_mappings(void)
+{
+	int n = 0;
+	for (int i = 0; i < MAX_MAPPINGS; i++)
+		n += D.maps[i].used;
+	return n;
+}
+
+static int n_listeners(void)
+{
+	int n = 0;
+	for (int i = 0; i < MAX_LISTENERS; i++)
+		n += D.lis[i].used;
+	return n;
+}
+
+static struct mapping *find_mapping(const char *id)
+{
+	for (int i = 0; i < MAX_MAPPINGS; i++)
+		if (D.maps[i].used && !strcmp(D.maps[i].id, id))
+			return &D.maps[i];
+	return NULL;
+}
+
+/* ============================================================ MIDI input */
+static void push_midi(uint64_t ns, const uint8_t *m, size_t size)
+{
+	if (size < 1 || size > 3 || m[0] == 0xf0)
+		return;
+	unsigned w = atomic_load_explicit(&D.ring_w, memory_order_relaxed);
+	unsigned r = atomic_load_explicit(&D.ring_r, memory_order_acquire);
+	if (w - r >= MIDI_RING) {
+		atomic_fetch_add_explicit(&D.midi_dropped, 1, memory_order_relaxed);
+		return;
+	}
+	struct midi_ev *e = &D.ring[w & (MIDI_RING - 1)];
+	e->ns = ns;
+	e->size = (uint8_t)size;
+	memcpy(e->data, m, size);
+	atomic_store_explicit(&D.ring_w, w + 1, memory_order_release);
+}
+
+static void push_ump(uint64_t ns, const void *body, size_t size)
+{
+#ifdef BL_HAVE_SPA_PARSER_BODY
+	const uint32_t *u = body;
+	uint64_t state = 0;
+	while (size > 0) {
+		uint8_t midi[16];
+		int sz = spa_ump_to_midi(&u, &size, midi, sizeof(midi), &state);
+		if (sz < 0)
+			break;
+		if (sz > 0)
+			push_midi(ns, midi, (size_t)sz);
+	}
+#else
+	uint8_t midi[16];
+	int sz = spa_ump_to_midi((uint32_t *)body, size, midi, sizeof(midi));
+	if (sz > 0)
+		push_midi(ns, midi, (size_t)sz);
+#endif
+}
+
+static void on_process(void *data, struct spa_io_position *pos)
+{
+	if (!D.midi_port)
+		return;
+	struct pw_buffer *b = pw_filter_dequeue_buffer(D.midi_port);
+	if (!b)
+		return;
+	struct spa_data *d = &b->buffer->datas[0];
+	uint64_t base = pos ? pos->clock.nsec : 0;
+	uint32_t rate = pos && pos->clock.rate.denom ? pos->clock.rate.denom : 48000;
+	unsigned before = atomic_load_explicit(&D.ring_w, memory_order_relaxed);
+	if (d->data && d->chunk) {
+#ifdef BL_HAVE_SPA_PARSER_BODY
+		struct spa_pod_parser parser;
+		struct spa_pod_frame frame;
+		struct spa_pod_sequence seq;
+		const void *seq_body, *c_body;
+		struct spa_pod_control c;
+		spa_pod_parser_init_from_data(&parser, d->data, d->maxsize, d->chunk->offset, d->chunk->size);
+		if (spa_pod_parser_push_sequence_body(&parser, &frame, &seq, &seq_body) >= 0) {
+			while (spa_pod_parser_get_control_body(&parser, &c, &c_body) >= 0) {
+				uint64_t ns = base + (uint64_t)c.offset * 1000000000ull / rate;
+				if (c.type == SPA_CONTROL_Midi)
+					push_midi(ns, c_body, c.value.size);
+				else if (c.type == SPA_CONTROL_UMP)
+					push_ump(ns, c_body, c.value.size);
+			}
+		}
+#else
+		struct spa_pod *pod = spa_pod_from_data(d->data, d->maxsize, d->chunk->offset, d->chunk->size);
+		if (pod && spa_pod_is_sequence(pod)) {
+			struct spa_pod_control *c;
+			SPA_POD_SEQUENCE_FOREACH((struct spa_pod_sequence *)pod, c) {
+				uint64_t ns = base + (uint64_t)c->offset * 1000000000ull / rate;
+				if (c->type == SPA_CONTROL_Midi)
+					push_midi(ns, SPA_POD_BODY(&c->value), SPA_POD_BODY_SIZE(&c->value));
+				else if (c->type == SPA_CONTROL_UMP)
+					push_ump(ns, SPA_POD_BODY(&c->value), SPA_POD_BODY_SIZE(&c->value));
+			}
+		}
+#endif
+	}
+	pw_filter_queue_buffer(D.midi_port, b);
+	if (atomic_load_explicit(&D.ring_w, memory_order_relaxed) != before)
+		pw_loop_signal_event(D.l, D.midi_ev);
+}
+
+static void on_filter_state(void *data, enum pw_filter_state old, enum pw_filter_state state, const char *error)
+{
+	if (state == PW_FILTER_STATE_ERROR)
+		LOG("filter error: %s\n", error ? error : "?");
+	if ((state == PW_FILTER_STATE_PAUSED || state == PW_FILTER_STATE_STREAMING) && D.node_id == SPA_ID_INVALID)
+		D.node_id = pw_filter_get_node_id(D.filter);
+}
+
+static const struct pw_filter_events filter_events = {
+	PW_VERSION_FILTER_EVENTS,
+	.state_changed = on_filter_state,
+	.process = on_process,
+};
+
+/* ============================================================ node props */
+/* Sends the pending volume once the channel count is known. */
+static void vnode_apply(struct vnode *v)
+{
+	if (v->nch <= 0 || !v->pend_vol || !v->proxy)
+		return;
+	v->pend_vol = false;
+	uint8_t buf[1024];
+	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+	float g[64];
+	for (int i = 0; i < v->nch; i++)
+		g[i] = v->pend_gain;
+	struct spa_pod *p = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props,
+		SPA_PROP_channelVolumes, SPA_POD_Array(sizeof(float), SPA_TYPE_Float, v->nch, g));
+	pw_node_set_param((struct pw_node *)v->proxy, SPA_PARAM_Props, 0, p);
+	VLOG("volume %s: gain %.6f on %d channels (t=%" PRIu64 ")\n", v->name, v->pend_gain, v->nch, now_ns());
+}
+
+static void vnode_param(void *data, int seq, uint32_t id, uint32_t index, uint32_t next, const struct spa_pod *param)
+{
+	struct vnode *v = data;
+	if (id != SPA_PARAM_Props || !param || !spa_pod_is_object(param))
+		return;
+	const struct spa_pod_object *obj = (const struct spa_pod_object *)param;
+	const struct spa_pod_prop *prop;
+	SPA_POD_OBJECT_FOREACH(obj, prop) {
+		if (prop->key == SPA_PROP_channelVolumes) {
+			float vols[64];
+			uint32_t n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float, vols, 64);
+			if (n > 0)
+				v->nch = (int)n;
+		} else if (prop->key == SPA_PROP_mute) {
+			bool m;
+			if (spa_pod_get_bool(&prop->value, &m) >= 0)
+				v->muted = m;
+		}
+	}
+	vnode_apply(v);
+}
+
+static const struct pw_node_events vnode_events = {
+	PW_VERSION_NODE_EVENTS,
+	.param = vnode_param,
+};
+
+static void vnode_drop(struct vnode *v)
+{
+	if (v->proxy) {
+		spa_hook_remove(&v->listener);
+		spa_hook_remove(&v->proxy_listener);
+		pw_proxy_destroy(v->proxy);
+	}
+	memset(v, 0, sizeof(*v));
+}
+
+static void vnode_removed(void *data)
+{
+	struct vnode *v = data;
+	spa_hook_remove(&v->listener);
+	spa_hook_remove(&v->proxy_listener);
+	pw_proxy_destroy(v->proxy);
+	v->proxy = NULL;
+	memset(v, 0, sizeof(*v));
+}
+
+static const struct pw_proxy_events vnode_proxy_events = {
+	PW_VERSION_PROXY_EVENTS,
+	.removed = vnode_removed,
+};
+
+/* The bound node for a name, (re)bound if it is new or came back. */
+static struct vnode *vnode_get(const char *name)
+{
+	const struct bl_node *n = bl_graph_find_node(D.graph, name);
+	if (!n)
+		return NULL;
+	struct vnode *free_slot = NULL;
+	for (int i = 0; i < MAX_VNODES; i++) {
+		struct vnode *v = &D.vnodes[i];
+		if (v->used && !strcmp(v->name, name)) {
+			if (v->id == n->id && v->proxy)
+				return v;
+			vnode_drop(v);
+			free_slot = v;
+			break;
+		}
+		if (!v->used && !free_slot)
+			free_slot = v;
+	}
+	if (!free_slot)
+		return NULL;
+	struct vnode *v = free_slot;
+	memset(v, 0, sizeof(*v));
+	v->used = true;
+	v->id = n->id;
+	v->muted = -1;
+	snprintf(v->name, sizeof(v->name), "%s", name);
+	v->proxy = pw_registry_bind(D.registry, n->id, PW_TYPE_INTERFACE_Node, PW_VERSION_NODE, 0);
+	if (!v->proxy) {
+		v->used = false;
+		return NULL;
+	}
+	pw_node_add_listener((struct pw_node *)v->proxy, &v->listener, &vnode_events, v);
+	pw_proxy_add_listener(v->proxy, &v->proxy_listener, &vnode_proxy_events, v);
+	uint32_t ids[] = { SPA_PARAM_Props };
+	pw_node_subscribe_params((struct pw_node *)v->proxy, ids, 1);
+	pw_node_enum_params((struct pw_node *)v->proxy, 0, SPA_PARAM_Props, 0, 8, NULL);
+	return v;
+}
+
+static bool set_volume(const char *node, double gain)
+{
+	struct vnode *v = vnode_get(node);
+	if (!v)
+		return false;
+	v->pend_gain = (float)gain;
+	v->pend_vol = true;
+	vnode_apply(v); /* now, or when the node's Props arrive */
+	return true;
+}
+
+static bool set_mute(const char *node, int mute /* 0, 1, -1 toggle */)
+{
+	struct vnode *v = vnode_get(node);
+	if (!v)
+		return false;
+	bool m = mute < 0 ? !(v->muted > 0) : mute;
+	uint8_t buf[256];
+	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+	struct spa_pod *p = spa_pod_builder_add_object(&b, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props, SPA_PROP_mute, SPA_POD_Bool(m));
+	pw_node_set_param((struct pw_node *)v->proxy, SPA_PARAM_Props, 0, p);
+	v->muted = m;
+	VLOG("mute %s: %d\n", node, m);
+	return true;
+}
+
+static bool set_control(const char *node, const char *name, double value)
+{
+	struct vnode *v = vnode_get(node);
+	if (!v)
+		return false;
+	uint8_t buf[1024];
+	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+	struct spa_pod_frame f[2];
+	spa_pod_builder_push_object(&b, &f[0], SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+	spa_pod_builder_prop(&b, SPA_PROP_params, 0);
+	spa_pod_builder_push_struct(&b, &f[1]);
+	spa_pod_builder_string(&b, name);
+	spa_pod_builder_float(&b, (float)value);
+	spa_pod_builder_pop(&b, &f[1]);
+	struct spa_pod *p = spa_pod_builder_pop(&b, &f[0]);
+	pw_node_set_param((struct pw_node *)v->proxy, SPA_PARAM_Props, 0, p);
+	VLOG("control %s/%s: %g\n", node, name, value);
+	return true;
+}
+
+/* ============================================================ D-Bus targets */
+enum call_kind { CALL_VALUE, CALL_RANGE, CALL_TOGGLE, CALL_FIRE };
+struct call_ctx {
+	enum call_kind kind;
+	char id[48];
+	uint64_t sent_ns;
+};
+
+static void inst_bus(const char *node, char *out, size_t n)
+{
+	if (!strncmp(node, INST_PREFIX, strlen(INST_PREFIX))) {
+		snprintf(out, n, "%s", node);
+		return;
+	}
+	size_t k = (size_t)snprintf(out, n, "%s", INST_PREFIX);
+	if (!*node || (*node >= '0' && *node <= '9'))
+		k += (size_t)snprintf(out + k, n - k, "n_");
+	for (; *node && k + 1 < n; node++) {
+		unsigned char ch = (unsigned char)*node;
+		out[k++] = (ch < 0x80 && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9'))) ? (char)ch : '_';
+	}
+	out[k] = 0;
+}
+
+static void send_value(struct mapping *m, double out);
+static int call_async(struct mapping *m, enum call_kind kind, const char *dest, const char *path, const char *iface,
+		      const char *method, const char *types, ...);
+static void apply_norm(struct mapping *m, double norm);
+
+static void target_error(struct mapping *m, const sd_bus_error *e)
+{
+	D.target_errors++;
+	if (D.target_errors <= 50 || D.verbose)
+		LOG("%s -> %s: %s\n", m ? m->source_str : "?", m ? m->target_str : "?",
+		    e && e->message ? e->message : e && e->name ? e->name : "failed");
+}
+
+/* Instance1 ListParams: the range of the mapped parameter, matched the way
+ * the worker matches keys (id, exact name, module/name, unique substring). */
+static bool range_from_list(struct mapping *m, sd_bus_message *reply)
+{
+	const char *key = m->tgt.key;
+	char *end;
+	unsigned long want_id = strtoul(key, &end, 10);
+	bool numeric = *key && !*end;
+	int r = sd_bus_message_enter_container(reply, 'a', "(ussddd)");
+	if (r < 0)
+		return false;
+	uint32_t id;
+	const char *name, *module;
+	double val, mn, mx, fmin = 0, fmax = 1, smin = 0, smax = 1;
+	int exact = 0, sub = 0;
+	while (sd_bus_message_read(reply, "(ussddd)", &id, &name, &module, &val, &mn, &mx) > 0) {
+		char full[600];
+		snprintf(full, sizeof(full), "%s%s%s", module, *module ? "/" : "", name);
+		if ((numeric && id == want_id) || !strcasecmp(name, key) || !strcasecmp(full, key)) {
+			if (!exact++) { fmin = mn; fmax = mx; }
+		} else if (strcasestr(full, key)) {
+			if (!sub++) { smin = mn; smax = mx; }
+		}
+	}
+	sd_bus_message_exit_container(reply);
+	if (exact >= 1) {
+		m->rmin = fmin;
+		m->rmax = fmax;
+		return true;
+	}
+	if (sub == 1) {
+		m->rmin = smin;
+		m->rmax = smax;
+		return true;
+	}
+	return false;
+}
+
+static int on_reply(sd_bus_message *reply, void *ud, sd_bus_error *ret_error)
+{
+	struct call_ctx *c = ud;
+	struct mapping *m = find_mapping(c->id);
+	const sd_bus_error *e = sd_bus_message_get_error(reply);
+	if (e) {
+		target_error(m, e);
+	} else if (m && D.verbose && c->kind != CALL_RANGE) {
+		VLOG("%s -> %s: done in %.2f ms (t=%" PRIu64 ")\n", m->source_str, m->target_str,
+		     (now_ns() - c->sent_ns) / 1e6, now_ns());
+	}
+	if (m) {
+		switch (c->kind) {
+		case CALL_VALUE:
+			m->inflight = false;
+			if (m->has_pending) {
+				m->has_pending = false;
+				send_value(m, m->pending);
+			}
+			break;
+		case CALL_RANGE:
+			m->range_inflight = false;
+			if (!e && range_from_list(m, reply)) {
+				m->range_known = true;
+				VLOG("%s: parameter range %g..%g\n", m->target_str, m->rmin, m->rmax);
+				if (m->have_norm) {
+					m->have_norm = false;
+					apply_norm(m, m->norm_pending);
+				}
+			} else if (!e) {
+				sd_bus_error ne = SD_BUS_ERROR_MAKE_CONST("io.github.manuaudio.Backline.Error.NoSuchParam",
+									   "no single parameter matches the key");
+				target_error(m, &ne);
+			}
+			break;
+		case CALL_TOGGLE:
+			if (!e) {
+				int rolling = 0;
+				if (sd_bus_message_enter_container(reply, 'v', "b") >= 0)
+					sd_bus_message_read(reply, "b", &rolling);
+				call_async(m, CALL_FIRE, CLK_NAME, CLK_PATH, CLK_IFACE, rolling ? "Stop" : "Play", "");
+			}
+			break;
+		case CALL_FIRE:
+			break;
+		}
+	}
+	free(c);
+	return 0;
+}
+
+/* sd_bus_call_method_async with a floating slot whose userdata is freed by
+ * on_reply (which always runs: reply, error or timeout). */
+static int call_async(struct mapping *m, enum call_kind kind, const char *dest, const char *path, const char *iface,
+		      const char *method, const char *types, ...)
+{
+	struct call_ctx *c = calloc(1, sizeof(*c));
+	if (!c)
+		return -ENOMEM;
+	c->kind = kind;
+	c->sent_ns = now_ns();
+	snprintf(c->id, sizeof(c->id), "%s", m->id);
+	sd_bus_message *msg = NULL;
+	int r = sd_bus_message_new_method_call(D.bus, &msg, dest, path, iface, method);
+	if (r >= 0 && types && *types) {
+		va_list ap;
+		va_start(ap, types);
+		r = sd_bus_message_appendv(msg, types, ap);
+		va_end(ap);
+	}
+	if (r >= 0)
+		r = sd_bus_call_async(D.bus, NULL, msg, on_reply, c, 30 * 1000000ull);
+	sd_bus_message_unref(msg);
+	if (r < 0) {
+		free(c);
+		sd_bus_error e = SD_BUS_ERROR_NULL;
+		sd_bus_error_set_errno(&e, r);
+		target_error(m, &e);
+		sd_bus_error_free(&e);
+		return r;
+	}
+	if (kind != CALL_RANGE)
+		D.dispatched++;
+	m->sends++;
+	return 0;
+}
+
+static void query_range(struct mapping *m)
+{
+	if (m->range_inflight)
+		return;
+	char bus[300];
+	inst_bus(m->tgt.node, bus, sizeof(bus));
+	if (call_async(m, CALL_RANGE, bus, INST_PATH, INST_IFACE, "ListParams", "") >= 0)
+		m->range_inflight = true;
+}
+
+static void send_value(struct mapping *m, double out)
+{
+	switch (m->tgt.kind) {
+	case CTL_T_VOLUME:
+		if (set_volume(m->tgt.node, isinf(out) && out < 0 ? 0 : ctl_db_to_gain(out)))
+			D.dispatched++, m->sends++;
+		else
+			target_error(m, &SD_BUS_ERROR_MAKE_CONST(ERR_NOTFOUND, "no such node"));
+		return;
+	case CTL_T_MUTE: {
+		int mu = out > 0.5;
+		if (mu == m->last_mute)
+			return;
+		if (set_mute(m->tgt.node, mu)) {
+			m->last_mute = mu;
+			D.dispatched++, m->sends++;
+		} else {
+			target_error(m, &SD_BUS_ERROR_MAKE_CONST(ERR_NOTFOUND, "no such node"));
+		}
+		return;
+	}
+	case CTL_T_CONTROL:
+		if (set_control(m->tgt.node, m->tgt.key, out))
+			D.dispatched++, m->sends++;
+		else
+			target_error(m, &SD_BUS_ERROR_MAKE_CONST(ERR_NOTFOUND, "no such node"));
+		return;
+	default:
+		break;
+	}
+	if (m->inflight) {
+		m->pending = out;
+		m->has_pending = true;
+		return;
+	}
+	int r = -1;
+	if (m->tgt.kind == CTL_T_INSTANCE) {
+		char bus[300];
+		inst_bus(m->tgt.node, bus, sizeof(bus));
+		r = call_async(m, CALL_VALUE, bus, INST_PATH, INST_IFACE, "SetParam", "sd", m->tgt.key, out);
+		VLOG("%s -> %s = %g (t=%" PRIu64 ")\n", m->source_str, m->target_str, out, now_ns());
+	} else if (m->tgt.kind == CTL_T_TRANSPORT && !strcmp(m->tgt.action, "tempo")) {
+		r = call_async(m, CALL_VALUE, CLK_NAME, CLK_PATH, CLK_IFACE, "SetTempo", "d", out);
+	}
+	if (r >= 0)
+		m->inflight = true;
+}
+
+static void fire(struct mapping *m)
+{
+	const struct ctl_target *t = &m->tgt;
+	VLOG("%s -> %s (trigger, t=%" PRIu64 ")\n", m->source_str, m->target_str, now_ns());
+	if (t->kind == CTL_T_TRANSPORT) {
+		if (!strcmp(t->action, "play"))
+			call_async(m, CALL_FIRE, CLK_NAME, CLK_PATH, CLK_IFACE, "Play", "");
+		else if (!strcmp(t->action, "stop"))
+			call_async(m, CALL_FIRE, CLK_NAME, CLK_PATH, CLK_IFACE, "Stop", "");
+		else if (!strcmp(t->action, "locate"))
+			call_async(m, CALL_FIRE, CLK_NAME, CLK_PATH, CLK_IFACE, "Locate", "s", t->arg);
+		else if (!strcmp(t->action, "toggle")) {
+			if (call_async(m, CALL_TOGGLE, CLK_NAME, CLK_PATH, "org.freedesktop.DBus.Properties", "Get", "ss", CLK_IFACE,
+				       "Rolling") >= 0)
+				D.dispatched--; /* counted when the Play/Stop goes out */
+		}
+	} else if (t->kind == CTL_T_RECORDER) {
+		if (!strcmp(t->action, "arm")) {
+			sd_bus_message *msg = NULL;
+			struct call_ctx *c = calloc(1, sizeof(*c));
+			c->kind = CALL_FIRE;
+			c->sent_ns = now_ns();
+			snprintf(c->id, sizeof(c->id), "%s", m->id);
+			int r = sd_bus_message_new_method_call(D.bus, &msg, REC_NAME, REC_PATH, REC_IFACE, "Arm");
+			if (r >= 0)
+				r = sd_bus_message_open_container(msg, 'a', "s");
+			for (int i = 0; r >= 0 && i < m->nargs; i++)
+				r = sd_bus_message_append(msg, "s", m->args[i]);
+			if (r >= 0)
+				r = sd_bus_message_close_container(msg);
+			if (r >= 0)
+				r = sd_bus_message_append(msg, "a{sv}", 0);
+			if (r >= 0)
+				r = sd_bus_call_async(D.bus, NULL, msg, on_reply, c, 30 * 1000000ull);
+			sd_bus_message_unref(msg);
+			if (r < 0) {
+				free(c);
+				sd_bus_error e = SD_BUS_ERROR_NULL;
+				sd_bus_error_set_errno(&e, r);
+				target_error(m, &e);
+				sd_bus_error_free(&e);
+			} else {
+				D.dispatched++;
+				m->sends++;
+			}
+		} else if (!strcmp(t->action, "record")) {
+			call_async(m, CALL_FIRE, REC_NAME, REC_PATH, REC_IFACE, "Record", "");
+		} else if (!strcmp(t->action, "stop")) {
+			call_async(m, CALL_FIRE, REC_NAME, REC_PATH, REC_IFACE, "Stop", "");
+		} else if (!strcmp(t->action, "marker")) {
+			call_async(m, CALL_FIRE, REC_NAME, REC_PATH, REC_IFACE, "AddMarker", "s", m->nargs ? m->args[0] : "");
+		}
+	} else if (t->kind == CTL_T_MUTE) {
+		if (set_mute(t->node, -1))
+			D.dispatched++, m->sends++;
+	}
+}
+
+static void apply_norm(struct mapping *m, double norm)
+{
+	double lo = m->min, hi = m->max;
+	if (m->tgt.kind == CTL_T_INSTANCE && !(m->has_min && m->has_max)) {
+		if (!m->range_known) {
+			m->norm_pending = norm;
+			m->have_norm = true;
+			query_range(m);
+			return;
+		}
+		if (!m->has_min) lo = m->rmin;
+		if (!m->has_max) hi = m->rmax;
+	}
+	double out = ctl_scale(norm, m->invert, lo, hi);
+	if (m->tgt.kind == CTL_T_VOLUME && !m->has_min && ctl_scale(norm, m->invert, 0, 1) <= 0)
+		out = -INFINITY; /* the bottom of a fader is silence */
+	send_value(m, out);
+}
+
+/* One input value for a mapping. impulse: an OSC message without a value
+ * (or with I): a press, every time. */
+static void mapping_input(struct mapping *m, double norm, bool impulse)
+{
+	if (ctl_target_is_trigger(&m->tgt) || (impulse && m->tgt.kind == CTL_T_MUTE)) {
+		bool on = impulse || ctl_scale(norm, m->invert, 0, 1) > 0.5;
+		if (impulse || (on && !m->pressed))
+			fire(m);
+		m->pressed = on && !impulse;
+		return;
+	}
+	apply_norm(m, norm);
+}
+
+/* ============================================================ mappings */
+static void mapping_defaults(struct mapping *m)
+{
+	memset(m, 0, sizeof(*m));
+	m->in_min = 0;
+	m->in_max = 1;
+	m->last_mute = -1;
+}
+
+/* Fills the parsed fields and the output range; 0 or -1 with err. */
+static int mapping_finish(struct mapping *m, char *err, size_t n)
+{
+	if (ctl_parse_source(m->source_str, &m->src, err, n) < 0)
+		return -1;
+	if (ctl_parse_target(m->target_str, &m->tgt, err, n) < 0)
+		return -1;
+	double dmin, dmax;
+	if (ctl_target_default_range(&m->tgt, &dmin, &dmax)) {
+		if (!m->has_min) m->min = dmin;
+		if (!m->has_max) m->max = dmax;
+	}
+	if (m->tgt.kind == CTL_T_RECORDER && !strcmp(m->tgt.action, "arm") && m->nargs == 0) {
+		snprintf(err, n, "recorder:arm needs the sources to arm in args (e.g. [\"backline-test.sink\"])");
+		return -1;
+	}
+	if (!(m->in_max != m->in_min) && m->src.kind == CTL_SRC_OSC) {
+		snprintf(err, n, "in-min and in-max must differ");
+		return -1;
+	}
+	return 0;
+}
+
+static struct mapping *mapping_insert(const struct mapping *tmpl, char *err, size_t n)
+{
+	if (tmpl->id[0] && find_mapping(tmpl->id)) {
+		snprintf(err, n, "a mapping with id '%s' already exists", tmpl->id);
+		return NULL;
+	}
+	for (int i = 0; i < MAX_MAPPINGS; i++) {
+		if (D.maps[i].used)
+			continue;
+		D.maps[i] = *tmpl;
+		struct mapping *m = &D.maps[i];
+		m->used = true;
+		m->last_mute = -1;
+		if (!m->id[0]) {
+			do
+				snprintf(m->id, sizeof(m->id), "m%d", ++D.next_id);
+			while (find_mapping(m->id) != m);
+		}
+		return m;
+	}
+	snprintf(err, n, "too many mappings (%d)", MAX_MAPPINGS);
+	return NULL;
+}
+
+/* A mapping from JSON (the schema of Mappings()). */
+static int mapping_from_json(json_object *o, struct mapping *m, char *err, size_t n)
+{
+	mapping_defaults(m);
+	json_object *v;
+	if (!json_object_is_type(o, json_type_object)) {
+		snprintf(err, n, "a mapping is a JSON object");
+		return -1;
+	}
+	json_object_object_foreach(o, key, val) {
+		if (!strcmp(key, "id")) snprintf(m->id, sizeof(m->id), "%s", json_object_get_string(val));
+		else if (!strcmp(key, "source")) snprintf(m->source_str, sizeof(m->source_str), "%s", json_object_get_string(val));
+		else if (!strcmp(key, "target")) snprintf(m->target_str, sizeof(m->target_str), "%s", json_object_get_string(val));
+		else if (!strcmp(key, "min")) { m->min = json_object_get_double(val); m->has_min = true; }
+		else if (!strcmp(key, "max")) { m->max = json_object_get_double(val); m->has_max = true; }
+		else if (!strcmp(key, "invert")) m->invert = json_object_get_boolean(val);
+		else if (!strcmp(key, "in-min")) m->in_min = json_object_get_double(val);
+		else if (!strcmp(key, "in-max")) m->in_max = json_object_get_double(val);
+		else if (!strcmp(key, "args")) {
+			if (!json_object_is_type(val, json_type_array)) {
+				snprintf(err, n, "args is an array of strings");
+				return -1;
+			}
+			for (size_t i = 0; i < json_object_array_length(val) && m->nargs < MAX_ARGS; i++)
+				snprintf(m->args[m->nargs++], sizeof(m->args[0]), "%s",
+					 json_object_get_string(json_object_array_get_idx(val, i)));
+		} else if (!strcmp(key, "sends") || !strcmp(key, "origin")) {
+			/* output-only fields of Mappings() */
+		} else {
+			snprintf(err, n, "unknown mapping key '%s'", key);
+			return -1;
+		}
+	}
+	(void)v;
+	if (strlen(m->id) && (strspn(m->id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.") != strlen(m->id))) {
+		snprintf(err, n, "an id is letters, digits, '-', '_' and '.'");
+		return -1;
+	}
+	return mapping_finish(m, err, n);
+}
+
+static json_object *mapping_to_json(const struct mapping *m, bool runtime)
+{
+	json_object *o = json_object_new_object();
+	json_object_object_add(o, "id", json_object_new_string(m->id));
+	json_object_object_add(o, "source", json_object_new_string(m->source_str));
+	json_object_object_add(o, "target", json_object_new_string(m->target_str));
+	if (m->has_min) json_object_object_add(o, "min", json_object_new_double(m->min));
+	if (m->has_max) json_object_object_add(o, "max", json_object_new_double(m->max));
+	if (m->invert) json_object_object_add(o, "invert", json_object_new_boolean(1));
+	if (m->src.kind == CTL_SRC_OSC && (m->in_min != 0 || m->in_max != 1)) {
+		json_object_object_add(o, "in-min", json_object_new_double(m->in_min));
+		json_object_object_add(o, "in-max", json_object_new_double(m->in_max));
+	}
+	if (m->nargs) {
+		json_object *a = json_object_new_array();
+		for (int i = 0; i < m->nargs; i++)
+			json_object_array_add(a, json_object_new_string(m->args[i]));
+		json_object_object_add(o, "args", a);
+	}
+	if (runtime) {
+		json_object_object_add(o, "sends", json_object_new_int64((int64_t)m->sends));
+		if (m->origin[0])
+			json_object_object_add(o, "origin", json_object_new_string(m->origin));
+	}
+	return o;
+}
+
+/* ============================================================ learn */
+static void learn_stop(void)
+{
+	D.learning = false;
+	D.learn_id[0] = D.learn_target[0] = 0;
+	struct timespec z = { 0, 0 };
+	pw_loop_update_timer(D.l, D.learn_timer, &z, NULL, false);
+	props_changed("Learning", NULL);
+}
+
+static void on_learn_timeout(void *data, uint64_t exp)
+{
+	if (!D.learning)
+		return;
+	LOG("learn %s timed out\n", D.learn_id);
+	sd_bus_emit_signal(D.bus, OBJ_PATH, IFACE, "LearnCancelled", "ss", D.learn_id, "timeout");
+	learn_stop();
+}
+
+/* true: this input was learned (and is not dispatched) */
+static bool learn_input(const struct ctl_source *src)
+{
+	if (!D.learning)
+		return false;
+	bool midi = src->kind != CTL_SRC_OSC;
+	if ((!strcmp(D.learn_from, "midi") && !midi) || (!strcmp(D.learn_from, "osc") && midi))
+		return false;
+	struct mapping m = D.learn_tmpl;
+	ctl_format_source(src, m.source_str, sizeof(m.source_str));
+	snprintf(m.id, sizeof(m.id), "%s", D.learn_id);
+	char err[256];
+	if (mapping_finish(&m, err, sizeof(err)) < 0 || !mapping_insert(&m, err, sizeof(err))) {
+		LOG("learn %s: %s\n", D.learn_id, err);
+		sd_bus_emit_signal(D.bus, OBJ_PATH, IFACE, "LearnCancelled", "ss", D.learn_id, err);
+		learn_stop();
+		return true;
+	}
+	LOG("learned %s: %s -> %s\n", m.id, m.source_str, m.target_str);
+	sd_bus_emit_signal(D.bus, OBJ_PATH, IFACE, "Learned", "sss", m.id, m.source_str, m.target_str);
+	learn_stop();
+	props_changed("MappingCount", NULL);
+	return true;
+}
+
+/* ============================================================ inputs */
+static void on_midi_event(void *data, uint64_t count)
+{
+	for (;;) {
+		unsigned r = atomic_load_explicit(&D.ring_r, memory_order_relaxed);
+		unsigned w = atomic_load_explicit(&D.ring_w, memory_order_acquire);
+		if (r == w)
+			break;
+		struct midi_ev e = D.ring[r & (MIDI_RING - 1)];
+		atomic_store_explicit(&D.ring_r, r + 1, memory_order_release);
+		struct ctl_source src;
+		double v;
+		if (!ctl_midi_event(e.data, e.size, &src, &v))
+			continue;
+		D.midi_events++;
+		char s[64];
+		if (D.verbose) {
+			ctl_format_source(&src, s, sizeof(s));
+			VLOG("midi %s %.4f (cycle t=%" PRIu64 ", main t=%" PRIu64 ")\n", s, v, e.ns, now_ns());
+		}
+		/* only note-ons and controller moves are learned */
+		if (!(src.kind == CTL_SRC_NOTE && v == 0) && learn_input(&src))
+			continue;
+		for (int i = 0; i < MAX_MAPPINGS; i++)
+			if (D.maps[i].used && D.maps[i].src.kind != CTL_SRC_OSC && ctl_source_matches(&D.maps[i].src, &src))
+				mapping_input(&D.maps[i], v, false);
+	}
+}
+
+static void osc_dispatch(void *data, const struct osc_msg *msg)
+{
+	struct ctl_source src;
+	memset(&src, 0, sizeof(src));
+	src.kind = CTL_SRC_OSC;
+	if (strlen(msg->address) >= sizeof(src.address) || !strcmp(msg->address, "/backline/auth"))
+		return;
+	strcpy(src.address, msg->address);
+	D.received++;
+	double x = 1;
+	bool impulse = msg->argc == 0 || msg->argv[0].type == 'I';
+	if (msg->argc > 0 && !impulse && !osc_arg_number(&msg->argv[0], &x))
+		impulse = true; /* a string argument: a press */
+	VLOG("osc %s %g%s (t=%" PRIu64 ")\n", msg->address, x, impulse ? " (press)" : "", now_ns());
+	if (learn_input(&src))
+		return;
+	for (int i = 0; i < MAX_MAPPINGS; i++) {
+		struct mapping *m = &D.maps[i];
+		if (m->used && m->src.kind == CTL_SRC_OSC && !strcmp(m->src.address, src.address))
+			mapping_input(m, impulse ? 1 : ctl_normalize(x, m->in_min, m->in_max), impulse);
+	}
+}
+
+/* ============================================================ listeners */
+static bool same_ip(const struct sockaddr_storage *a, const struct sockaddr_storage *b)
+{
+	if (a->ss_family != b->ss_family)
+		return false;
+	if (a->ss_family == AF_INET)
+		return ((const struct sockaddr_in *)a)->sin_addr.s_addr == ((const struct sockaddr_in *)b)->sin_addr.s_addr;
+	return !memcmp(&((const struct sockaddr_in6 *)a)->sin6_addr, &((const struct sockaddr_in6 *)b)->sin6_addr, 16);
+}
+
+static struct peer *peer_of(struct listener *l, const struct sockaddr_storage *ss, uint64_t now)
+{
+	struct peer *oldest = &l->peers[0];
+	for (int i = 0; i < MAX_PEERS; i++) {
+		struct peer *p = &l->peers[i];
+		if (p->used && same_ip(&p->addr, ss)) {
+			p->last_ns = now;
+			return p;
+		}
+		if (!p->used || p->last_ns < oldest->last_ns)
+			oldest = p;
+	}
+	memset(oldest, 0, sizeof(*oldest));
+	oldest->used = true;
+	oldest->addr = *ss;
+	oldest->last_ns = now;
+	return oldest;
+}
+
+static void reject(const char *why, const struct sockaddr_storage *ss)
+{
+	D.rejected++;
+	if (D.rejected <= 20 || D.verbose) {
+		char a[INET6_ADDRSTRLEN] = "?";
+		if (ss->ss_family == AF_INET)
+			inet_ntop(AF_INET, &((const struct sockaddr_in *)ss)->sin_addr, a, sizeof(a));
+		else if (ss->ss_family == AF_INET6)
+			inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)ss)->sin6_addr, a, sizeof(a));
+		LOG("rejected %s: %s\n", a, why);
+	}
+}
+
+static void on_udp(void *data, int fd, uint32_t mask)
+{
+	struct listener *l = data;
+	for (int k = 0; k < 64; k++) {
+		struct sockaddr_storage ss;
+		socklen_t sl = sizeof(ss);
+		ssize_t n = recvfrom(fd, l->udp_buf, l->spec.max_size + 1, MSG_TRUNC, (struct sockaddr *)&ss, &sl);
+		if (n < 0)
+			return;
+		uint64_t now = now_ns();
+		if (!ctl_peer_allowed(&l->spec, l->loopback, (struct sockaddr *)&ss)) {
+			reject("not on the allow-list", &ss);
+			continue;
+		}
+		struct peer *p = peer_of(l, &ss, now);
+		if (!ctl_bucket_take(&p->bucket, l->spec.max_rate, now)) {
+			reject("over the rate limit", &ss);
+			continue;
+		}
+		if ((size_t)n > l->spec.max_size) {
+			D.malformed++;
+			reject("packet over max-size", &ss);
+			continue;
+		}
+		if (osc_parse(l->udp_buf, (size_t)n, osc_dispatch, NULL) < 0) {
+			D.malformed++;
+			reject("malformed OSC", &ss);
+		}
+	}
+}
+
+static void conn_close(struct conn *c)
+{
+	struct listener *l = c->l;
+	pw_loop_destroy_source(D.l, c->src);
+	close(c->fd);
+	free(c->buf);
+	for (int i = 0; i < l->n_conns; i++)
+		if (l->conns[i] == c) {
+			l->conns[i] = l->conns[--l->n_conns];
+			break;
+		}
+	free(c);
+}
+
+static void tcp_send(struct conn *c, const uint8_t *pkt, size_t n)
+{
+	uint8_t frame[4 + 512];
+	if (n > 512)
+		return;
+	frame[0] = (uint8_t)(n >> 24); frame[1] = (uint8_t)(n >> 16); frame[2] = (uint8_t)(n >> 8); frame[3] = (uint8_t)n;
+	memcpy(frame + 4, pkt, n);
+	(void)!send(c->fd, frame, n + 4, MSG_NOSIGNAL | MSG_DONTWAIT);
+}
+
+struct auth_ctx {
+	struct conn *c;
+	int result; /* 0 not an auth message, 1 ok, -1 wrong */
+};
+
+static void auth_check(void *data, const struct osc_msg *m)
+{
+	struct auth_ctx *a = data;
+	if (a->result)
+		return;
+	if (strcmp(m->address, "/backline/auth") || m->argc != 1 || m->argv[0].type != 's') {
+		a->result = -1;
+		return;
+	}
+	const char *given = m->argv[0].s;
+	a->result = ctl_secret_equal(given, strlen(given), a->c->l->spec.secret) ? 1 : -1;
+}
+
+/* false: the connection was closed */
+static bool tcp_packet(struct conn *c, const uint8_t *pkt, size_t n)
+{
+	struct listener *l = c->l;
+	uint64_t now = now_ns();
+	struct peer *p = peer_of(l, &c->peer, now);
+	if (!ctl_bucket_take(&p->bucket, l->spec.max_rate, now)) {
+		reject("over the rate limit", &c->peer);
+		return true;
+	}
+	if (osc_parse(pkt, n, NULL, NULL) < 0) {
+		D.malformed++;
+		reject("malformed OSC, closing", &c->peer);
+		conn_close(c);
+		return false;
+	}
+	if (!c->authed) {
+		struct auth_ctx a = { c, 0 };
+		osc_parse(pkt, n, auth_check, &a);
+		uint8_t reply[128];
+		if (a.result == 1) {
+			c->authed = true;
+			p->fails = 0;
+			size_t rn = osc_build(reply, sizeof(reply), "/backline/auth", "i", 1);
+			tcp_send(c, reply, rn);
+			VLOG("tcp peer authenticated\n");
+			return true;
+		}
+		D.auth_failures++;
+		if (++p->fails >= BLOCK_AFTER_FAILS)
+			p->blocked_until = now + BLOCK_NS;
+		reject("wrong or missing secret, closing", &c->peer);
+		size_t rn = osc_build(reply, sizeof(reply), "/backline/auth", "i", 0);
+		tcp_send(c, reply, rn);
+		conn_close(c);
+		return false;
+	}
+	osc_parse(pkt, n, osc_dispatch, NULL);
+	return true;
+}
+
+static void on_tcp_conn(void *data, int fd, uint32_t mask)
+{
+	struct conn *c = data;
+	struct listener *l = c->l;
+	if (mask & (SPA_IO_ERR | SPA_IO_HUP)) {
+		conn_close(c);
+		return;
+	}
+	size_t cap = l->spec.max_size + 4;
+	ssize_t n = recv(fd, c->buf + c->have, cap - c->have, MSG_DONTWAIT);
+	if (n <= 0) {
+		if (n == 0 || (errno != EAGAIN && errno != EINTR))
+			conn_close(c);
+		return;
+	}
+	c->have += (size_t)n;
+	while (c->have >= 4) {
+		uint32_t len = (uint32_t)c->buf[0] << 24 | (uint32_t)c->buf[1] << 16 | (uint32_t)c->buf[2] << 8 | c->buf[3];
+		if (len == 0 || len > l->spec.max_size) {
+			D.malformed++;
+			reject("frame size out of range, closing", &c->peer);
+			conn_close(c);
+			return;
+		}
+		if (c->have < 4 + (size_t)len)
+			break;
+		if (!tcp_packet(c, c->buf + 4, len))
+			return;
+		memmove(c->buf, c->buf + 4 + len, c->have - 4 - len);
+		c->have -= 4 + len;
+	}
+}
+
+static void on_tcp_accept(void *data, int fd, uint32_t mask)
+{
+	struct listener *l = data;
+	for (;;) {
+		struct sockaddr_storage ss;
+		socklen_t sl = sizeof(ss);
+		int cfd = accept4(fd, (struct sockaddr *)&ss, &sl, SOCK_NONBLOCK | SOCK_CLOEXEC);
+		if (cfd < 0)
+			return;
+		uint64_t now = now_ns();
+		if (!ctl_peer_allowed(&l->spec, l->loopback, (struct sockaddr *)&ss)) {
+			reject("not on the allow-list", &ss);
+			close(cfd);
+			continue;
+		}
+		struct peer *p = peer_of(l, &ss, now);
+		if (p->blocked_until > now) {
+			reject("blocked after failed authentication", &ss);
+			close(cfd);
+			continue;
+		}
+		if (l->n_conns >= (int)l->spec.max_clients || l->n_conns >= MAX_CONNS) {
+			reject("too many clients", &ss);
+			close(cfd);
+			continue;
+		}
+		struct conn *c = calloc(1, sizeof(*c));
+		c->buf = malloc(l->spec.max_size + 4);
+		c->fd = cfd;
+		c->peer = ss;
+		c->l = l;
+		c->opened_ns = now;
+		c->authed = !l->spec.secret[0];
+		c->src = pw_loop_add_io(D.l, cfd, SPA_IO_IN | SPA_IO_ERR | SPA_IO_HUP, false, on_tcp_conn, c);
+		l->conns[l->n_conns++] = c;
+	}
+}
+
+static void listener_close(struct listener *l)
+{
+	while (l->n_conns)
+		conn_close(l->conns[0]);
+	if (l->src)
+		pw_loop_destroy_source(D.l, l->src);
+	if (l->fd > 0)
+		close(l->fd);
+	free(l->udp_buf);
+	memset(l, 0, sizeof(*l));
+}
+
+static void format_listener_id(const struct ctl_listen_spec *s, uint16_t port, char *out, size_t n)
+{
+	bool v6 = strchr(s->address, ':') != NULL;
+	snprintf(out, n, "%s:%s%s%s:%u", s->tcp ? "tcp" : "udp", v6 ? "[" : "", s->address, v6 ? "]" : "", port);
+}
+
+static struct listener *listener_open(const struct ctl_listen_spec *spec, const char *origin, char *err, size_t n)
+{
+	if (ctl_check_listen(spec, err, n) < 0)
+		return NULL;
+	struct sockaddr_storage ss;
+	socklen_t sl;
+	bool loopback;
+	ctl_parse_address(spec->address, spec->port, &ss, &sl, &loopback, err, n);
+	struct listener *l = NULL;
+	for (int i = 0; i < MAX_LISTENERS; i++)
+		if (!D.lis[i].used) {
+			l = &D.lis[i];
+			break;
+		}
+	if (!l) {
+		snprintf(err, n, "too many listeners (%d)", MAX_LISTENERS);
+		return NULL;
+	}
+	int fd = socket(ss.ss_family, (spec->tcp ? SOCK_STREAM : SOCK_DGRAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		snprintf(err, n, "socket: %s", strerror(errno));
+		return NULL;
+	}
+	int one = 1;
+	if (ss.ss_family == AF_INET6)
+		setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+	/* a restart must get its port back while closed connections sit in
+	 * TIME_WAIT (Linux still refuses a second listener on the port) */
+	if (spec->tcp)
+		setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	if (bind(fd, (struct sockaddr *)&ss, sl) < 0 || (spec->tcp && listen(fd, 8) < 0)) {
+		snprintf(err, n, "cannot listen on %s port %u: %s", spec->address, spec->port, strerror(errno));
+		close(fd);
+		return NULL;
+	}
+	memset(l, 0, sizeof(*l));
+	l->used = true;
+	l->spec = *spec;
+	l->loopback = loopback;
+	l->fd = fd;
+	snprintf(l->origin, sizeof(l->origin), "%s", origin ? origin : "");
+	struct sockaddr_storage bound;
+	socklen_t bl = sizeof(bound);
+	getsockname(fd, (struct sockaddr *)&bound, &bl);
+	uint16_t port = ntohs(bound.ss_family == AF_INET ? ((struct sockaddr_in *)&bound)->sin_port
+							  : ((struct sockaddr_in6 *)&bound)->sin6_port);
+	l->spec.port = port;
+	format_listener_id(spec, port, l->id, sizeof(l->id));
+	if (spec->tcp) {
+		l->src = pw_loop_add_io(D.l, fd, SPA_IO_IN, false, on_tcp_accept, l);
+	} else {
+		l->udp_buf = malloc(spec->max_size + 1);
+		l->src = pw_loop_add_io(D.l, fd, SPA_IO_IN, false, on_udp, l);
+	}
+	LOG("listening on %s%s%s\n", l->id, loopback ? " (loopback)" : "", l->spec.secret[0] ? ", secret required" : "");
+	props_changed("Listeners", NULL);
+	return l;
+}
+
+static void spec_defaults(struct ctl_listen_spec *s)
+{
+	memset(s, 0, sizeof(*s));
+	s->max_rate = 500;
+	s->max_clients = 8;
+	s->max_size = 8192;
+}
+
+static int spec_from_json(json_object *o, struct ctl_listen_spec *s, char *err, size_t n)
+{
+	spec_defaults(s);
+	if (!json_object_is_type(o, json_type_object)) {
+		snprintf(err, n, "a listener is a JSON object");
+		return -1;
+	}
+	json_object_object_foreach(o, key, val) {
+		if (!strcmp(key, "proto")) {
+			const char *p = json_object_get_string(val);
+			if (!strcmp(p, "tcp")) s->tcp = true;
+			else if (strcmp(p, "udp")) { snprintf(err, n, "proto is udp or tcp"); return -1; }
+		} else if (!strcmp(key, "address")) snprintf(s->address, sizeof(s->address), "%s", json_object_get_string(val));
+		else if (!strcmp(key, "port")) {
+			int p = json_object_get_int(val);
+			if (p < 0 || p > 65535) { snprintf(err, n, "port out of range"); return -1; }
+			s->port = (uint16_t)p;
+		} else if (!strcmp(key, "allow")) {
+			if (!json_object_is_type(val, json_type_array)) { snprintf(err, n, "allow is an array"); return -1; }
+			for (size_t i = 0; i < json_object_array_length(val); i++) {
+				const char *c = json_object_get_string(json_object_array_get_idx(val, i));
+				if (s->n_allow >= CTL_MAX_ALLOW || ctl_parse_cidr(c, &s->allow[s->n_allow]) < 0) {
+					snprintf(err, n, "'%s' is not an IP address or CIDR (or too many)", c ? c : "");
+					return -1;
+				}
+				s->n_allow++;
+			}
+		} else if (!strcmp(key, "secret")) snprintf(s->secret, sizeof(s->secret), "%s", json_object_get_string(val));
+		else if (!strcmp(key, "insecure-udp")) s->insecure_udp = json_object_get_boolean(val);
+		else if (!strcmp(key, "max-rate")) s->max_rate = (uint32_t)json_object_get_int64(val);
+		else if (!strcmp(key, "max-clients")) s->max_clients = (uint32_t)json_object_get_int64(val);
+		else if (!strcmp(key, "max-size")) s->max_size = (uint32_t)json_object_get_int64(val);
+		else { snprintf(err, n, "unknown listener key '%s'", key); return -1; }
+	}
+	return 0;
+}
+
+static json_object *spec_to_json(const struct listener *l, bool with_secret)
+{
+	const struct ctl_listen_spec *s = &l->spec;
+	json_object *o = json_object_new_object();
+	if (!with_secret)
+		json_object_object_add(o, "id", json_object_new_string(l->id));
+	json_object_object_add(o, "proto", json_object_new_string(s->tcp ? "tcp" : "udp"));
+	json_object_object_add(o, "address", json_object_new_string(s->address));
+	json_object_object_add(o, "port", json_object_new_int(s->port));
+	json_object *a = json_object_new_array();
+	for (int i = 0; i < s->n_allow; i++) {
+		char buf[INET6_ADDRSTRLEN + 8];
+		inet_ntop(s->allow[i].family, s->allow[i].addr, buf, sizeof(buf));
+		snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "/%d", s->allow[i].prefix);
+		json_object_array_add(a, json_object_new_string(buf));
+	}
+	json_object_object_add(o, "allow", a);
+	if (with_secret && s->secret[0])
+		json_object_object_add(o, "secret", json_object_new_string(s->secret));
+	if (!with_secret) {
+		json_object_object_add(o, "auth", json_object_new_boolean(s->secret[0] != 0));
+		json_object_object_add(o, "loopback", json_object_new_boolean(l->loopback));
+		if (s->tcp)
+			json_object_object_add(o, "clients", json_object_new_int(l->n_conns));
+	}
+	if (s->insecure_udp)
+		json_object_object_add(o, "insecure-udp", json_object_new_boolean(1));
+	json_object_object_add(o, "max-rate", json_object_new_int64(s->max_rate));
+	if (s->tcp)
+		json_object_object_add(o, "max-clients", json_object_new_int64(s->max_clients));
+	json_object_object_add(o, "max-size", json_object_new_int64(s->max_size));
+	return o;
+}
+
+/* ============================================================ MIDI follow */
+static int follow_port(void *data, const struct bl_port *p)
+{
+	if (!D.follow_on || D.midi_port_id == SPA_ID_INVALID || !p->midi || !p->output)
+		return 0;
+	char hay[700];
+	snprintf(hay, sizeof(hay), "%s:%s | %s", p->node_name, p->name, p->alias);
+	if (regexec(&D.follow_re, hay, 0, NULL, 0) == 0 && !bl_graph_is_linked(D.graph, p->id, D.midi_port_id)) {
+		LOG("midi-follow: linking %s\n", hay);
+		bl_graph_link(D.graph, p->id, D.midi_port_id);
+		if (D.n_followed < 64)
+			D.followed[D.n_followed++] = p->id;
+	}
+	return 0;
+}
+
+static int find_own_port(void *data, const struct bl_port *p)
+{
+	if (D.node_id != SPA_ID_INVALID && p->node_id == D.node_id && !p->output && p->midi) {
+		D.midi_port_id = p->id;
+		return 1;
+	}
+	return 0;
+}
+
+static void on_port_added(void *data, const struct bl_port *p)
+{
+	if (D.midi_port_id == SPA_ID_INVALID && find_own_port(NULL, p)) {
+		bl_graph_for_each_port(D.graph, follow_port, NULL);
+		return;
+	}
+	follow_port(NULL, p);
+}
+
+static void on_port_removed(void *data, uint32_t id)
+{
+	if (id == D.midi_port_id)
+		D.midi_port_id = SPA_ID_INVALID;
+	for (int i = 0; i < D.n_followed; i++)
+		if (D.followed[i] == id) {
+			D.followed[i] = D.followed[--D.n_followed];
+			break;
+		}
+}
+
+static const struct bl_graph_events graph_events = {
+	.port_added = on_port_added,
+	.port_removed = on_port_removed,
+};
+
+static int set_follow(const char *re, char *err, size_t n)
+{
+	regex_t nr;
+	if (re && *re) {
+		int r = regcomp(&nr, re, REG_EXTENDED | REG_ICASE | REG_NOSUB);
+		if (r) {
+			regerror(r, &nr, err, n);
+			return -1;
+		}
+	}
+	/* drop the links this daemon made to sources that no longer match */
+	for (int i = 0; i < D.n_followed; i++)
+		if (D.midi_port_id != SPA_ID_INVALID)
+			bl_graph_unlink(D.graph, D.followed[i], D.midi_port_id);
+	D.n_followed = 0;
+	if (D.follow_on)
+		regfree(&D.follow_re);
+	D.follow_on = re && *re;
+	snprintf(D.follow, sizeof(D.follow), "%s", re ? re : "");
+	if (D.follow_on) {
+		D.follow_re = nr;
+		bl_graph_for_each_port(D.graph, follow_port, NULL);
+	}
+	props_changed("MidiFollow", NULL);
+	return 0;
+}
+
+/* ============================================================ config */
+static void default_config_dir(void)
+{
+	const char *own = getenv("BACKLINE_CONTROL_DIR"), *x = getenv("XDG_CONFIG_HOME"), *h = getenv("HOME");
+	if (D.config_dir[0])
+		return;
+	if (own)
+		snprintf(D.config_dir, sizeof(D.config_dir), "%s", own);
+	else if (x && *x)
+		snprintf(D.config_dir, sizeof(D.config_dir), "%s/backline/control", x);
+	else
+		snprintf(D.config_dir, sizeof(D.config_dir), "%s/.config/backline/control", h ? h : ".");
+}
+
+static int name_cmp(const struct dirent **a, const struct dirent **b) { return strcmp((*a)->d_name, (*b)->d_name); }
+static int json_file(const struct dirent *d)
+{
+	size_t n = strlen(d->d_name);
+	return d->d_name[0] != '.' && n > 5 && !strcmp(d->d_name + n - 5, ".json");
+}
+
+static void load_file(const char *path, const char *base)
+{
+	json_object *j = json_object_from_file(path);
+	if (!j) {
+		LOG("%s: not readable JSON, skipped\n", path);
+		return;
+	}
+	json_object *v;
+	if (!json_object_object_get_ex(j, "schema", &v) || strcmp(json_object_get_string(v), SCHEMA)) {
+		LOG("%s: not a %s file, skipped\n", path, SCHEMA);
+		json_object_put(j);
+		return;
+	}
+	char err[300];
+	if (json_object_object_get_ex(j, "mappings", &v) && json_object_is_type(v, json_type_array))
+		for (size_t i = 0; i < json_object_array_length(v); i++) {
+			struct mapping m;
+			if (mapping_from_json(json_object_array_get_idx(v, i), &m, err, sizeof(err)) < 0 ||
+			    (snprintf(m.origin, sizeof(m.origin), "%s", base), !mapping_insert(&m, err, sizeof(err))))
+				LOG("%s: mapping %zu skipped: %s\n", path, i, err);
+		}
+	if (json_object_object_get_ex(j, "listeners", &v) && json_object_is_type(v, json_type_array))
+		for (size_t i = 0; i < json_object_array_length(v); i++) {
+			struct ctl_listen_spec s;
+			if (spec_from_json(json_object_array_get_idx(v, i), &s, err, sizeof(err)) < 0 ||
+			    !listener_open(&s, base, err, sizeof(err)))
+				LOG("%s: listener %zu not opened: %s\n", path, i, err);
+		}
+	if (json_object_object_get_ex(j, "midi-follow", &v) && json_object_get_string(v)[0] && !D.follow_on)
+		if (set_follow(json_object_get_string(v), err, sizeof(err)) < 0)
+			LOG("%s: midi-follow: %s\n", path, err);
+	json_object_put(j);
+	LOG("loaded %s\n", path);
+}
+
+static void load_config(void)
+{
+	struct dirent **list;
+	int n = scandir(D.config_dir, &list, json_file, name_cmp);
+	if (n < 0)
+		return;
+	for (int i = 0; i < n; i++) {
+		char p[1200];
+		snprintf(p, sizeof(p), "%s/%s", D.config_dir, list[i]->d_name);
+		load_file(p, list[i]->d_name);
+		free(list[i]);
+	}
+	free(list);
+}
+
+static int mkdir_p(const char *path)
+{
+	char tmp[700];
+	snprintf(tmp, sizeof(tmp), "%s", path);
+	for (char *p = tmp + 1; *p; p++)
+		if (*p == '/') {
+			*p = 0;
+			if (mkdir(tmp, 0700) < 0 && errno != EEXIST)
+				return -errno;
+			*p = '/';
+		}
+	return mkdir(tmp, 0700) < 0 && errno != EEXIST ? -errno : 0;
+}
+
+/* Writes control.json: what was made at run time and what came from it. */
+static int save_config(char *path_out, size_t n, char *err, size_t en)
+{
+	if (mkdir_p(D.config_dir) < 0) {
+		snprintf(err, en, "cannot create %s: %s", D.config_dir, strerror(errno));
+		return -1;
+	}
+	json_object *o = json_object_new_object();
+	json_object_object_add(o, "schema", json_object_new_string(SCHEMA));
+	if (D.follow_on)
+		json_object_object_add(o, "midi-follow", json_object_new_string(D.follow));
+	json_object *ls = json_object_new_array();
+	for (int i = 0; i < MAX_LISTENERS; i++)
+		if (D.lis[i].used && (!D.lis[i].origin[0] || !strcmp(D.lis[i].origin, "control.json")))
+			json_object_array_add(ls, spec_to_json(&D.lis[i], true));
+	json_object_object_add(o, "listeners", ls);
+	json_object *ms = json_object_new_array();
+	for (int i = 0; i < MAX_MAPPINGS; i++)
+		if (D.maps[i].used && (!D.maps[i].origin[0] || !strcmp(D.maps[i].origin, "control.json")))
+			json_object_array_add(ms, mapping_to_json(&D.maps[i], false));
+	json_object_object_add(o, "mappings", ms);
+	char tmp[800], final[800];
+	snprintf(final, sizeof(final), "%s/control.json", D.config_dir);
+	snprintf(tmp, sizeof(tmp), "%s/.control.json.tmp", D.config_dir);
+	const char *s = json_object_to_json_string_ext(o, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE);
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600); /* it may hold a secret */
+	int r = -1;
+	if (fd >= 0) {
+		size_t len = strlen(s);
+		r = write(fd, s, len) == (ssize_t)len && write(fd, "\n", 1) == 1 && fsync(fd) == 0 ? 0 : -1;
+		close(fd);
+		if (r == 0)
+			r = rename(tmp, final);
+	}
+	json_object_put(o);
+	if (r < 0) {
+		snprintf(err, en, "cannot write %s: %s", final, strerror(errno));
+		unlink(tmp);
+		return -1;
+	}
+	for (int i = 0; i < MAX_MAPPINGS; i++)
+		if (D.maps[i].used && !D.maps[i].origin[0])
+			snprintf(D.maps[i].origin, sizeof(D.maps[i].origin), "control.json");
+	for (int i = 0; i < MAX_LISTENERS; i++)
+		if (D.lis[i].used && !D.lis[i].origin[0])
+			snprintf(D.lis[i].origin, sizeof(D.lis[i].origin), "control.json");
+	snprintf(path_out, n, "%s", final);
+	return 0;
+}
+
+/* ============================================================ D-Bus API */
+static int read_options(sd_bus_message *m, struct mapping *t, char *learn_from, sd_bus_error *err, uint32_t *timeout)
+{
+	int r = sd_bus_message_enter_container(m, 'a', "{sv}");
+	if (r < 0)
+		return r;
+	const char *key;
+	while ((r = sd_bus_message_enter_container(m, 'e', "sv")) > 0) {
+		if ((r = sd_bus_message_read(m, "s", &key)) < 0)
+			return r;
+		const char *sig = NULL;
+		sd_bus_message_peek_type(m, NULL, &sig);
+		if (!strcmp(key, "min") || !strcmp(key, "max") || !strcmp(key, "in-min") || !strcmp(key, "in-max")) {
+			double d;
+			if (!sig || strcmp(sig, "d"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s is a double (d)", key);
+			sd_bus_message_read(m, "v", "d", &d);
+			if (!strcmp(key, "min")) { t->min = d; t->has_min = true; }
+			else if (!strcmp(key, "max")) { t->max = d; t->has_max = true; }
+			else if (!strcmp(key, "in-min")) t->in_min = d;
+			else t->in_max = d;
+		} else if (!strcmp(key, "invert")) {
+			int b;
+			if (!sig || strcmp(sig, "b"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "invert is a boolean (b)");
+			sd_bus_message_read(m, "v", "b", &b);
+			t->invert = b;
+		} else if (!strcmp(key, "id")) {
+			const char *s;
+			if (!sig || strcmp(sig, "s"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "id is a string (s)");
+			sd_bus_message_read(m, "v", "s", &s);
+			snprintf(t->id, sizeof(t->id), "%s", s);
+		} else if (!strcmp(key, "args")) {
+			if (!sig || strcmp(sig, "as"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "args is an array of strings (as)");
+			sd_bus_message_enter_container(m, 'v', "as");
+			sd_bus_message_enter_container(m, 'a', "s");
+			const char *s;
+			while (sd_bus_message_read(m, "s", &s) > 0)
+				if (t->nargs < MAX_ARGS)
+					snprintf(t->args[t->nargs++], sizeof(t->args[0]), "%s", s);
+			sd_bus_message_exit_container(m);
+			sd_bus_message_exit_container(m);
+		} else if (learn_from && !strcmp(key, "from")) {
+			const char *s;
+			if (!sig || strcmp(sig, "s"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "from is a string (s)");
+			sd_bus_message_read(m, "v", "s", &s);
+			if (strcmp(s, "midi") && strcmp(s, "osc") && strcmp(s, "any"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "from is midi, osc or any");
+			snprintf(learn_from, 8, "%s", s);
+		} else if (timeout && !strcmp(key, "timeout")) {
+			if (!sig || strcmp(sig, "u"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "timeout is seconds (u)");
+			sd_bus_message_read(m, "v", "u", timeout);
+		} else {
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "unknown option '%s'", key);
+		}
+		sd_bus_message_exit_container(m);
+	}
+	return sd_bus_message_exit_container(m);
+}
+
+static int m_map(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *src, *tgt;
+	int r = sd_bus_message_read(m, "ss", &src, &tgt);
+	if (r < 0)
+		return r;
+	struct mapping t;
+	mapping_defaults(&t);
+	if ((r = read_options(m, &t, NULL, err, NULL)) < 0)
+		return r;
+	snprintf(t.source_str, sizeof(t.source_str), "%s", src);
+	snprintf(t.target_str, sizeof(t.target_str), "%s", tgt);
+	char e[400];
+	struct mapping *nm;
+	if (mapping_finish(&t, e, sizeof(e)) < 0 || !(nm = mapping_insert(&t, e, sizeof(e))))
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s", e);
+	ctl_format_source(&nm->src, nm->source_str, sizeof(nm->source_str)); /* canonical */
+	LOG("mapped %s: %s -> %s\n", nm->id, nm->source_str, nm->target_str);
+	props_changed("MappingCount", NULL);
+	return sd_bus_reply_method_return(m, "s", nm->id);
+}
+
+static int m_add_mapping(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *js;
+	int r = sd_bus_message_read(m, "s", &js);
+	if (r < 0)
+		return r;
+	json_object *o = json_tokener_parse(js);
+	if (!o)
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "not valid JSON");
+	struct mapping t;
+	char e[400];
+	struct mapping *nm = NULL;
+	r = mapping_from_json(o, &t, e, sizeof(e));
+	json_object_put(o);
+	if (r < 0 || !(nm = mapping_insert(&t, e, sizeof(e))))
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s", e);
+	ctl_format_source(&nm->src, nm->source_str, sizeof(nm->source_str));
+	LOG("mapped %s: %s -> %s\n", nm->id, nm->source_str, nm->target_str);
+	props_changed("MappingCount", NULL);
+	return sd_bus_reply_method_return(m, "s", nm->id);
+}
+
+static int m_remove(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *id;
+	int r = sd_bus_message_read(m, "s", &id);
+	if (r < 0)
+		return r;
+	struct mapping *mp = find_mapping(id);
+	if (!mp)
+		return sd_bus_error_setf(err, ERR_NOTFOUND, "no mapping '%s'", id);
+	mp->used = false; /* in-flight replies find no mapping and are dropped */
+	props_changed("MappingCount", NULL);
+	return sd_bus_reply_method_return(m, "");
+}
+
+static int m_mappings(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	json_object *o = json_object_new_object();
+	json_object_object_add(o, "schema", json_object_new_string(SCHEMA));
+	json_object *ms = json_object_new_array();
+	for (int i = 0; i < MAX_MAPPINGS; i++)
+		if (D.maps[i].used)
+			json_object_array_add(ms, mapping_to_json(&D.maps[i], true));
+	json_object_object_add(o, "mappings", ms);
+	json_object *ls = json_object_new_array();
+	for (int i = 0; i < MAX_LISTENERS; i++)
+		if (D.lis[i].used)
+			json_object_array_add(ls, spec_to_json(&D.lis[i], false));
+	json_object_object_add(o, "listeners", ls);
+	json_object_object_add(o, "midi-follow", json_object_new_string(D.follow));
+	int r = sd_bus_reply_method_return(m, "s", json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
+	json_object_put(o);
+	return r;
+}
+
+static int m_learn(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *tgt;
+	int r = sd_bus_message_read(m, "s", &tgt);
+	if (r < 0)
+		return r;
+	if (D.learning)
+		return sd_bus_error_setf(err, ERR_BUSY, "already learning %s (CancelLearn first)", D.learn_id);
+	struct mapping t;
+	mapping_defaults(&t);
+	char from[8] = "any";
+	uint32_t timeout = 30;
+	if ((r = read_options(m, &t, from, err, &timeout)) < 0)
+		return r;
+	struct ctl_target pt;
+	char e[400];
+	if (ctl_parse_target(tgt, &pt, e, sizeof(e)) < 0)
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s", e);
+	if (t.id[0] && find_mapping(t.id))
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "a mapping with id '%s' already exists", t.id);
+	if (!t.id[0]) {
+		do
+			snprintf(t.id, sizeof(t.id), "m%d", ++D.next_id);
+		while (find_mapping(t.id));
+	}
+	snprintf(t.target_str, sizeof(t.target_str), "%s", tgt);
+	D.learn_tmpl = t;
+	snprintf(D.learn_id, sizeof(D.learn_id), "%s", t.id);
+	snprintf(D.learn_target, sizeof(D.learn_target), "%s", tgt);
+	snprintf(D.learn_from, sizeof(D.learn_from), "%s", from);
+	D.learning = true;
+	if (timeout) {
+		struct timespec ts = { timeout, 0 };
+		pw_loop_update_timer(D.l, D.learn_timer, &ts, NULL, false);
+	}
+	LOG("learning %s for %s (from %s, %u s)\n", D.learn_id, tgt, from, timeout);
+	props_changed("Learning", NULL);
+	return sd_bus_reply_method_return(m, "s", D.learn_id);
+}
+
+static int m_cancel_learn(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	if (!D.learning)
+		return sd_bus_error_setf(err, ERR_STATE, "not learning");
+	sd_bus_emit_signal(D.bus, OBJ_PATH, IFACE, "LearnCancelled", "ss", D.learn_id, "cancelled");
+	learn_stop();
+	return sd_bus_reply_method_return(m, "");
+}
+
+static int m_listen(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *proto, *addr;
+	uint16_t port;
+	int r = sd_bus_message_read(m, "ssq", &proto, &addr, &port);
+	if (r < 0)
+		return r;
+	struct ctl_listen_spec s;
+	spec_defaults(&s);
+	if (!strcmp(proto, "tcp"))
+		s.tcp = true;
+	else if (strcmp(proto, "udp"))
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "proto is udp or tcp");
+	snprintf(s.address, sizeof(s.address), "%s", addr);
+	s.port = port;
+	if ((r = sd_bus_message_enter_container(m, 'a', "{sv}")) < 0)
+		return r;
+	const char *key;
+	while ((r = sd_bus_message_enter_container(m, 'e', "sv")) > 0) {
+		sd_bus_message_read(m, "s", &key);
+		const char *sig = NULL;
+		sd_bus_message_peek_type(m, NULL, &sig);
+		if (!strcmp(key, "allow")) {
+			if (!sig || strcmp(sig, "as"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "allow is an array of strings (as)");
+			sd_bus_message_enter_container(m, 'v', "as");
+			sd_bus_message_enter_container(m, 'a', "s");
+			const char *c;
+			while (sd_bus_message_read(m, "s", &c) > 0) {
+				if (s.n_allow >= CTL_MAX_ALLOW || ctl_parse_cidr(c, &s.allow[s.n_allow]) < 0)
+					return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "'%s' is not an IP address or CIDR (or too many)", c);
+				s.n_allow++;
+			}
+			sd_bus_message_exit_container(m);
+			sd_bus_message_exit_container(m);
+		} else if (!strcmp(key, "secret")) {
+			const char *v;
+			if (!sig || strcmp(sig, "s"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "secret is a string (s)");
+			sd_bus_message_read(m, "v", "s", &v);
+			snprintf(s.secret, sizeof(s.secret), "%s", v);
+		} else if (!strcmp(key, "insecure-udp")) {
+			int b;
+			if (!sig || strcmp(sig, "b"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "insecure-udp is a boolean (b)");
+			sd_bus_message_read(m, "v", "b", &b);
+			s.insecure_udp = b;
+		} else if (!strcmp(key, "max-rate") || !strcmp(key, "max-clients") || !strcmp(key, "max-size")) {
+			uint32_t u;
+			if (!sig || strcmp(sig, "u"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s is a number (u)", key);
+			sd_bus_message_read(m, "v", "u", &u);
+			if (!strcmp(key, "max-rate")) s.max_rate = u;
+			else if (!strcmp(key, "max-clients")) s.max_clients = u;
+			else s.max_size = u;
+		} else {
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "unknown option '%s'", key);
+		}
+		sd_bus_message_exit_container(m);
+	}
+	sd_bus_message_exit_container(m);
+	char e[400];
+	struct listener *l = listener_open(&s, NULL, e, sizeof(e));
+	if (!l)
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s", e);
+	return sd_bus_reply_method_return(m, "s", l->id);
+}
+
+static int m_unlisten(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *id;
+	int r = sd_bus_message_read(m, "s", &id);
+	if (r < 0)
+		return r;
+	for (int i = 0; i < MAX_LISTENERS; i++)
+		if (D.lis[i].used && !strcmp(D.lis[i].id, id)) {
+			LOG("closed %s\n", id);
+			listener_close(&D.lis[i]);
+			props_changed("Listeners", NULL);
+			return sd_bus_reply_method_return(m, "");
+		}
+	return sd_bus_error_setf(err, ERR_NOTFOUND, "no listener '%s'", id);
+}
+
+static int m_save(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	char path[800], e[400];
+	if (D.no_config)
+		return sd_bus_error_setf(err, ERR_STATE, "started with --no-config: nothing is saved");
+	if (save_config(path, sizeof(path), e, sizeof(e)) < 0)
+		return sd_bus_error_setf(err, SD_BUS_ERROR_FAILED, "%s", e);
+	LOG("saved %s\n", path);
+	return sd_bus_reply_method_return(m, "s", path);
+}
+
+static int m_set_follow(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *re;
+	int r = sd_bus_message_read(m, "s", &re);
+	if (r < 0)
+		return r;
+	char e[300];
+	if (set_follow(re, e, sizeof(e)) < 0)
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "bad regular expression: %s", e);
+	return sd_bus_reply_method_return(m, "");
+}
+
+static int p_str(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply, void *ud,
+		 sd_bus_error *err)
+{
+	if (!strcmp(prop, "Learning"))
+		return sd_bus_message_append(reply, "s", D.learning ? D.learn_target : "");
+	if (!strcmp(prop, "MidiFollow"))
+		return sd_bus_message_append(reply, "s", D.follow);
+	if (!strcmp(prop, "Node"))
+		return sd_bus_message_append(reply, "s", D.node_name);
+	if (!strcmp(prop, "ConfigDir"))
+		return sd_bus_message_append(reply, "s", D.no_config ? "" : D.config_dir);
+	return sd_bus_message_append(reply, "s", "");
+}
+
+static int p_num(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply, void *ud,
+		 sd_bus_error *err)
+{
+	if (!strcmp(prop, "MappingCount"))
+		return sd_bus_message_append(reply, "u", (uint32_t)n_mappings());
+	uint64_t v = 0;
+	if (!strcmp(prop, "Received")) v = D.received;
+	else if (!strcmp(prop, "MidiEvents")) v = D.midi_events;
+	else if (!strcmp(prop, "Rejected")) v = D.rejected;
+	else if (!strcmp(prop, "AuthFailures")) v = D.auth_failures;
+	else if (!strcmp(prop, "Malformed")) v = D.malformed;
+	else if (!strcmp(prop, "Dispatched")) v = D.dispatched;
+	else if (!strcmp(prop, "TargetErrors")) v = D.target_errors;
+	else if (!strcmp(prop, "MidiDropped")) v = atomic_load(&D.midi_dropped);
+	return sd_bus_message_append(reply, "t", v);
+}
+
+static int p_listeners(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply,
+		       void *ud, sd_bus_error *err)
+{
+	int r = sd_bus_message_open_container(reply, 'a', "s");
+	for (int i = 0; r >= 0 && i < MAX_LISTENERS; i++)
+		if (D.lis[i].used)
+			r = sd_bus_message_append(reply, "s", D.lis[i].id);
+	return r < 0 ? r : sd_bus_message_close_container(reply);
+}
+
+static const sd_bus_vtable vtable[] = {
+	SD_BUS_VTABLE_START(0),
+	SD_BUS_METHOD_WITH_ARGS("Map", SD_BUS_ARGS("s", source, "s", target, "a{sv}", options), SD_BUS_RESULT("s", id), m_map, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("AddMapping", SD_BUS_ARGS("s", json), SD_BUS_RESULT("s", id), m_add_mapping, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("RemoveMapping", SD_BUS_ARGS("s", id), SD_BUS_NO_RESULT, m_remove, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("Mappings", SD_BUS_NO_ARGS, SD_BUS_RESULT("s", json), m_mappings, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("Learn", SD_BUS_ARGS("s", target, "a{sv}", options), SD_BUS_RESULT("s", id), m_learn, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("CancelLearn", SD_BUS_NO_ARGS, SD_BUS_NO_RESULT, m_cancel_learn, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("Listen", SD_BUS_ARGS("s", proto, "s", address, "q", port, "a{sv}", options), SD_BUS_RESULT("s", id), m_listen, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("Unlisten", SD_BUS_ARGS("s", id), SD_BUS_NO_RESULT, m_unlisten, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("SetMidiFollow", SD_BUS_ARGS("s", regex), SD_BUS_NO_RESULT, m_set_follow, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("Save", SD_BUS_NO_ARGS, SD_BUS_RESULT("s", path), m_save, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_PROPERTY("MappingCount", "u", p_num, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+	SD_BUS_PROPERTY("Listeners", "as", p_listeners, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+	SD_BUS_PROPERTY("Learning", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+	SD_BUS_PROPERTY("MidiFollow", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+	SD_BUS_PROPERTY("Node", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+	SD_BUS_PROPERTY("ConfigDir", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+	SD_BUS_PROPERTY("Received", "t", p_num, 0, 0),
+	SD_BUS_PROPERTY("MidiEvents", "t", p_num, 0, 0),
+	SD_BUS_PROPERTY("MidiDropped", "t", p_num, 0, 0),
+	SD_BUS_PROPERTY("Rejected", "t", p_num, 0, 0),
+	SD_BUS_PROPERTY("AuthFailures", "t", p_num, 0, 0),
+	SD_BUS_PROPERTY("Malformed", "t", p_num, 0, 0),
+	SD_BUS_PROPERTY("Dispatched", "t", p_num, 0, 0),
+	SD_BUS_PROPERTY("TargetErrors", "t", p_num, 0, 0),
+	SD_BUS_SIGNAL_WITH_ARGS("Learned", SD_BUS_ARGS("s", id, "s", source, "s", target), 0),
+	SD_BUS_SIGNAL_WITH_ARGS("LearnCancelled", SD_BUS_ARGS("s", id, "s", reason), 0),
+	SD_BUS_VTABLE_END
+};
+
+/* ============================================================ loops */
+static void on_bus_io(void *data, int fd, uint32_t mask)
+{
+	while (sd_bus_process(D.bus, NULL) > 0) {}
+	sd_bus_flush(D.bus);
+}
+
+static void on_house(void *data, uint64_t exp)
+{
+	uint64_t now = now_ns();
+	for (int i = 0; i < MAX_LISTENERS; i++) {
+		struct listener *l = &D.lis[i];
+		if (!l->used || !l->spec.tcp)
+			continue;
+		for (int k = l->n_conns - 1; k >= 0; k--) {
+			struct conn *c = l->conns[k];
+			if (!c->authed && now - c->opened_ns > AUTH_TIMEOUT_NS) {
+				D.auth_failures++;
+				reject("no authentication within 5 s, closing", &c->peer);
+				conn_close(c);
+			}
+		}
+	}
+	bool busy = n_mappings() || n_listeners() || D.learning || D.follow_on;
+	if (busy || !D.idle_exit) {
+		D.idle_since = 0;
+	} else if (!D.idle_since) {
+		D.idle_since = now;
+	} else if (now - D.idle_since > (uint64_t)D.idle_exit * 1000000000ull) {
+		LOG("idle for %d s with nothing mapped, exiting\n", D.idle_exit);
+		pw_main_loop_quit(D.loop);
+	}
+	on_bus_io(NULL, 0, 0);
+}
+
+static void on_signal(void *data, int sig)
+{
+	pw_main_loop_quit(D.loop);
+}
+
+static void usage(FILE *f)
+{
+	fputs("usage: backline-controld [--name NODE] [--config-dir DIR | --no-config] [--midi-follow REGEX]\n"
+	      "                         [--idle-exit SECONDS] [--replace] [--verbose]\n"
+	      "  OSC and MIDI to any parameter, on the session bus (" BUS_NAME ", " IFACE ").\n"
+	      "  It opens no network socket unless a listener is configured or asked for (docs/api/Control1.md).\n"
+	      "  --config-dir DIR  mappings and listeners (default $XDG_CONFIG_HOME/backline/control)\n"
+	      "  --no-config       start empty and never write a file\n"
+	      "  --idle-exit N     exit after N s with nothing mapped (default 60; 0 = never)\n", f);
+}
+
+int main(int argc, char **argv)
+{
+	static const struct option opts[] = {
+		{ "name", required_argument, NULL, 'n' },
+		{ "config-dir", required_argument, NULL, 'c' },
+		{ "no-config", no_argument, NULL, 'N' },
+		{ "midi-follow", required_argument, NULL, 'm' },
+		{ "idle-exit", required_argument, NULL, 'i' },
+		{ "replace", no_argument, NULL, 'r' },
+		{ "verbose", no_argument, NULL, 'v' },
+		{ "help", no_argument, NULL, 'h' },
+		{ NULL, 0, NULL, 0 },
+	};
+	int c, replace = 0;
+	const char *follow = NULL;
+	D.idle_exit = 60;
+	snprintf(D.node_name, sizeof(D.node_name), "backline.control");
+	while ((c = getopt_long(argc, argv, "n:c:Nm:i:rvh", opts, NULL)) != -1) {
+		switch (c) {
+		case 'n': snprintf(D.node_name, sizeof(D.node_name), "%s", optarg); break;
+		case 'c': snprintf(D.config_dir, sizeof(D.config_dir), "%s", optarg); break;
+		case 'N': D.no_config = true; break;
+		case 'm': follow = optarg; break;
+		case 'i': D.idle_exit = atoi(optarg); break;
+		case 'r': replace = 1; break;
+		case 'v': D.verbose = true; break;
+		case 'h': usage(stdout); return 0;
+		default: usage(stderr); return 2;
+		}
+	}
+	default_config_dir();
+	D.node_id = D.midi_port_id = SPA_ID_INVALID;
+
+	pw_init(&argc, &argv);
+	D.loop = pw_main_loop_new(NULL);
+	D.l = pw_main_loop_get_loop(D.loop);
+	pw_loop_add_signal(D.l, SIGINT, on_signal, NULL);
+	pw_loop_add_signal(D.l, SIGTERM, on_signal, NULL);
+	D.context = pw_context_new(D.l, NULL, 0);
+	D.core = pw_context_connect(D.context, NULL, 0);
+	if (!D.core) {
+		fprintf(stderr, "backline-controld: cannot connect to PipeWire\n");
+		return 1;
+	}
+	D.registry = pw_core_get_registry(D.core, PW_VERSION_REGISTRY, 0);
+	D.graph = bl_graph_new(D.core, &graph_events, NULL);
+	D.midi_ev = pw_loop_add_event(D.l, on_midi_event, NULL);
+
+	/* The MIDI input: a node with one MIDI port and no audio. It is never
+	 * autoconnected; sources reach it by midi-follow or by a link someone
+	 * makes. */
+	struct pw_properties *props = pw_properties_new(
+		PW_KEY_MEDIA_TYPE, "Midi", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_CLASS, "Midi/Sink",
+		PW_KEY_NODE_DESCRIPTION, "Backline control (MIDI learn and mapping)", PW_KEY_NODE_AUTOCONNECT, "false",
+		"node.passive", "true", "backline.dbus.name", BUS_NAME, NULL);
+	D.filter = pw_filter_new(D.core, D.node_name, props);
+	pw_filter_add_listener(D.filter, &D.filter_listener, &filter_events, NULL);
+	D.midi_port = pw_filter_add_port(D.filter, PW_DIRECTION_INPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, 0,
+					 pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi", PW_KEY_PORT_NAME, "midi_in", NULL),
+					 NULL, 0);
+	if (pw_filter_connect(D.filter, PW_FILTER_FLAG_RT_PROCESS, NULL, 0) < 0) {
+		fprintf(stderr, "backline-controld: pw_filter_connect failed\n");
+		return 1;
+	}
+
+	int r = sd_bus_open_user(&D.bus);
+	if (r < 0) {
+		fprintf(stderr, "backline-controld: session bus: %s\n", strerror(-r));
+		return 1;
+	}
+	r = sd_bus_add_object_vtable(D.bus, NULL, OBJ_PATH, IFACE, vtable, NULL);
+	if (r < 0) {
+		fprintf(stderr, "backline-controld: %s\n", strerror(-r));
+		return 1;
+	}
+	D.bus_io = pw_loop_add_io(D.l, sd_bus_get_fd(D.bus), SPA_IO_IN, false, on_bus_io, NULL);
+	D.learn_timer = pw_loop_add_timer(D.l, on_learn_timeout, NULL);
+	D.house_timer = pw_loop_add_timer(D.l, on_house, NULL);
+	struct timespec hk = { 0, 250 * 1000000L };
+	pw_loop_update_timer(D.l, D.house_timer, &hk, &hk, false);
+
+	pw_core_sync(D.core, PW_ID_CORE, 0);
+	for (int i = 0; i < 20; i++)
+		pw_loop_iterate(D.l, 10);
+	if (!D.no_config)
+		load_config();
+	if (follow) {
+		char e[300];
+		if (set_follow(follow, e, sizeof(e)) < 0) {
+			fprintf(stderr, "backline-controld: --midi-follow: %s\n", e);
+			return 2;
+		}
+	}
+	/* the name last: a client that sees it sees the loaded mappings */
+	r = sd_bus_request_name(D.bus, BUS_NAME, replace ? SD_BUS_NAME_REPLACE_EXISTING | SD_BUS_NAME_ALLOW_REPLACEMENT
+							 : SD_BUS_NAME_ALLOW_REPLACEMENT);
+	if (r < 0) {
+		fprintf(stderr, "backline-controld: cannot own %s: %s\n", BUS_NAME, strerror(-r));
+		return 1;
+	}
+	LOG("on the session bus as %s; node %s; %d mappings, %d listeners%s\n", BUS_NAME, D.node_name, n_mappings(),
+	    n_listeners(), n_listeners() ? "" : " (no network socket)");
+	on_bus_io(NULL, 0, 0);
+
+	pw_main_loop_run(D.loop);
+
+	for (int i = 0; i < MAX_LISTENERS; i++)
+		if (D.lis[i].used)
+			listener_close(&D.lis[i]);
+	for (int i = 0; i < MAX_VNODES; i++)
+		if (D.vnodes[i].used)
+			vnode_drop(&D.vnodes[i]);
+	if (D.follow_on)
+		regfree(&D.follow_re);
+	pw_filter_destroy(D.filter);
+	bl_graph_destroy(D.graph);
+	pw_proxy_destroy((struct pw_proxy *)D.registry);
+	sd_bus_flush_close_unref(D.bus);
+	pw_core_disconnect(D.core);
+	pw_context_destroy(D.context);
+	pw_main_loop_destroy(D.loop);
+	pw_deinit();
+	return 0;
+}
