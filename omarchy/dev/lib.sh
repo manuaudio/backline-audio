@@ -12,29 +12,25 @@ SHELL_ROOT=${SHELL_ROOT:-${OMARCHY_PATH:-/usr/share/omarchy}/shell}
 now_ms() { date +%s%3N; }
 
 # stage_shell: a disposable Quickshell config holding Omarchy's real Ui and
-# Commons, Backline's four real panels (copied, links resolved, as the
-# installer copies them), and a strip standing in for the bar, with Tab
-# moving between neighbours the way the bar's switchPanelFrom does.
+# Commons, Backline's real plugin (omarchy/plugin, copied as `omarchy plugin
+# add` would place it: the bar widget Backline.qml and its four panels), and a
+# strip standing in for the bar. The strip holds only Backline, so the bar's
+# switchPanelFrom says no (as the real bar does with one panel) and Tab wraps
+# around the four inside the widget.
 stage_shell() {
   STAGE=$BACKLINE_BENCH/stage
   rm -rf "$STAGE"
   mkdir -p "$STAGE"
   ln -s "$SHELL_ROOT/Ui" "$STAGE/Ui"
   ln -s "$SHELL_ROOT/Commons" "$STAGE/Commons"
-  local p
-  for p in instruments plugins record transport; do
-    cp -rL "$REPO/omarchy/plugins/backline.$p" "$STAGE/$p"
-  done
+  cp -r "$REPO/omarchy/plugin" "$STAGE/backline"
   cat >"$STAGE/shell.qml" <<'QML'
 import QtQuick
 import Quickshell
 import Quickshell.Wayland
 import qs.Commons
 import qs.Commons as Commons
-import "instruments" as Instruments
-import "plugins" as Plugins
-import "record" as Record
-import "transport" as Transport
+import "backline" as Backline
 
 ShellRoot {
   PanelWindow {
@@ -77,7 +73,7 @@ ShellRoot {
       function showTooltip(target, text) {}
       function switchPanelFrom(owner, direction) {
         var i = order.indexOf(owner)
-        if (i < 0) return false
+        if (i < 0 || order.length < 2) return false
         var next = order[(i + direction + order.length) % order.length]
         owner.closeForPopoutSwitch()
         next.open()
@@ -90,12 +86,9 @@ ShellRoot {
       anchors.rightMargin: 12
       anchors.verticalCenter: parent.verticalCenter
       spacing: 2
-      Transport.Panel { id: transport; bar: barApi }
-      Instruments.Panel { id: instruments; bar: barApi }
-      Plugins.Panel { id: plugins; bar: barApi }
-      Record.Panel { id: record; bar: barApi }
+      Backline.Backline { id: backline; bar: barApi; moduleName: "io.github.manuaudio.backline" }
     }
-    Component.onCompleted: barApi.order = [transport, instruments, plugins, record]
+    Component.onCompleted: barApi.order = [backline]
   }
 }
 QML

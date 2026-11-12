@@ -7,7 +7,7 @@
 # service or the graph shows the result, and screenshots are taken for the
 # README. The hotkeys themselves (Super+Ctrl+I, ...) belong to Hyprland, which
 # can't run headless; each hotkey step makes the same call its binding makes
-# ({ panel = "<id>" } opens the panel), and is timed the same way.
+# (omarchy-shell -q backline.<panel> toggle opens the panel; here the same IPC call on the staged shell), and is timed the same way.
 #
 #   omarchy/dev/flows [report] [screenshots-dir]
 #
@@ -25,6 +25,7 @@ if [[ ${WAYLAND_DISPLAY:-} != bl-headless-0 ]]; then
   "$dev/headless" "$0" "$report" "$SHOTS"
   status=$?
   "$dev/bench" stop
+  "$dev/headless" stop   # leave no compositor behind
   exit $status
 fi
 
@@ -101,7 +102,7 @@ PY
 }
 
 echo "# Backline UX flows, $(date -Is)"
-echo "# panels: omarchy/plugins, staged against the Omarchy shell in ${SHELL_ROOT/#$HOME/\~}; services: ${BACKLINE_BIN/#$HOME/\~}"
+echo "# panels: omarchy/plugin (the io.github.manuaudio.backline bar plugin), staged against the Omarchy shell in ${SHELL_ROOT/#$HOME/\~}; services: ${BACKLINE_BIN/#$HOME/\~}"
 echo "# devices: throwaway bench nodes only; the live desktop, shell and devices are not touched"
 
 # The panels launch the mixer the desktop would; here, the one just built.

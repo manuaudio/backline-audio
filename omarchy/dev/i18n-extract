@@ -1,17 +1,17 @@
 #!/bin/bash
 
-# Writes the panels' English catalog (plugins/shared/i18n/en.json) from the
+# Writes the panels' English catalog (plugin/i18n/en.json) from the
 # code: every t("key", "English") in the panels and the shared model. With
 # --check, fails when the catalog is stale instead.
 
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-catalog=$root/plugins/shared/i18n/en.json
+catalog=$root/plugin/i18n/en.json
 
 generated=$(node - "$root" <<'JS'
 const fs = require('fs'), path = require('path')
 const root = process.argv[2]
-const files = ['plugins/shared/Model.js', ...['instruments', 'record', 'plugins', 'transport'].map(p => `plugins/backline.${p}/Panel.qml`)]
+const files = ["plugin/Model.js", ...["Instruments", "Record", "Plugins", "Transport", "Backline"].map(p => `plugin/${p}.qml`)]
 const out = {}
 const re = /\bt\(\s*"([A-Za-z0-9_.]+)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*\)/g
 for (const f of files) {

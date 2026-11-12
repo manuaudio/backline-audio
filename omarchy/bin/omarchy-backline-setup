@@ -1,0 +1,137 @@
+#!/bin/bash
+
+# omarchy:summary=Add or remove Backline's Omarchy menu rows and hotkeys, and check its bar plugin
+# omarchy:args=[--yes] [--no-hotkeys] [--no-menu] [--no-plugin] | --uninstall
+# omarchy:examples=omarchy backline setup | omarchy backline setup --uninstall
+
+# The parts of Backline's Omarchy integration that live in the user's own
+# files, which an Omarchy plugin can't declare:
+#
+#   menu      Backline's rows, merged into
+#             ~/.config/omarchy/extensions/omarchy-menu.jsonc
+#   hotkeys   Super+Ctrl+I / M / G and their Alt variants, appended to
+#             ~/.config/hypr/bindings.lua (asked first)
+#   plugin    checks that the bar plugin (io.github.manuaudio.backline) is
+#             installed, and offers `omarchy plugin add` for it if not
+#
+# Both edits go between backline:begin/backline:end lines, so running this
+# again replaces them and --uninstall takes exactly them out, leaving the rest
+# of each file as it was. Nothing is changed without a yes (or --yes).
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+
+config=${XDG_CONFIG_HOME:-$HOME/.config}
+menu_file=$config/omarchy/extensions/omarchy-menu.jsonc
+bindings_file=$config/hypr/bindings.lua
+plugin_id=io.github.manuaudio.backline
+plugin_url=${BACKLINE_PLUGIN_URL:-https://github.com/manuaudio/backline-audio}
+
+yes=false
+hotkeys=true
+menu=true
+plugin=true
+uninstall=false
+for arg in "$@"; do
+  case $arg in
+    --yes) yes=true ;;
+    --no-hotkeys) hotkeys=false ;;
+    --no-menu) menu=false ;;
+    --no-plugin) plugin=false ;;
+    --uninstall) uninstall=true ;;
+    *) echo "Usage: omarchy-backline-setup [--yes] [--no-hotkeys] [--no-menu] [--no-plugin] | --uninstall" >&2; exit 2 ;;
+  esac
+done
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+confirm() {
+  if [[ $yes == "true" ]]; then
+    return 0
+  elif have gum && [[ -t 0 ]]; then
+    gum confirm "$1"
+  else
+    echo "$1 (skipped: run with --yes to agree)"
+    return 1
+  fi
+}
+
+# Take the backline:begin..backline:end block out of a file.
+strip_block() {
+  [[ -f $1 ]] || return 0
+  local tmp
+  tmp=$(mktemp)
+  awk '/^[[:space:]]*(\/\/|--) backline:begin$/{skip=1} !skip{print} /^[[:space:]]*(\/\/|--) backline:end$/{skip=0}' "$1" >"$tmp" && cat "$tmp" >"$1"
+  rm -f "$tmp"
+}
+
+# The menu block goes inside the JSONC object, before its closing brace. The
+# entry before it gets a trailing comma if it has none (JSONC allows one).
+merge_menu() {
+  local block
+  block=$(sed -n '/^\/\/ backline:begin$/,/^\/\/ backline:end$/p' "$BL_ROOT/extensions/omarchy-menu.jsonc")
+  mkdir -p "$(dirname "$menu_file")"
+  if [[ ! -s $menu_file ]] || ! grep -q '[{]' "$menu_file"; then
+    {
+      [[ -s $menu_file ]] && cat "$menu_file"
+      printf '{\n%s\n}\n' "$block"
+    } >"$menu_file.tmp" && mv "$menu_file.tmp" "$menu_file"
+    return
+  fi
+  strip_block "$menu_file"
+  BLOCK=$block python3 -I - "$menu_file" <<'PY'
+import os, sys
+path = sys.argv[1]
+text = open(path).read()
+end = text.rstrip().rfind("}")
+head, tail = text[:end], text[end:]
+# The last thing before the brace that isn't a comment or whitespace. If it
+# needs a comma, the comma goes inside the block, on its own line, so taking
+# the block out leaves the user's lines exactly as they were.
+block = os.environ["BLOCK"]
+code = [l for l in head.splitlines() if l.strip() and not l.strip().startswith("//")]
+if code and not code[-1].rstrip().endswith((",", "{")):
+    first, rest = block.split("\n", 1)
+    block = first + "\n  ,\n" + rest
+open(path, "w").write(head.rstrip("\n") + "\n" + block + "\n" + tail)
+PY
+}
+
+plugin_installed() {
+  [[ -f $config/omarchy/plugins/$plugin_id/manifest.json ]]
+}
+
+if [[ $uninstall == "true" ]]; then
+  strip_block "$menu_file"
+  strip_block "$bindings_file"
+  echo "menu rows and hotkeys: removed"
+  if plugin_installed; then
+    echo "the bar plugin is still installed; to remove it: omarchy plugin remove $plugin_id"
+  fi
+  exit 0
+fi
+
+if [[ $menu == "true" ]] && confirm "Add Backline's rows to the Omarchy menu ($menu_file)?"; then
+  merge_menu
+  echo "menu: Super+Space > Trigger > Backline"
+fi
+
+if [[ $hotkeys == "true" ]] && confirm "Add Backline's hotkeys (Super+Ctrl+I/M/G) to $bindings_file?"; then
+  strip_block "$bindings_file"
+  mkdir -p "$(dirname "$bindings_file")"
+  {
+    echo
+    sed -n '/^-- backline:begin$/,/^-- backline:end$/p' "$BL_ROOT/hypr/backline.lua"
+  } >>"$bindings_file"
+  echo "hotkeys: added; Hyprland applies them on its next config reload"
+fi
+
+if [[ $plugin == "true" ]]; then
+  if plugin_installed; then
+    echo "bar plugin: $plugin_id is installed (omarchy plugin update $plugin_id to update it)"
+  elif have omarchy-plugin-add && confirm "Add Backline's bar plugin from $plugin_url?"; then
+    omarchy-plugin-add "$plugin_url" --enable --yes
+  else
+    echo "bar plugin: not installed; add it with: omarchy plugin add $plugin_url --enable"
+  fi
+fi

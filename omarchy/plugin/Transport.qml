@@ -21,6 +21,15 @@ Panel {
   ipcTarget: "backline.transport"
   manageIpc: false
 
+  // The Backline bar widget (Backline.qml) that holds this panel and its
+  // three siblings: Tab moves to the sibling, and past the last one to the
+  // bar's next panel. Without a host (a bench strip), the bar's own switch.
+  property Item host: null
+  function tabTo(direction) {
+    if (host && typeof host.switchFrom === "function") return host.switchFrom(root, direction)
+    return root.switchPanel(direction)
+  }
+
   property QtObject strings: Commons.Translations { directory: Qt.resolvedUrl("i18n") }
   function t(key, english) { return root.strings.t(key, english) }
 
@@ -252,7 +261,7 @@ Panel {
         viaReturn = false
       }
       onCloseRequested: root.close()
-      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onTabRequested: function(direction) { root.tabTo(direction) }
       onTextKey: function(t) {
         if (t === "0") root.run(["omarchy-backline-transport", "locate", "0"])
         else if (t === "o") Quickshell.execDetached(["omarchy-backline-mixer"])

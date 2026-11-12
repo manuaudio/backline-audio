@@ -1,6 +1,6 @@
 # Backline in Omarchy
 
-Backline's everyday jobs live inside Omarchy's own workflow. There are four bar panels, `omarchy-backline-*` commands in Omarchy's command style, rows in the Omarchy menu, and `Super + Ctrl` hotkeys on the planes Omarchy gives them. Everything is built from Omarchy's shell components and theme tokens, so it follows the current theme and language the way Omarchy's own panels do.
+Backline's everyday jobs live inside Omarchy's own workflow. There is one Omarchy plugin, `io.github.manuaudio.backline`, holding four bar panels, `omarchy-backline-*` commands in Omarchy's command style, rows in the Omarchy menu, and `Super + Ctrl` hotkeys on the planes Omarchy gives them. Everything is built from Omarchy's shell components and theme tokens, so it follows the current theme and language the way Omarchy's own panels do.
 
 | Instruments | Record | Plugins | Transport |
 |---|---|---|---|
@@ -24,14 +24,16 @@ The jobs, and the fewest keystrokes for each (measured), are in [`ui/UX-FLOWS.md
 
 | Path | What |
 |---|---|
-| `plugins/backline.{instruments,record,plugins,transport}/` | the four shell plugins: `manifest.json`, `Panel.qml`, and the shared `Model.js` and `i18n/` (links here, copied in on install) |
-| `plugins/shared/Model.js` | the panels' pure logic: picker order, filters, grades, sources, timecode, status tones |
-| `bin/omarchy-backline-*` | commands: `instrument-add`, `instrument-remove`, `instrument-midi`, `record`, `soundcheck`, `transport`, `plugins-scan`, `mixer`, and the panels' `state` and `watch` |
+| `../manifest.json` | the plugin's manifest, at the repository root, so `omarchy plugin add` takes the repository as the plugin |
+| `plugin/Backline.qml` | the bar widget: the four panels side by side, `Tab` between them |
+| `plugin/{Instruments,Record,Plugins,Transport}.qml` | the panels |
+| `plugin/Model.js`, `plugin/i18n/` | the panels' pure logic (picker order, filters, grades, sources, timecode, status tones) and their catalogs |
+| `bin/omarchy-backline-*` | commands: `instrument-add`, `instrument-remove`, `instrument-midi`, `record`, `soundcheck`, `transport`, `plugins-scan`, `mixer`, `setup`, and the panels' `state` and `watch` |
 | `lib/omarchy-backline.sh` | their shared D-Bus, MIDI and catalog helpers |
 | `i18n/en.json` | the commands' notification and prompt strings |
 | `extensions/omarchy-menu.jsonc` | the menu rows (Trigger › Backline) |
 | `hypr/backline.lua` | the hotkeys |
-| `install` | installs it all for the current user; `--uninstall` takes it out again |
+| `install` | installs it all from a checkout for the current user; `--uninstall` takes it out again |
 | `dev/` | the bench, the headless compositor and the flows (below) |
 | `test/` | tests in Omarchy's shape |
 
@@ -45,10 +47,10 @@ The rules are from Omarchy's `AGENTS.md`, `agents/skills/shell-dev.md`, `docs/me
 - There is one cursor model shared by keyboard and mouse. Hover moves the cursor; visuals come from `hasCursor`/`current` through `CursorSurface`.
 - Keys: `j`/`k` and the arrows move, `h`/`l` move along pills or adjust, `Enter`/`Space` act, `x` removes, `Esc` closes, and `Tab` goes to the next panel.
 - Only Omarchy's components are used: `PanelSectionHeader`, `PanelSeparator`, `Button` pills, `PanelActionButton`, `FilterInput`, `BarIconButton`. Colours come from `Commons.Color` and `Style`; there are no hard-coded colours.
-- Each plugin answers its own IPC target (`backline.instruments`, …) with `refresh` and a `state` the tests read.
+- Each panel answers its own IPC target (`backline.instruments`, …) with `open`, `toggle`, `refresh` and a `state` the tests read; the hotkeys and menu rows open panels through these targets.
 - Repeater rows are primitive snapshots, never `PwNode`s.
 - Strings come from `Commons.Translations` with the plugin's own catalog. Every `Text` declares `textFormat`.
-- All four pass Omarchy's `omarchy-plugin-validate`.
+- The plugin (the repository root, and an installed copy) passes Omarchy's `omarchy-plugin-validate`: one manifest, no symlinks.
 
 **No polling.**
 
@@ -74,19 +76,31 @@ The rules are from Omarchy's `AGENTS.md`, `agents/skills/shell-dev.md`, `docs/me
 - `Super + Ctrl + Alt + M`, `G` are their quick-action variants (record or stop; play or stop), as `Super + Ctrl + Alt + C` is to the capture menu.
 - All five keys are free in Omarchy's defaults.
 
-**Third-party, not first-party.** This installs as a third-party plugin set under `~/.config/omarchy/plugins/`, with its own commands and catalogs. The `backline` command group isn't in Omarchy's `GROUP_DESCRIPTIONS`. Proposing any of it to Omarchy itself would follow `ARCHITECTURE.md` §5.8: one problem per PR, with the measured evidence.
+**Third-party, not first-party.** This installs as a third-party plugin under `~/.config/omarchy/plugins/io.github.manuaudio.backline`, with its own commands and catalogs from the `backline-audio` package. The `backline` command group isn't in Omarchy's `GROUP_DESCRIPTIONS`. Proposing any of it to Omarchy itself would follow `ARCHITECTURE.md` §5.8: one problem per PR, with the measured evidence.
 
 ## Install
 
-The panels need Omarchy's quattro shell (the plugin API with `ShellIpc`, `FilterInput`, `Commons.I18n` and `Commons.Translations`). A 4.0.0 alpha install predates it, and the panels won't load there; the commands, menu rows and mixer don't depend on it.
+Backline is an Omarchy plugin plus a package: the package (`backline-audio`, AUR) brings the services and the `omarchy-backline-*` commands; the plugin brings the panels. Everything about the format, updates, removal and the plugin marketplace is in [`docs/OMARCHY-PLUGIN.md`](../docs/OMARCHY-PLUGIN.md).
+
+```sh
+yay -S backline-audio
+omarchy plugin add https://github.com/manuaudio/backline-audio --enable
+omarchy-backline-setup          # asks before adding the menu rows and the hotkeys
+```
+
+Remove: `omarchy-backline-setup --uninstall`, `omarchy plugin remove io.github.manuaudio.backline`, `yay -R backline-audio`.
+
+The panels need Omarchy's quattro shell (the plugin API with `ShellIpc`, `FilterInput`, `Commons.I18n` and `Commons.Translations`). Omarchy 4.0.4's shell predates it, and the panels won't load there; the commands, menu rows and mixer don't depend on it.
+
+From a checkout, without the package:
 
 ```sh
 cmake -S ui -B ui/build && cmake --build ui/build    # the mixer (optional)
-omarchy/install                                       # asks before adding hotkeys; --yes, --no-hotkeys, --no-menu
+omarchy/install                                       # asks before the menu and hotkeys; --yes, --no-hotkeys, --no-menu
 omarchy/install --uninstall
 ```
 
-The panels start in the bar's right section, in the order Instruments, Plugins, Record, Transport. `Tab` moves between neighbours. Arrange them with `omarchy bar move`.
+The panels sit in one slot in the bar's right section, in the order Transport, Instruments, Plugins, Record. `Tab` moves to the next of them, and past the last to the bar's next panel (around the four when the bar has no other). Move the slot with `omarchy bar move`.
 
 ## Tests
 
@@ -97,7 +111,7 @@ Tests run in Omarchy's style: `pass`/`fail` TAP lines, a stubbed world, and the 
 | `test/model-test.sh` | the panels' model in Node: picker order, filters, MIDI pills, plugin findings, sources, drop-frame timecode, chase status |
 | `test/commands-test.sh` | the commands against stubbed `busctl`, `pw-dump` and `backline`, in a fake HOME: MIDI matches checked as the worker's regex, picker order and ids, the fail-grade refusal, arming and re-arming, notifications in pt-BR → pt → English |
 | `test/i18n-test.sh` | the catalogs are current, every key is used and exists, and every `Text` has a `textFormat` |
-| `test/install-test.sh` | the installer in a fake HOME: the menu is merged and parsed by Omarchy's own `MenuModel.js`, the user's rows and bindings are kept, a rerun is idempotent, and uninstall restores each file byte for byte |
+| `test/install-test.sh` | the installer and `omarchy-backline-setup` in a fake HOME: nothing changes without a yes, the plugin passes Omarchy's validator (installed and as the repository), an old four-plugin install is replaced, the menu is merged and parsed by Omarchy's own `MenuModel.js`, the user's rows and bindings are kept, a rerun is idempotent, and uninstall restores each file byte for byte |
 
 End to end:
 

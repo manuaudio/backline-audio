@@ -11,11 +11,11 @@ fail() {
   exit 1
 }
 
-# run_node_test < script: the script gets `Model` (plugins/shared/Model.js)
+# run_node_test < script: the script gets `Model` (plugin/Model.js)
 # and `assert`.
 run_node_test() {
   {
-    printf 'const assert = require("assert");\nconst Model = require(%s);\n' "\"$ROOT/plugins/shared/Model.js\""
+    printf 'const assert = require("assert");\nconst Model = require(%s);\n' "\"$ROOT/plugin/Model.js\""
     cat
   } | node -
 }
