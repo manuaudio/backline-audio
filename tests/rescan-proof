@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# rescan-proof: the plugin index follows installs by itself.
+#
+# The shipped units are checked with systemd-analyze. Then the same watch runs
+# as a *transient* user path unit (systemd-run, removed at the end; nothing
+# is installed into ~/.config) over throwaway plugin directories and a
+# throwaway stamp, with the shipped service's debounce, scanning into a
+# throwaway cache. Install, upgrade-in-place via the stamp (what the pacman
+# hook does), and removal are each timed until the index shows them.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+out=$here/out/rescan
+rm -rf "$out"; mkdir -p "$out"/{clap,vst3,lv2,cache}
+exec > >(tee "$out/report.txt") 2>&1
+unit=backline-test-rescan-$$
+trap 'systemctl --user stop "$unit.path" "$unit.service" 2>/dev/null; systemctl --user reset-failed "$unit.service" 2>/dev/null; true' EXIT
+echo "== rescan-proof $(date -Is)"
+
+echo "-- shipped units"
+for f in "$BL_BIN"/systemd/backline-registry-rescan.{path,service}; do
+  r=$(systemd-analyze --user verify "$f" 2>&1 | grep -v "Unit is bound to inactive unit" || true)
+  echo "  $(basename "$f"): ${r:-verified}"
+done
+grep -hE '^(PathChanged|Unit|ExecStart)' "$BL_BIN"/systemd/backline-registry-rescan.{path,service} | sed 's/^/  /'
+echo "  pacman hook targets: $(grep -c '^Target' "$here/../data/pacman/backline-plugins.hook"), action: $(grep '^Exec' "$here/../data/pacman/backline-plugins.hook")"
+
+echo; echo "-- live, as a transient user path unit"
+plug="$BL_BIN/test-plugins/backline-test-ok.clap"
+[[ -f $plug ]] || { echo "build the test plugins first"; exit 1; }
+cat >"$out/scan.sh" <<EOS
+#!/bin/sh
+sleep 2   # the shipped service's ExecStartPre debounce
+echo "scan \$(date +%s.%N)" >>"$out/scans.log"
+exec env BACKLINE_CACHE_DIR="$out/cache" CLAP_PATH="$out/clap" VST3_PATH="$out/vst3" LV2_PATH="$out/lv2" \
+  "$BL_BIN/registry/backline-registry" scan --no-validate --jobs 2 --timeout 10
+EOS
+chmod +x "$out/scan.sh"
+touch "$out/plugins.stamp"
+systemd-run --user --quiet --unit="$unit" \
+  --path-property=PathChanged="$out/clap" --path-property=PathChanged="$out/vst3" \
+  --path-property=PathChanged="$out/lv2" --path-property=PathChanged="$out/plugins.stamp" \
+  "$out/scan.sh"
+sleep 0.5
+echo "  $(systemctl --user is-active "$unit.path"): $unit.path"
+count() { [[ -f $out/cache/plugins.json ]] && jq '[.plugins[] | select(.format=="clap")] | length' "$out/cache/plugins.json" || echo 0; }
+wait_for() { # gt0|0 -> seconds until the index has some / no CLAP plugins
+  local t0=$(date +%s.%N) c
+  for _ in $(seq 300); do c=$(count); [[ ($1 == gt0 && $c -gt 0) || ($1 == 0 && $c -eq 0) ]] && { python3 -c "print(f'{$(date +%s.%N)-$t0:.2f}')"; return 0; }; sleep 0.1; done
+  echo "timeout"; return 1
+}
+cp "$plug" "$out/clap/"
+t_in=$(wait_for gt0 || true)
+echo "  install: copied backline-test-ok.clap -> the index lists it after $t_in s ($(count) CLAP plugins in the bundle)"
+gen1=$(jq -r .generated "$out/cache/plugins.json")
+sleep 1
+touch "$out/plugins.stamp"
+t0=$(date +%s.%N)
+for _ in $(seq 100); do [[ $(jq -r .generated "$out/cache/plugins.json") != "$gen1" ]] && break; sleep 0.1; done
+echo "  stamp touched (what the pacman hook does after a transaction): rescanned after $(python3 -c "print(f'{$(date +%s.%N)-$t0:.2f}')") s"
+rm "$out/clap/backline-test-ok.clap"
+t_rm=$(wait_for 0 || true)
+echo "  remove: the index is empty again after $t_rm s"
+echo "  scans run: $(wc -l <"$out/scans.log") (one per change)"
+systemctl --user stop "$unit.path"
+sleep 0.3
+left=$(systemctl --user list-units --all --no-legend "backline-test-rescan-*" | wc -l)
+echo "  transient units left: $left"
+ok=$([[ $(wc -l <"$out/scans.log") -eq 3 && $left -eq 0 && $t_in != timeout && $t_rm != timeout ]] && echo PASS || echo FAIL)
+echo "RESULT: $ok (install, a pacman-style stamp and removal each rescan once, by themselves)"

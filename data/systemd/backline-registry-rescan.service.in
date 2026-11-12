@@ -1,0 +1,13 @@
+# One rescan of the plugin index (cheap when nothing changed: the probe cache
+# is keyed on size, mtime and SHA-256). Started by the .path unit.
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Rescan the Backline plugin index
+
+[Service]
+Type=oneshot
+# let a copy or a package transaction finish before scanning
+ExecStartPre=/usr/bin/sleep 2
+ExecStart=@bindir@/backline plugins scan
+Nice=10
+IOSchedulingClass=idle

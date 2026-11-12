@@ -1,0 +1,17 @@
+# Tell Backline that system plugins changed (for packagers: install as
+# /usr/share/libalpm/hooks/backline-plugins.hook). The user units watch the
+# stamp and rescan; the scan itself runs as each user, never as root.
+# SPDX-License-Identifier: MIT
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Path
+Target = usr/lib/clap/*
+Target = usr/lib/vst3/*
+Target = usr/lib/lv2/*
+
+[Action]
+Description = Telling Backline that audio plugins changed...
+When = PostTransaction
+Exec = /usr/bin/touch /var/lib/backline/plugins.stamp

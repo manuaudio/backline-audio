@@ -1,0 +1,22 @@
+# Rescan the Backline plugin index when plugins are installed, upgraded or
+# removed: the user's plugin directories, the system ones, and the stamp the
+# pacman hook touches after a package transaction (it catches upgrades deep
+# inside an existing bundle, which don't change the top directories).
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Watch plugin directories for the Backline plugin index
+
+[Path]
+PathChanged=%h/.clap
+PathChanged=%h/.vst3
+PathChanged=%h/.lv2
+PathChanged=/usr/lib/clap
+PathChanged=/usr/lib/vst3
+PathChanged=/usr/lib/lv2
+PathChanged=/usr/local/lib/vst3
+PathChanged=/usr/local/lib/lv2
+PathChanged=/var/lib/backline/plugins.stamp
+Unit=backline-registry-rescan.service
+
+[Install]
+WantedBy=default.target
