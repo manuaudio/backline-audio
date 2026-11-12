@@ -29,19 +29,95 @@ pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
 pkg_check_modules(JSONC REQUIRED IMPORTED_TARGET json-c)
 
 include(CTest)
+find_package(Threads REQUIRED)
 
 # Shared graph helper (C, main-thread only).
 add_library(bl_graph STATIC common/bl_graph.c)
 target_include_directories(bl_graph PUBLIC common)
 target_link_libraries(bl_graph PUBLIC PkgConfig::PIPEWIRE)
 
-# Plugin host: one CLAP instance per process, as one PipeWire node.
-add_executable(backline-plugin-worker host/worker.cpp)
+# Plugin host: one plugin instance per process, as one PipeWire node. The
+# format sits behind one interface (host/plugin.h): CLAP always; VST3 when the
+# VST3 SDK is found; LV2 when lilv is.
+add_executable(backline-plugin-worker host/worker.cpp host/plugin_clap.cpp)
 target_include_directories(backline-plugin-worker PRIVATE third_party/clap/include)
 target_link_libraries(backline-plugin-worker PRIVATE bl_graph PkgConfig::PIPEWIRE PkgConfig::SYSTEMD ${CMAKE_DL_LIBS})
 if(BL_HAVE_SPA_PARSER_BODY)
   target_compile_definitions(backline-plugin-worker PRIVATE BL_HAVE_SPA_PARSER_BODY=1)
 endif()
+
+# LV2 through lilv (ISC).
+pkg_check_modules(LILV IMPORTED_TARGET lilv-0)
+option(BACKLINE_LV2 "Host LV2 plugins in the worker (needs lilv)" ${LILV_FOUND})
+if(BACKLINE_LV2)
+  if(NOT LILV_FOUND)
+    message(FATAL_ERROR "BACKLINE_LV2=ON but lilv-0 was not found")
+  endif()
+  target_sources(backline-plugin-worker PRIVATE host/plugin_lv2.cpp)
+  target_compile_definitions(backline-plugin-worker PRIVATE BL_HAVE_LV2=1)
+  target_link_libraries(backline-plugin-worker PRIVATE PkgConfig::LILV)
+endif()
+
+# VST3 through the VST3 SDK's hosting classes (MIT since 3.8). Only the
+# sources the worker needs are compiled, into a static library.
+pkg_check_modules(VST3SDK QUIET vst3sdk)
+set(_vst3_default "")
+if(VST3SDK_FOUND)
+  pkg_get_variable(_vst3_inc vst3sdk includedir)
+  if(NOT _vst3_inc)
+    string(REGEX REPLACE "^-I" "" _vst3_inc "${VST3SDK_CFLAGS}")
+  endif()
+  set(_vst3_default "${_vst3_inc}")
+endif()
+if(NOT _vst3_default AND EXISTS /usr/src/vst3sdk/pluginterfaces)
+  set(_vst3_default /usr/src/vst3sdk)
+endif()
+set(BACKLINE_VST3SDK_DIR "${_vst3_default}" CACHE PATH "VST3 SDK root (pluginterfaces/, base/, public.sdk/)")
+set(_vst3_found OFF)
+if(BACKLINE_VST3SDK_DIR AND EXISTS "${BACKLINE_VST3SDK_DIR}/public.sdk/source/vst/hosting/plugprovider.cpp")
+  set(_vst3_found ON)
+endif()
+option(BACKLINE_VST3 "Host VST3 plugins in the worker (needs the VST3 SDK)" ${_vst3_found})
+if(BACKLINE_VST3)
+  if(NOT _vst3_found)
+    message(FATAL_ERROR "BACKLINE_VST3=ON but no VST3 SDK at BACKLINE_VST3SDK_DIR='${BACKLINE_VST3SDK_DIR}'")
+  endif()
+  set(_s ${BACKLINE_VST3SDK_DIR})
+  add_library(bl_vst3sdk STATIC
+    ${_s}/pluginterfaces/base/coreiids.cpp
+    ${_s}/pluginterfaces/base/funknown.cpp
+    ${_s}/pluginterfaces/base/ustring.cpp
+    ${_s}/base/source/baseiids.cpp
+    ${_s}/base/source/fbuffer.cpp
+    ${_s}/base/source/fdebug.cpp
+    ${_s}/base/source/fobject.cpp
+    ${_s}/base/source/fstring.cpp
+    ${_s}/base/source/updatehandler.cpp
+    ${_s}/base/thread/source/flock.cpp
+    ${_s}/public.sdk/source/common/commonstringconvert.cpp
+    ${_s}/public.sdk/source/common/memorystream.cpp
+    ${_s}/public.sdk/source/vst/hosting/connectionproxy.cpp
+    ${_s}/public.sdk/source/vst/hosting/eventlist.cpp
+    ${_s}/public.sdk/source/vst/hosting/hostclasses.cpp
+    ${_s}/public.sdk/source/vst/hosting/module.cpp
+    ${_s}/public.sdk/source/vst/hosting/module_linux.cpp
+    ${_s}/public.sdk/source/vst/hosting/parameterchanges.cpp
+    ${_s}/public.sdk/source/vst/hosting/pluginterfacesupport.cpp
+    ${_s}/public.sdk/source/vst/hosting/plugprovider.cpp
+    ${_s}/public.sdk/source/vst/hosting/processdata.cpp
+    ${_s}/public.sdk/source/vst/utility/stringconvert.cpp
+    ${_s}/public.sdk/source/vst/vstinitiids.cpp
+    ${_s}/public.sdk/source/vst/vstpresetfile.cpp)
+  target_include_directories(bl_vst3sdk SYSTEM PUBLIC ${_s})
+  target_compile_definitions(bl_vst3sdk PUBLIC RELEASE=1)
+  target_compile_options(bl_vst3sdk PRIVATE -w)
+  set_target_properties(bl_vst3sdk PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(bl_vst3sdk PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
+  target_sources(backline-plugin-worker PRIVATE host/plugin_vst3.cpp)
+  target_compile_definitions(backline-plugin-worker PRIVATE BL_HAVE_VST3=1)
+  target_link_libraries(backline-plugin-worker PRIVATE bl_vst3sdk)
+endif()
+message(STATUS "plugin worker formats: CLAP yes, VST3 ${BACKLINE_VST3}, LV2 ${BACKLINE_LV2}")
 
 # Recorder: N nodes into sample-aligned, timestamped files.
 add_library(bl_rec_align STATIC recorder/rec_align.c)
