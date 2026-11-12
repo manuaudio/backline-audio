@@ -24,8 +24,8 @@ extern "C" {
  * cycle k-1.
  *
  * (The ports' reported SPA_PARAM_Latency cannot decide this: a null sink
- * reports 1 quantum of playback latency whether it drives or follows, and 0
- * until something feeds it. The recorder logs it in the sidecar instead.) */
+ * reports 0 frames of playback latency whether it drives or follows. The
+ * recorder logs it in the sidecar instead; docs/DECISIONS.md D5.) */
 
 struct rec_align_track {
 	bool sink_monitor;     /* the track records a sink's monitor ports */

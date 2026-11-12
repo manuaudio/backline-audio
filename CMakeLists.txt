@@ -46,13 +46,23 @@ endif()
 # Recorder: N nodes into sample-aligned, timestamped files.
 add_library(bl_rec_align STATIC recorder/rec_align.c)
 target_include_directories(bl_rec_align PUBLIC recorder)
+add_library(bl_rec_engine STATIC recorder/rec_engine.c)
+target_include_directories(bl_rec_engine PUBLIC recorder)
+find_package(Threads REQUIRED)
+target_link_libraries(bl_rec_engine PUBLIC bl_graph bl_rec_align PkgConfig::PIPEWIRE PkgConfig::SNDFILE Threads::Threads m)
 add_executable(backline-recorder recorder/recorder.c)
-target_link_libraries(backline-recorder PRIVATE bl_graph bl_rec_align PkgConfig::PIPEWIRE PkgConfig::SNDFILE m)
+target_link_libraries(backline-recorder PRIVATE bl_rec_engine)
+# The recorder as a D-Bus service (Recorder1), with virtual soundcheck.
+add_executable(backline-recorderd recorder/recorderd.c recorder/soundcheck.c)
+target_link_libraries(backline-recorderd PRIVATE bl_rec_engine PkgConfig::SYSTEMD PkgConfig::JSONC)
 
 # Test tool: a virtual MIDI keyboard on the ALSA sequencer (what a USB
 # keyboard looks like to PipeWire's MIDI bridge).
 add_executable(backline-test-keyboard tools/test-keyboard.c)
 target_link_libraries(backline-test-keyboard PRIVATE PkgConfig::ALSA)
+# Test tool: fake capture devices with a known input latency.
+add_executable(backline-test-source tools/test-source.c)
+target_link_libraries(backline-test-source PRIVATE PkgConfig::PIPEWIRE PkgConfig::SNDFILE m)
 
 
 # Plugin-host supervisor: one systemd user scope per worker, restart with state.
@@ -63,11 +73,11 @@ add_executable(backline-hostd hostd/hostd.c)
 target_link_libraries(backline-hostd PRIVATE bl_hostd_policy PkgConfig::SYSTEMD PkgConfig::JSONC)
 
 # libbackline: the MIT C client library (D-Bus only), and the backline CLI.
-add_library(backline SHARED lib/backline.c)
+add_library(backline SHARED lib/backline.c lib/services.c)
 set_target_properties(backline PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 0 C_VISIBILITY_PRESET default)
 target_include_directories(backline PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/lib/include> $<INSTALL_INTERFACE:include>)
 target_link_libraries(backline PRIVATE PkgConfig::SYSTEMD)
-add_executable(backline-cli cli/backline.c)
+add_executable(backline-cli cli/backline.c cli/services.c)
 set_target_properties(backline-cli PROPERTIES OUTPUT_NAME backline)
 target_link_libraries(backline-cli PRIVATE backline PkgConfig::JSONC)
 
@@ -87,6 +97,21 @@ if(BUILD_TESTING)
   add_executable(test_rec_align tests/unit/test_rec_align.c)
   target_link_libraries(test_rec_align PRIVATE bl_rec_align)
   add_test(NAME rec_align COMMAND test_rec_align)
+  add_executable(test_rec_cues tests/unit/test_rec_cues.c)
+  target_link_libraries(test_rec_cues PRIVATE bl_rec_engine)
+  add_test(NAME rec_cues COMMAND test_rec_cues)
+  # LD_PRELOAD shim for the slow-disk proof (tests/recorderd-proof).
+  add_library(slowdisk MODULE tests/tools/slowdisk.c)
+  set_target_properties(slowdisk PROPERTIES PREFIX "")
+  add_executable(rf64check tests/tools/rf64check.c)
+  target_link_libraries(rf64check PRIVATE PkgConfig::SNDFILE m)
+  target_link_libraries(slowdisk PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+endif()
+
+# Clock service: transport, tempo, LTC/MTC, Ableton Link (clock/).
+option(BACKLINE_CLOCK "Build the clock service (needs jack from pipewire-jack, and libltc)" ON)
+if(BACKLINE_CLOCK)
+  add_subdirectory(clock)
 endif()
 
 # Plugin registry: sandboxed probes, grades, cache, D-Bus query service.
@@ -95,6 +120,31 @@ if(BACKLINE_REGISTRY)
   add_subdirectory(registry)
 endif()
 
-install(TARGETS backline-plugin-worker backline-recorder backline-hostd backline-cli RUNTIME DESTINATION bin)
+install(TARGETS backline-plugin-worker backline-recorder backline-recorderd backline-hostd backline-cli RUNTIME DESTINATION bin)
 install(TARGETS backline LIBRARY DESTINATION lib)
 install(DIRECTORY lib/include/backline DESTINATION include)
+
+# D-Bus activation files (session bus).
+include(GNUInstallDirs)
+set(bindir ${CMAKE_INSTALL_FULL_BINDIR})
+set(_svcs Recorder)
+if(TARGET backline-registry)
+  list(APPEND _svcs Registry)
+endif()
+if(TARGET backline-clockd)
+  list(APPEND _svcs Clock)
+endif()
+foreach(svc ${_svcs})
+  configure_file(data/dbus/io.github.manuaudio.Backline.${svc}.service.in
+                 ${CMAKE_BINARY_DIR}/dbus/io.github.manuaudio.Backline.${svc}.service @ONLY)
+  install(FILES ${CMAKE_BINARY_DIR}/dbus/io.github.manuaudio.Backline.${svc}.service
+          DESTINATION ${CMAKE_INSTALL_DATADIR}/dbus-1/services)
+endforeach()
+
+# Registry auto-rescan: a user .path unit, and a pacman hook for packagers.
+foreach(u backline-registry-rescan.path backline-registry-rescan.service)
+  configure_file(data/systemd/${u}.in ${CMAKE_BINARY_DIR}/systemd/${u} @ONLY)
+  install(FILES ${CMAKE_BINARY_DIR}/systemd/${u} DESTINATION lib/systemd/user)
+endforeach()
+install(FILES data/pacman/backline-plugins.hook DESTINATION ${CMAKE_INSTALL_DATADIR}/libalpm/hooks)
+install(DIRECTORY DESTINATION ${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/lib/backline)

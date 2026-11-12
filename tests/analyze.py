@@ -6,6 +6,8 @@
   analyze.py level FILE START END       RMS dBFS per channel over [START, END) s
   analyze.py windows FILE START END MS  min/max windowed RMS (dropout check)
   analyze.py align A B                  lag between two recordings, and diff
+  analyze.py match A B [CH_A CH_B]      where B sits inside A, sample-exact, and how many differ
+  analyze.py cues FILE                  WAV cue points with their labels
 All output is JSON.
 """
 import cmath
@@ -211,6 +213,61 @@ def cmd_align(pa, pb):
             "bext_time_reference": [a["bext"] and a["bext"]["time_reference"], b["bext"] and b["bext"]["time_reference"]]}
 
 
+def find_in(xa, xb, start=0):
+    """Offset of xb (from its first non-silent stretch) inside xa, by an exact
+    4-sample key. Returns (offset of xb[0] in xa, key index) or (None, None)."""
+    k = next((i for i in range(start, len(xb) - 4) if all(abs(v) > 1e-4 for v in xb[i:i + 4])), None)
+    if k is None:
+        return None, None
+    key = tuple(xb[k:k + 4])
+    for i in range(len(xa) - 4):
+        if xa[i] == key[0] and tuple(xa[i:i + 4]) == key:
+            return i - k, k
+    return None, k
+
+
+def cmd_match(pa, pb, ca="0", cb="0"):
+    a, b = read_wav(pa), read_wav(pb)
+    xa, xb = a["data"][int(ca)], b["data"][int(cb)]
+    off, k = find_in(xa, xb)
+    if off is None:
+        return {"found": False, "frames_a": len(xa), "frames_b": len(xb)}
+    lo, hi = max(0, -off), min(len(xb), len(xa) - off)
+    bad = [i for i in range(lo, hi) if xa[i + off] != xb[i]]
+    return {"found": True, "offset": off, "compared": hi - lo, "frames_a": len(xa), "frames_b": len(xb),
+            "mismatches": len(bad), "first_mismatch": bad[0] if bad else None,
+            "nonzero": sum(1 for i in range(lo, hi) if xb[i] != 0.0)}
+
+
+def cmd_cues(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    pos, cues, labels = 12, [], {}
+    if data[:4] == b"RF64":
+        pass
+    while pos + 8 <= len(data):
+        cid, size = data[pos:pos + 4], struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        if cid == b"data" and data[:4] == b"RF64" and size == 0xFFFFFFFF:
+            size = struct.unpack("<Q", data[28:36])[0]  # ds64 dataSize
+        body = data[pos + 8:pos + 8 + size]
+        if cid == b"cue ":
+            n = struct.unpack("<I", body[:4])[0]
+            for i in range(n):
+                ident, position, _, _, _, off = struct.unpack("<II4sIII", body[4 + 24 * i:28 + 24 * i])
+                cues.append({"id": ident, "frame": off})
+        elif cid == b"LIST" and body[:4] == b"adtl":
+            q = 4
+            while q + 8 <= len(body):
+                sid, ssz = body[q:q + 4], struct.unpack("<I", body[q + 4:q + 8])[0]
+                if sid == b"labl":
+                    labels[struct.unpack("<I", body[q + 8:q + 12])[0]] = body[q + 12:q + 8 + ssz].split(b"\0")[0].decode()
+                q += 8 + ssz + (ssz & 1)
+        pos += 8 + size + (size & 1)
+    for c in cues:
+        c["label"] = labels.get(c["id"])
+    return {"container": data[:4].decode(), "cues": cues}
+
+
 if __name__ == "__main__":
     cmd, args = sys.argv[1], sys.argv[2:]
     if cmd == "notes" and "--thresh" in args:
@@ -218,5 +275,6 @@ if __name__ == "__main__":
         res = cmd_notes(args[0], float(args[i + 1]))
     else:
         res = {"info": cmd_info, "notes": cmd_notes, "level": cmd_level,
-               "windows": cmd_windows, "align": cmd_align}[cmd](*args)
+               "windows": cmd_windows, "align": cmd_align,
+               "match": cmd_match, "cues": cmd_cues}[cmd](*args)
     print(json.dumps(res, indent=1))

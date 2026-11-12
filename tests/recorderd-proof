@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+# recorderd-proof: the recorder as a D-Bus service (docs/api/Recorder1.md).
+#
+#  1. API. Arm, Record, AddMarker, Stop, Takes, GetTake and the errors, on a
+#     private session bus; markers land in the sidecar and as WAV cue points;
+#     Level and TakeFinished signals arrive.
+#  2. Input-latency compensation. Three fake capture devices
+#     (backline-test-source) play the same signal in the same graph cycle:
+#     a declares 0 frames, b 480 frames (physical, and really 480 late), c 256
+#     frames (not physical, and really 256 late). Takes in each mode; the lag
+#     of b and c against a is measured.
+#  3. Slow disk. A take of 40 s while an LD_PRELOAD shim stalls every write
+#     to the take directory for 12 s, then again for 8 s. Must lose nothing:
+#     every frame equal to a reference recording made at the same time on a
+#     disk that doesn't stall. Control: the same stall with a 4 s ring must
+#     report overruns (the stall is real) and keep the tracks aligned.
+#  4. Virtual soundcheck. Two virtual mics feed a "FOH" sink through links
+#     the test made. A take of the mics is played back; each mic is switched
+#     to playback and back, and the FOH is recorded in every state. Then the
+#     daemon is SIGKILLed with a mic switched, and a fresh start puts the
+#     links back.
+#
+# Throwaway: test nodes only (lib.sh), a private D-Bus session, nothing linked
+# to real devices, and default sink and every other node checked before/after.
+set -euo pipefail
+if [[ -z ${BL_PRIVATE_BUS:-} ]]; then
+  BL_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+fi
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+out=$here/out/recorderd
+rm -rf "$out"; mkdir -p "$out"
+exec > >(tee "$out/report.txt") 2>&1
+RD=
+trap 'bl_cleanup; [[ -n $RD ]] && kill $RD 2>/dev/null; kill ${BL_WATCH:-} 2>/dev/null; true' EXIT
+trap 'exit 130' INT TERM
+
+A() { python3 -I "$here/analyze.py" "$@"; }
+J() { python3 -I -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
+R=(io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder io.github.manuaudio.Backline.Recorder1)
+call() { busctl --user call "${R[@]}" "$@"; }
+prop() { busctl --user get-property "${R[@]}" "$1" | cut -d' ' -f2-; }
+# busctl prints a string reply as: s "..." with JSON escaped; decode it
+jcall() { busctl --user --json=short call "${R[@]}" "$@" | python3 -I -c "import json,sys; print(json.load(sys.stdin)['data'][0])"; }
+mkdir -p "$out/runtime"
+
+start_daemon() { # [env...]
+  env BACKLINE_RUNTIME_DIR="$out/runtime/backline" "$@" "$BL_BIN/backline-recorderd" --idle-exit 0 >>"$out/recorderd.log" 2>&1 &
+  RD=$!
+  for _ in $(seq 100); do busctl --user status io.github.manuaudio.Backline.Recorder >/dev/null 2>&1 && return 0; sleep 0.05; done
+  echo "recorderd did not come up"; return 1
+}
+stop_daemon() { [[ -n $RD ]] || return 0; kill "$RD" 2>/dev/null || true; wait "$RD" 2>/dev/null || true; RD=; }
+
+echo "== recorderd-proof $(date -Is)"
+default_before=$(bl_default_sink); source_before=$(bl_default_source); bl_foreign_nodes >"$out/nodes-before.txt"
+bl_watch_defaults "$default_before" "$source_before" "$out/defaults-moved.txt"
+echo "default sink: $default_before"
+echo "bus: private ($DBUS_SESSION_BUS_ADDRESS)"
+
+python3 -I - "$out" <<'EOF'
+import math, random, struct, sys, wave
+out = sys.argv[1]; r = 48000
+def save(path, L, R):
+    w = wave.open(path, "wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(r)
+    w.writeframes(b"".join(struct.pack("<hh", int(a * 32767), int(b * 32767)) for a, b in zip(L, R))); w.close()
+random.seed(11)
+# impulses + noise: for latency lags (onsets) and exact matching (noise)
+L = [0.0] * (r // 2)
+for gap in (4801, 7333, 2903, 11117, 5003):
+    seg = [0.0] * gap; seg[0] = 0.8; L += seg
+L += [random.uniform(-0.3, 0.3) for _ in range(r)]
+save(f"{out}/impulses.wav", L, [-0.5 * v for v in L])
+# 46 s of noise for the slow-disk take (every frame distinguishable)
+N = [random.uniform(-0.25, 0.25) for _ in range(46 * r)]
+save(f"{out}/noise46.wav", N, [-0.5 * v for v in N])
+# 8 s noise for the soundcheck take, and a long tone pair for "live" afterwards
+N = [random.uniform(-0.25, 0.25) for _ in range(8 * r)]
+save(f"{out}/noise8.wav", N, [-0.5 * v for v in N])
+T = 40 * r
+save(f"{out}/tones.wav", [0.3 * math.sin(2 * math.pi * 1000 * n / r) for n in range(T)],
+     [0.3 * math.sin(2 * math.pi * 1500 * n / r) for n in range(T)])
+print("signals written")
+EOF
+
+want() { [[ " ${SECTIONS:-1 2 3 4} " == *" $1 "* ]]; }
+
+play_into() { # FILE NODE... : one player, linked to each node's playback/input ports
+  local f=$1; shift
+  bl_spawn pw-play -P '{ node.autoconnect = false node.name = backline-test.player node.dont-fallback = true }' "$f"
+  bl_wait_node backline-test.player
+  local x p
+  for x in "$@"; do
+    for p in FL FR; do
+      pw-link backline-test.player:output_$p "$x:playback_$p" 2>/dev/null || pw-link backline-test.player:output_$p "$x:input_$p"
+    done
+  done
+}
+
+########################################################################## 1
+if want 1; then
+echo; echo "-- 1. the API on a private bus"
+bl_testbed backline-test.rec-a backline-test.rec-b
+start_daemon
+busctl --user monitor --json=short io.github.manuaudio.Backline.Recorder >"$out/signals.jsonl" 2>/dev/null &
+MON=$!; BL_PIDS+=($MON)
+sleep 0.3
+echo "  Record while idle: $(call Record 2>&1 || true)"
+echo "  Arm a missing node: $(call Arm 'asa{sv}' 1 no.such.node 0 2>&1 || true)"
+echo "  Arm a bad option: $(call Arm 'asa{sv}' 1 backline-test.rec-a 1 colour s red 2>&1 || true)"
+t0=$(date +%s.%N)
+echo "  Arm: $(call Arm 'asa{sv}' 2 backline-test.rec-a backline-test.rec-b 2 dir s "$out/takes" name s api) in $(python3 -c "print(f'{($(date +%s.%N)-$t0)*1000:.0f} ms')")"
+echo "  State $(prop State), Take $(prop Take), Sources $(prop Sources)"
+echo "  Arm again: $(call Arm 'asa{sv}' 1 backline-test.rec-a 0 2>&1 || true)"
+echo "  AddMarker while armed: $(call AddMarker s early 2>&1 || true)"
+play_into "$out/impulses.wav" backline-test.rec-a backline-test.rec-b
+call Record >/dev/null; echo "  Record -> State $(prop State)"
+sleep 0.8; m1=$(call AddMarker s "verse one" | cut -d' ' -f2)
+sleep 0.6; m2=$(call AddMarker s chorus | cut -d' ' -f2)
+sleep 0.6
+echo "  markers at frames $m1 and $m2; Frames now $(prop Frames)"
+sidecar=$(jcall Stop)
+echo "  Stop -> $sidecar; State $(prop State); LastTake $(prop LastTake)"
+kill $MON 2>/dev/null || true; bl_cleanup
+sleep 0.5
+python3 -I - "$sidecar" "$out/signals.jsonl" "$m1" "$m2" "$here" <<'EOF'
+import json, sys
+sc, sig, m1, m2, here = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+sys.path.insert(0, here); import analyze as A
+d = json.load(open(sc))
+print(f"  sidecar: {d['schema']}, {d['frames']} frames at {d['rate']}, overruns {d['overrun_frames']}, markers {[(m['name'], m['frame']) for m in d['markers']]}")
+ok = [m['frame'] for m in d['markers']] == [m1, m2]
+for t in d["tracks"]:
+    c = A.cmd_cues(t["file"])
+    print(f"  {t['file'].split('/')[-1]}: {t['frames']} frames, container {t['container']}, cues {[(x['label'], x['frame']) for x in c['cues']]}")
+    ok &= [(x['label'], x['frame']) for x in c['cues']] == [("verse one", m1), ("chorus", m2)]
+al = A.cmd_align(d["tracks"][0]["file"], d["tracks"][1]["file"])
+print(f"  tracks: lag {al['lag_samples']}, max diff {al['max_abs_diff_at_lag']}")
+ok &= al["lag_samples"] == 0 and al["max_abs_diff_at_lag"] == 0.0
+names = {}
+for line in open(sig):
+    try: m = json.loads(line)
+    except Exception: continue
+    if m.get("type") == "signal": names[m.get("member")] = names.get(m.get("member"), 0) + 1
+print(f"  signals seen: {dict(sorted(names.items()))}")
+ok &= names.get("TakeFinished", 0) == 1 and names.get("Marker", 0) == 2 and names.get("Level", 0) >= 5 and names.get("PropertiesChanged", 0) >= 3
+print("  RESULT:", "PASS" if ok else "FAIL", "(markers in sidecar and cue chunks, tracks aligned, signals)")
+EOF
+echo "  Takes: $(jcall Takes | J "[(t['take'], t['frames'], t['markers']) for t in d['takes']]")"
+echo "  GetTake api: $(jcall GetTake s api | J "d['schema'], len(d['tracks'])")"
+echo "  GetTake missing: $(call GetTake s nope 2>&1 || true)"
+echo "  CLI, backline rec takes: $("$BL_BIN/backline" rec takes)"
+echo "  CLI, backline rec status --json: $("$BL_BIN/backline" rec status --json)"
+
+fi
+
+########################################################################## 2
+if want 2; then
+[[ -n $RD ]] || start_daemon
+echo; echo "-- 2. input-latency compensation (fake capture devices with known latency)"
+bl_spawn "$BL_BIN/backline-test-source" "$out/impulses.wav" backline-test.src-a:0 backline-test.src-b:480:physical backline-test.src-c:256 2>"$out/test-source.log"
+SRC=$!
+for n in a b c; do bl_wait_node backline-test.src-$n; done
+sleep 0.3
+pw-dump | jq -r '.[] | select(.type=="PipeWire:Interface:Port") | select((.info.props["object.path"] // "") | test("backline-test.src")) | select(.info.direction=="output")
+  | "  reported: \(.info.props["object.path"]) physical=\(.info.props["port.physical"] // false) capture latency \([.info.params.Latency[] | select(.direction=="Output") | .maxRate][0]) frames"'
+lat_take() { # NAME MODE [N_EXTRA extra options...]
+  local name=$1 mode=$2 n=3; shift 2
+  if [[ $# -gt 0 ]]; then n=$((3 + $1)); shift; fi
+  call Arm 'asa{sv}' 3 backline-test.src-a:1 backline-test.src-b:1 backline-test.src-c:1 $n dir s "$out/takes" name s "$name" latency s "$mode" "$@" >/dev/null
+  echo "  [$name] latency=$mode $*: CaptureLatency $(prop CaptureLatency)"
+  call Record >/dev/null
+}
+for spec in "lat-off off" "lat-hardware hardware" "lat-reported reported" "lat-manual hardware 1 latency-frames a{su} 1 backline-test.src-c 256"; do
+  # shellcheck disable=SC2086
+  lat_take $spec
+  kill -USR1 $SRC     # the sources start the signal 0.25 s from now, all in the same cycle
+  sleep 1.6
+  jcall Stop >"$out/${spec%% *}.path"
+  # the source plays once per SIGUSR1: restart it for the next take
+  kill $SRC; wait $SRC 2>/dev/null || true
+  bl_spawn "$BL_BIN/backline-test-source" "$out/impulses.wav" backline-test.src-a:0 backline-test.src-b:480:physical backline-test.src-c:256 2>>"$out/test-source.log"
+  SRC=$!; for n in a b c; do bl_wait_node backline-test.src-$n; done; sleep 0.3
+done
+kill $SRC; wait $SRC 2>/dev/null || true
+python3 -I - "$out" "$here" <<'EOF'
+import json, sys
+out, here = sys.argv[1:3]; sys.path.insert(0, here); import analyze as A
+expect = {"lat-off": (480, 256), "lat-hardware": (0, 256), "lat-reported": (0, 0), "lat-manual": (0, 0)}
+ok = True
+print("  take           compensation a/b/c   lag b-a  lag c-a  diff b  diff c  frames")
+for name, (eb, ec) in expect.items():
+    d = json.load(open(f"{out}/takes/{name}.json"))
+    f = [t["file"] for t in d["tracks"]]
+    comp = [t["capture_latency_frames"] for t in d["tracks"]]
+    ab, ac = A.cmd_align(f[0], f[1]), A.cmd_align(f[0], f[2])
+    lens = [t["frames"] for t in d["tracks"]]
+    good = ab["lag_samples"] == eb and ac["lag_samples"] == ec and ab["max_abs_diff_at_lag"] == 0 and ac["max_abs_diff_at_lag"] == 0 and len(set(lens)) == 1
+    ok &= good
+    print(f"  {name:14} {str(comp):20} {ab['lag_samples']:7}  {ac['lag_samples']:7}  {ab['max_abs_diff_at_lag']:6}  {ac['max_abs_diff_at_lag']:6}  {lens[0]} {'ok' if good else 'UNEXPECTED'}")
+print("  (expected lags b,c: off 480,256; hardware 0,256 since c is not physical; reported 0,0; hardware + manual c=256: 0,0)")
+print("  RESULT:", "PASS" if ok else "FAIL", "(each track lines up by exactly its capture latency, bit-identical, equal lengths)")
+EOF
+
+fi
+
+########################################################################## 3
+if want 3; then
+echo; echo "-- 3. slow disk: 12 s and 8 s write stalls during a 40 s take"
+stop_daemon
+bl_testbed backline-test.rec-a backline-test.rec-b
+mkdir -p "$out/stall" "$out/stall-ref" "$out/stall-small"
+start_daemon LD_PRELOAD="$BL_BIN/slowdisk.so" SLOWDISK_PREFIX="$out/stall/" SLOWDISK_STALLS="3:12,20:8" SLOWDISK_LOG="$out/stall.log"
+"$BL_BIN/backline-recorder" -s backline-test.rec-a -s backline-test.rec-b -o "$out/stall-ref" -n ref -d 44 >/dev/null 2>"$out/stall-ref.log" &
+REF=$!; BL_PIDS+=($REF)
+call Arm 'asa{sv}' 2 backline-test.rec-a backline-test.rec-b 3 dir s "$out/stall" name s stall duration d 40 >/dev/null
+echo "  ring per track: $(jcall GetTake s api >/dev/null 2>&1; echo 30) s (default); stalls: 12 s from 3 s, 8 s from 20 s"
+sleep 0.5
+play_into "$out/noise46.wav" backline-test.rec-a backline-test.rec-b
+sleep 0.5
+call Record >/dev/null
+t0=$(date +%s)
+peak_frames=0
+for i in $(seq 1 44); do
+  sleep 1
+  st=$(prop State)
+  [[ $st == '"idle"' ]] && break
+done
+wait $REF 2>/dev/null || true
+for _ in $(seq 100); do [[ $(prop State) == '"idle"' ]] && break; sleep 0.2; done
+sed 's/^/  shim: /' "$out/stall.log"
+stall_sc=$out/stall/stall.json
+python3 -I - "$stall_sc" "$out/stall-ref/ref.json" "$here" <<'EOF'
+import json, sys
+sc, ref, here = sys.argv[1:4]; sys.path.insert(0, here); import analyze as A
+d, r = json.load(open(sc)), json.load(open(ref))
+print(f"  stalled take: {d['frames']} frames ({d['frames']/d['rate']:.2f} s), overrun frames {d['overrun_frames']}")
+ok = d["overrun_frames"] == 0 and d["frames"] == 40 * d["rate"]
+for i in range(2):
+    m = A.cmd_match(r["tracks"][i]["file"], d["tracks"][i]["file"])
+    for ch in (1,):
+        m2 = A.cmd_match(r["tracks"][i]["file"], d["tracks"][i]["file"], ch, ch)
+    print(f"  track {i+1}: inside the reference at frame {m.get('offset')}, {m.get('compared')} frames compared, {m.get('mismatches')} differ (R channel: {m2.get('mismatches')} differ at offset {m2.get('offset')})")
+    ok &= m["found"] and m["mismatches"] == 0 and m["compared"] == d["frames"] and m2["mismatches"] == 0 and m2["offset"] == m["offset"]
+al = A.cmd_align(d["tracks"][0]["file"], d["tracks"][1]["file"])
+print(f"  tracks of the stalled take: lag {al['lag_samples']}, max diff {al['max_abs_diff_at_lag']}")
+ok &= al["lag_samples"] == 0
+print("  RESULT:", "PASS" if ok else "FAIL", "(0 frames lost: every frame of the 40 s take equals the unstalled reference)")
+EOF
+echo "  [control: the same stalls, 4 s ring]"
+stop_daemon
+bl_cleanup
+bl_testbed backline-test.rec-a backline-test.rec-b
+rm -f "$out/stall-small.log"
+start_daemon LD_PRELOAD="$BL_BIN/slowdisk.so" SLOWDISK_PREFIX="$out/stall-small/" SLOWDISK_STALLS="3:12,20:8" SLOWDISK_LOG="$out/stall-small.log"
+call Arm 'asa{sv}' 2 backline-test.rec-a backline-test.rec-b 4 dir s "$out/stall-small" name s small duration d 30 ring-seconds d 4 >/dev/null
+play_into "$out/noise46.wav" backline-test.rec-a backline-test.rec-b
+sleep 0.5
+call Record >/dev/null
+for _ in $(seq 200); do [[ $(prop State) == '"idle"' ]] && break; sleep 0.25; done
+python3 -I - "$out/stall-small/small.json" "$here" <<'EOF'
+import json, sys
+sc, here = sys.argv[1:3]; sys.path.insert(0, here); import analyze as A
+d = json.load(open(sc))
+al = A.cmd_align(d["tracks"][0]["file"], d["tracks"][1]["file"])
+print(f"  4 s ring: overrun frames {d['overrun_frames']} ({d['overrun_frames']/d['rate']:.2f} s lost, reported), tracks lag {al['lag_samples']} max diff {al['max_abs_diff_at_lag']}, lengths {[t['frames'] for t in d['tracks']]}")
+# a driver change during the take may glitch the cycle it happens in (a
+# known limit, README): allow differences only in that many cycles
+ta, tb = A.read_wav(d["tracks"][0]["file"])["data"][0], A.read_wav(d["tracks"][1]["file"])["data"][0]
+bad = [i for i in range(min(len(ta), len(tb))) if ta[i] != tb[i]]
+runs = 0
+for j, i in enumerate(bad):
+    if j == 0 or i - bad[j - 1] > d["quantum_range"][1]: runs += 1
+dc = d["alignment"]["driver_changes"]
+print(f"  frames that differ between the tracks: {len(bad)}, in {runs} place(s); driver changes during the take: {dc}")
+ok = d["overrun_frames"] > 0 and al["lag_samples"] == 0 and runs <= dc and len(bad) <= dc * d["quantum_range"][1]
+print("  RESULT:", "PASS" if ok else "FAIL", "(the stall is real: a small ring loses audio, says so, and the tracks stay aligned)")
+EOF
+grep -c Overrun "$out/recorderd.log" >/dev/null || true
+stop_daemon
+bl_cleanup
+
+fi
+
+########################################################################## 4
+if want 4; then
+echo; echo "-- 4. virtual soundcheck"
+vsrc() { echo "create-node adapter { factory.name = support.null-audio-sink node.name = $1 node.description = \"Backline test $1\" media.class = Audio/Source/Virtual audio.position = [ FL FR ] object.linger = false priority.session = 1 node.virtual = true }"; }
+{ vsrc backline-test.mic-a; vsrc backline-test.mic-b; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+BL_PIDS+=($!)
+bl_testbed backline-test.foh
+bl_wait_node backline-test.mic-a; bl_wait_node backline-test.mic-b
+# the "mixer": mic-a left -> FOH left, mic-b right -> FOH right, made by someone else (the test)
+pw-link backline-test.mic-a:capture_FL backline-test.foh:playback_FL
+pw-link backline-test.mic-b:capture_FR backline-test.foh:playback_FR
+links() { pw-link -l -I 2>/dev/null | python3 -I -c "
+import sys,re
+cur=None; out=[]
+for l in sys.stdin:
+    m=re.match(r'\s*\d+\s+(\S+:\S+)$', l)
+    if m: cur=m.group(1); continue
+    m=re.match(r'\s*\d+\s+\|->\s+\d+\s+(\S+:\S+)$', l)
+    if m and cur and 'foh' in m.group(1): out.append(cur+' -> '+m.group(1))
+print('; '.join(sorted(out)))"; }
+before=$(links)
+echo "  FOH inputs before: $before"
+start_daemon
+play_into "$out/noise8.wav" backline-test.mic-a backline-test.mic-b
+sleep 0.3
+call Arm 'asa{sv}' 2 backline-test.mic-a backline-test.mic-b 2 dir s "$out/takes" name s sc >/dev/null
+call Record >/dev/null; sleep 5; take=$(jcall Stop)
+echo "  recorded the mics: $take"
+bl_cleanup_player() { pkill -f 'node.name = backline-test.player' 2>/dev/null || true; }
+kill "$(pgrep -f 'pw-play .*backline-test.player' | head -1)" 2>/dev/null || true
+sleep 0.3
+play_into "$out/tones.wav" backline-test.mic-a backline-test.mic-b
+sleep 0.3
+foh() { # NAME: 1.2 s of the FOH sink's monitor
+  "$BL_BIN/backline-recorder" -s backline-test.foh -o "$out/foh" -n "$1" -d 1.2 >/dev/null 2>"$out/foh-$1.log"
+}
+foh live1
+call Soundcheck 'sa{sv}' sc 0 >/dev/null
+echo "  Soundcheck sc: Soundcheck $(prop Soundcheck), inputs $(prop SoundcheckInputs)"
+sleep 0.6; foh loaded
+call SetInput ss backline-test.mic-a playback >/dev/null; sleep 0.3
+echo "  mic-a -> playback: $(links)"
+foh a_playback
+call SetInput ss backline-test.mic-b playback >/dev/null; sleep 0.3
+echo "  mic-b -> playback: $(links)"
+foh both_playback
+echo "  SetInput unknown: $(call SetInput ss backline-test.foh playback 2>&1 || true)"
+call SetInput ss backline-test.mic-a live >/dev/null; sleep 0.3
+foh b_playback
+call SetInput ss backline-test.mic-b live >/dev/null; sleep 0.3
+after_live=$(links)
+echo "  both live: $after_live"
+foh live2
+python3 -I - "$out" "$take" "$here" <<'EOF'
+import json, sys
+out, take, here = sys.argv[1:4]; sys.path.insert(0, here); import analyze as A
+d = json.load(open(take))
+ta, tb = A.read_wav(d["tracks"][0]["file"]), A.read_wav(d["tracks"][1]["file"])
+def tone(x, rate):
+    return round(A.f0(x[2400:2400 + 16384], rate)[0])
+def where(take_ch, x):
+    off, k = A.find_in(take_ch, x)
+    if off is None: return None, None
+    # the take loops: compare up to its end
+    n = min(len(x), len(take_ch) - off)
+    bad = sum(1 for i in range(k, n) if take_ch[i + off] != x[i])
+    return off, bad
+ok = True
+rows = []
+for name, want in [("live1", ("live", "live")), ("loaded", ("live", "live")), ("a_playback", ("take", "live")),
+                   ("both_playback", ("take", "take")), ("b_playback", ("live", "take")), ("live2", ("live", "live"))]:
+    w = A.read_wav(f"{out}/foh/{name}-01-backline-test.foh.wav")
+    got, offs = [], []
+    for ch, tr, f in ((0, ta, 1000), (1, tb, 1500)):
+        x = w["data"][ch]
+        off, bad = where(tr["data"][ch], x)
+        if off is not None and bad == 0:
+            got.append("take"); offs.append(off)
+        elif tone(x, w["rate"]) == f:
+            got.append("live"); offs.append(None)
+        else:
+            got.append(f"? ({tone(x, w['rate'])} Hz, off {off}, {bad} differ)"); offs.append(None)
+    lock = ""
+    if offs[0] is not None and offs[1] is not None:
+        lock = f"; L at take frame {offs[0]}, R at take frame {offs[1]}: {'lockstep' if offs[0] == offs[1] else 'NOT IN STEP'}"
+        ok &= offs[0] == offs[1]
+    good = tuple(got) == want
+    ok &= good
+    print(f"  FOH {name:13}: L {got[0]:5} R {got[1]:5}{lock}  {'ok' if good else 'UNEXPECTED, wanted ' + str(want)}")
+print("  (live = the 1000/1500 Hz tones now on the mics; take = bit-exact samples of the recorded take)")
+print("  RESULT:", "PASS" if ok else "FAIL", "(each input switches alone, playback is bit-exact and in lockstep)")
+EOF
+if [[ $after_live == "$before" ]]; then echo "  links after live == before: yes"; else echo "  links after live == before: NO ($after_live)"; fi
+echo "  [crash with mic-a switched]"
+call SetInput ss backline-test.mic-a playback >/dev/null; sleep 0.3
+echo "  moves file: $(python3 -I -c "import json;print(len(json.load(open('$out/runtime/backline/soundcheck.json'))['moves']), 'link(s)')")"
+kill -KILL "$RD"; wait "$RD" 2>/dev/null || true; sleep 0.5
+echo "  after SIGKILL: $(links)"
+start_daemon; sleep 0.5
+restored=$(links)
+echo "  after restart: $restored"
+grep "putting back" "$out/recorderd.log" | sed 's/^/  recorderd: /'
+if [[ $restored == "$before" && ! -e $out/runtime/backline/soundcheck.json ]]; then
+  echo "  RESULT: PASS (a crash in playback loses the consumer's link; the next start puts it back)"
+else
+  echo "  RESULT: FAIL"
+fi
+stop_daemon
+bl_cleanup
+
+fi
+
+echo; echo "-- clean up"
+sleep 0.5
+left=$(pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // empty' | grep -c -E '^backline-test|^backline.soundcheck' || true)
+mine=0; for p in ${RD:-} ${SRC:-} ${REF:-}; do kill -0 "$p" 2>/dev/null && mine=$((mine + 1)); done
+echo "test nodes left: $left; processes of this proof left: $mine"
+bl_foreign_nodes >"$out/nodes-after.txt"
+echo "other nodes same as at start: $(bl_same_nodes "$out/nodes-before.txt" "$out/nodes-after.txt")"
+echo "default sink after: $(bl_default_sink) ($( [[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED)); default source $( [[ $(bl_default_source) == "$source_before" ]] && echo unchanged || echo CHANGED); moved during the run: $( [[ -s $out/defaults-moved.txt ]] && cat "$out/defaults-moved.txt" | head -3 || echo never)"; kill $BL_WATCH 2>/dev/null

@@ -233,8 +233,10 @@ bl_cleanup
 sleep 0.3
 
 echo; echo "-- clean up"
-left=$(pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // empty' | grep -c '^backline' || true)
-echo "backline nodes left: $left; processes left: $(pgrep -c -x 'backline-plugin|backline-record|backline-test-k|pw-record|pw-play' || true)"
+# only this proof's own things: other Backline work (a GUI bench, another
+# proof) may run its own backline.* nodes at the same time
+left=$(pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // empty' | grep -c '^backline-test' || true)
+echo "test nodes left: $left; processes left: $(pgrep -c -f 'backline-test\.(rec|player)' || true)"
 bl_foreign_nodes >"$out/foreign-end.txt"
 echo "other nodes same as at start: $(bl_same_nodes "$out/foreign-before.txt" "$out/foreign-end.txt")"
 echo "default sink after: $(bl_default_sink) ($([[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED))"

@@ -24,6 +24,11 @@ struct gnode {
 	struct bl_node info;
 };
 
+struct gglobal_link {
+	struct spa_list link;
+	struct bl_link info;
+};
+
 struct glink {
 	struct spa_list link;
 	struct bl_graph *g;
@@ -42,6 +47,7 @@ struct bl_graph {
 	struct spa_list ports;
 	struct spa_list nodes;
 	struct spa_list links;
+	struct spa_list all_links;
 };
 
 static void copy(char *dst, size_t n, const char *src)
@@ -83,6 +89,8 @@ static void on_global(void *data, uint32_t id, uint32_t permissions,
 		p->info.id = id;
 		if ((s = spa_dict_lookup(props, PW_KEY_NODE_ID)))
 			p->info.node_id = (uint32_t)atoi(s);
+		if ((s = spa_dict_lookup(props, PW_KEY_PORT_ID)))
+			p->info.index = (uint32_t)atoi(s);
 		p->info.output = spa_streq(spa_dict_lookup(props, PW_KEY_PORT_DIRECTION), "out");
 		p->info.monitor = spa_atob(spa_dict_lookup(props, PW_KEY_PORT_MONITOR));
 		p->info.physical = spa_atob(spa_dict_lookup(props, PW_KEY_PORT_PHYSICAL));
@@ -97,6 +105,19 @@ static void on_global(void *data, uint32_t id, uint32_t permissions,
 		spa_list_append(&g->ports, &p->link);
 		if (g->events && g->events->port_added)
 			g->events->port_added(g->data, &p->info);
+	} else if (spa_streq(type, PW_TYPE_INTERFACE_Link)) {
+		struct gglobal_link *l = calloc(1, sizeof(*l));
+		const char *s;
+		if (!l)
+			return;
+		l->info.id = id;
+		if ((s = spa_dict_lookup(props, PW_KEY_LINK_OUTPUT_PORT))) l->info.out_port = (uint32_t)atoi(s);
+		if ((s = spa_dict_lookup(props, PW_KEY_LINK_INPUT_PORT))) l->info.in_port = (uint32_t)atoi(s);
+		if ((s = spa_dict_lookup(props, PW_KEY_LINK_OUTPUT_NODE))) l->info.out_node = (uint32_t)atoi(s);
+		if ((s = spa_dict_lookup(props, PW_KEY_LINK_INPUT_NODE))) l->info.in_node = (uint32_t)atoi(s);
+		spa_list_append(&g->all_links, &l->link);
+		if (g->events && g->events->link_added)
+			g->events->link_added(g->data, &l->info);
 	}
 }
 
@@ -105,7 +126,17 @@ static void on_global_remove(void *data, uint32_t id)
 	struct bl_graph *g = data;
 	struct gport *p;
 	struct gnode *n;
+	struct gglobal_link *gl;
 
+	spa_list_for_each(gl, &g->all_links, link) {
+		if (gl->info.id == id) {
+			spa_list_remove(&gl->link);
+			free(gl);
+			if (g->events && g->events->link_removed)
+				g->events->link_removed(g->data, id);
+			return;
+		}
+	}
 	spa_list_for_each(p, &g->ports, link) {
 		if (p->info.id == id) {
 			spa_list_remove(&p->link);
@@ -142,6 +173,7 @@ struct bl_graph *bl_graph_new(struct pw_core *core,
 	spa_list_init(&g->ports);
 	spa_list_init(&g->nodes);
 	spa_list_init(&g->links);
+	spa_list_init(&g->all_links);
 	g->registry = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
 	pw_registry_add_listener(g->registry, &g->registry_listener, &registry_events, g);
 	return g;
@@ -162,8 +194,11 @@ void bl_graph_destroy(struct bl_graph *g)
 	struct gport *p, *tp;
 	struct gnode *n, *tn;
 	struct glink *l, *tl;
+	struct gglobal_link *gl, *tgl;
 	if (!g)
 		return;
+	spa_list_for_each_safe(gl, tgl, &g->all_links, link)
+		free(gl);
 	spa_list_for_each_safe(l, tl, &g->links, link)
 		link_free(l);
 	spa_list_for_each_safe(p, tp, &g->ports, link)
@@ -251,7 +286,48 @@ int bl_graph_links_ready(struct bl_graph *g)
 	return n;
 }
 
+static int make_link(struct bl_graph *g, uint32_t out_port, uint32_t in_port, bool linger);
+
 int bl_graph_link(struct bl_graph *g, uint32_t out_port, uint32_t in_port)
+{
+	return make_link(g, out_port, in_port, false);
+}
+
+int bl_graph_link_persistent(struct bl_graph *g, uint32_t out_port, uint32_t in_port)
+{
+	return make_link(g, out_port, in_port, true);
+}
+
+int bl_graph_unlink(struct bl_graph *g, uint32_t out_port, uint32_t in_port)
+{
+	struct glink *l;
+	spa_list_for_each(l, &g->links, link) {
+		if (l->out == out_port && l->in == in_port) {
+			link_free(l);
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
+int bl_graph_for_each_link(struct bl_graph *g,
+		int (*cb)(void *data, const struct bl_link *link), void *data)
+{
+	struct gglobal_link *l, *t;
+	int r;
+	spa_list_for_each_safe(l, t, &g->all_links, link)
+		if ((r = cb(data, &l->info)) != 0)
+			return r;
+	return 0;
+}
+
+int bl_graph_destroy_global(struct bl_graph *g, uint32_t id)
+{
+	int r = pw_registry_destroy(g->registry, id);
+	return r < 0 ? r : 0;
+}
+
+static int make_link(struct bl_graph *g, uint32_t out_port, uint32_t in_port, bool linger)
 {
 	struct glink *l;
 	char o[16], i[16];
@@ -266,7 +342,7 @@ int bl_graph_link(struct bl_graph *g, uint32_t out_port, uint32_t in_port)
 	struct pw_properties *props = pw_properties_new(
 			PW_KEY_LINK_OUTPUT_PORT, o,
 			PW_KEY_LINK_INPUT_PORT, i,
-			PW_KEY_OBJECT_LINGER, "false",
+			PW_KEY_OBJECT_LINGER, linger ? "true" : "false",
 			NULL);
 	l->g = g;
 	l->out = out_port;

@@ -23,6 +23,10 @@ bl_wait_node() { # node.name [tries]
   return 1
 }
 
+bl_default_source() {
+  pw-metadata -n default 0 default.audio.source 2>/dev/null | sed -n "s/.*value:'\([^']*\)'.*/\1/p"
+}
+
 bl_default_sink() {
   pw-metadata -n default 0 default.audio.sink 2>/dev/null | sed -n "s/.*value:'\([^']*\)'.*/\1/p"
 }
@@ -72,4 +76,14 @@ bl_cleanup() {
   pkill -f '^sleep 100000$' -P $$ 2>/dev/null || true
   for p in "${BL_PIDS[@]}"; do wait "$p" 2>/dev/null || true; done
   BL_PIDS=()
+}
+
+# Watch the default sink and source for the whole run (WirePlumber may make a
+# new test node the default while it exists). Lines in FILE if they move.
+bl_watch_defaults() { # sink source FILE
+  ( while sleep 0.5; do
+      [[ $(bl_default_sink) == "$1" && $(bl_default_source) == "$2" ]] ||
+        echo "$(date +%T) sink=$(bl_default_sink) source=$(bl_default_source)" >>"$3"
+    done ) &
+  BL_WATCH=$!
 }

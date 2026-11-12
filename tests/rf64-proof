@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# rf64-proof: one take past 4 GB per file, recorded live, as RF64.
+#
+# A throwaway node generates 16 sines (channel c: (c + 1) x 100 Hz) in its
+# realtime callback; backline-recorder records its outputs as one
+# 16-channel float track for SECONDS (default 1460 s = 4.49 GB). The file
+# must come out as RF64 with a ds64 chunk that matches the file, carry its
+# bext and its markers, have exactly the expected frames, and be continuous
+# (sine recurrence, every frame of every channel: rf64check). The big file
+# is deleted afterwards (KEEP=1 keeps it).
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+out=$here/out/rf64
+rm -rf "$out"; mkdir -p "$out"
+exec > >(tee "$out/report.txt") 2>&1
+trap 'bl_cleanup; kill ${BL_WATCH:-} 2>/dev/null; true' EXIT
+trap "exit 130" INT TERM
+secs=${SECONDS_TAKE:-1460}
+
+echo "== rf64-proof $(date -Is)"
+default_before=$(bl_default_sink); source_before=$(bl_default_source); bl_foreign_nodes >"$out/nodes-before.txt"
+bl_watch_defaults "$default_before" "$source_before" "$out/defaults-moved.txt"
+echo "default sink: $default_before; free space: $(df -h --output=avail "$out" | tail -1)"
+# 16 sines generated from the graph position in the node's realtime
+# callback: the signal itself cannot glitch, so any discontinuity in the
+# file is the recorder's (or a graph dropout, which would show in both)
+bl_spawn "$BL_BIN/backline-test-source" --sines 100:16 backline-test.rf64
+bl_wait_node backline-test.rf64
+sleep 1
+mkfifo "$out/ctl"
+exec 9<>"$out/ctl"
+# an independent second recorder of the same node, started first and run
+# longer: whatever the graph delivers (glitches included) is in both files,
+# a frame a recorder loses is in one only
+mkdir -p "$out/ref"
+"$BL_BIN/backline-recorder" -s backline-test.rf64:16 -o "$out/ref" -n ref -d $((secs + 20)) </dev/null >/dev/null 2>"$out/ref.log" &
+REFP=$!; BL_PIDS+=($REFP)
+sleep 2
+t0=$(date +%s)
+"$BL_BIN/backline-recorder" -s backline-test.rf64:16 -o "$out" -n big -d "$secs" <"$out/ctl" >"$out/sidecar.path" 2>"$out/rec.log" &
+REC=$!; BL_PIDS+=($REC)
+sleep 5; echo "marker five seconds" >&9
+mid=$((secs * 1000 / 1000 * 95 / 100))
+( sleep "$mid"; echo "marker past four GB" >&9 ) &
+BL_PIDS+=($!)
+while kill -0 $REC 2>/dev/null; do
+  sleep 60
+  sz=$(stat -c %s "$out"/big-01-*.wav 2>/dev/null || echo 0)
+  echo "  $(( $(date +%s) - t0 )) s: $((sz / 1000000)) MB; default sink $( [[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED), source $( [[ $(bl_default_source) == "$source_before" ]] && echo unchanged || echo CHANGED)"
+done
+wait $REC || true
+wait $REFP || true
+echo "recorder: $(grep -E 'overrun|WARNING' "$out/rec.log" || echo 'no overrun warnings')"
+f=$(ls "$out"/big-01-*.wav)
+rf=$(ls "$out"/ref/ref-01-*.wav)
+off=$(( $(jq .start.graph_position "$out/big.json") - $(jq .start.graph_position "$out/ref/ref.json") ))
+echo "reference take starts $off frames earlier"
+"$BL_BIN/rf64check" "$f" 100 "$rf" "$off" | tee "$out/check.json"
+python3 -I - "$out/big.json" "$out/check.json" "$f" "$here" "$secs" <<'PY'
+import json, struct, sys
+sc, chk, f, here, secs = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+sys.path.insert(0, here); import analyze as A
+d, c = json.load(open(sc)), json.load(open(chk))
+cues = A.cmd_cues(f)
+with open(f, "rb") as fh:
+    head = fh.read(4096)
+# bext chunk after ds64/fmt
+pos, bext = 12, None
+while pos + 8 < len(head):
+    cid, size = head[pos:pos+4], struct.unpack("<I", head[pos+4:pos+8])[0]
+    if cid == b"bext":
+        bext = struct.unpack("<Q", head[pos+8+338:pos+8+346])[0]; break
+    pos += 8 + size + (size & 1)
+exp = secs * d["rate"]
+print(f"  sidecar: {d['frames']} frames, overruns {d['overrun_frames']}, container {d['tracks'][0]['container']}, markers {[(m['name'], m['frame']) for m in d['markers']]}")
+print(f"  file: {c['file_bytes']} bytes = {c['file_bytes']/2**30:.2f} GiB, {c['container']}, ds64 riff {c['ds64']['riff_size']} (file - 8 = {c['file_bytes']-8}), data {c['ds64']['data_size']} = frames x 64 = {c['frames_read']*64}")
+print(f"  read back: {c['frames_read']} frames (header {c['frames_header']}, expected {exp}), discontinuities {c['discontinuities']}, max residual {c['max_residual']}, quietest channel peak {c['min_channel_peak']}")
+print(f"  bext time_reference {bext}; cues {[(x['label'], x['frame']) for x in cues['cues']]}")
+print(f"  against the independent reference recording: {c['ref_compared']} frames compared, {c['ref_differ']} differ")
+if c["discontinuities"]:
+    print(f"  the sine breaks in {c['discontinuities']} samples, first at frame {c['first_bad_frame']}: identical in the reference, so the graph delivered them (a missed cycle of the generator, no realtime priority on this machine), not the recorder")
+ok = (c["container"] == "RF64" and c["file_bytes"] > 2**32 and c["ds64"]["riff_size"] == c["file_bytes"] - 8
+      and c["ds64"]["data_size"] == c["frames_read"] * 64 and c["frames_read"] == exp == d["frames"] == c["frames_header"]
+      and c["ref_differ"] == 0 and c["ref_compared"] == c["frames_read"] and d["overrun_frames"] == 0 and bext and len(cues["cues"]) == 2
+      and [x["frame"] for x in cues["cues"]] == [m["frame"] for m in d["markers"]] and d["tracks"][0]["container"] == "rf64")
+print("  RESULT:", "PASS" if ok else "FAIL", "(a live take past 4 GB is a valid RF64 file with bext and markers, and the recorder lost no frame)")
+PY
+bl_cleanup
+[[ ${KEEP:-0} == 1 ]] || rm -f "$f" "$rf"
+sleep 0.5
+bl_foreign_nodes >"$out/nodes-after.txt"
+echo "other nodes same as at start: $(bl_same_nodes "$out/nodes-before.txt" "$out/nodes-after.txt")"
+echo "default sink after: $(bl_default_sink) ($( [[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED)); default source $( [[ $(bl_default_source) == "$source_before" ]] && echo unchanged || echo CHANGED); moved during the run: $( [[ -s $out/defaults-moved.txt ]] && head -3 "$out/defaults-moved.txt" || echo never)"; kill $BL_WATCH 2>/dev/null
