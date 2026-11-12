@@ -1,0 +1,173 @@
+#!/bin/bash
+
+# Installs Backline's Omarchy integration for the current user, with no sudo:
+#
+#   commands   omarchy-backline-* into ~/.local/bin (linked to a copy under
+#              ~/.local/share/backline/omarchy, with their lib and catalogs)
+#   panels     the four shell plugins into ~/.config/omarchy/plugins/<id>,
+#              then rescanned and enabled through Omarchy's own commands
+#   menu       Backline's rows, merged into
+#              ~/.config/omarchy/extensions/omarchy-menu.jsonc
+#   hotkeys    Super+Ctrl+I / M / G and their Alt variants, appended to
+#              ~/.config/hypr/bindings.lua (asked first; --no-hotkeys skips)
+#   mixer      backline-mixer and its .desktop entry, if ui/ has been built
+#
+# The menu rows and hotkeys go between backline:begin/backline:end lines, so
+# running this again replaces them and --uninstall takes exactly them out,
+# leaving the rest of each file as it was.
+#
+#   omarchy/install [--yes] [--no-hotkeys] [--no-menu]
+#   omarchy/install --uninstall
+
+set -uo pipefail
+
+src=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo=$(cd -- "$src/.." && pwd)
+data=${XDG_DATA_HOME:-$HOME/.local/share}
+config=${XDG_CONFIG_HOME:-$HOME/.config}
+share=$data/backline/omarchy
+bin=$HOME/.local/bin
+plugins_dir=$config/omarchy/plugins
+menu_file=$config/omarchy/extensions/omarchy-menu.jsonc
+bindings_file=$config/hypr/bindings.lua
+ids=(backline.instruments backline.plugins backline.record backline.transport)
+
+yes=false
+hotkeys=true
+menu=true
+uninstall=false
+for arg in "$@"; do
+  case $arg in
+    --yes) yes=true ;;
+    --no-hotkeys) hotkeys=false ;;
+    --no-menu) menu=false ;;
+    --uninstall) uninstall=true ;;
+    *) echo "Usage: omarchy/install [--yes] [--no-hotkeys] [--no-menu] | --uninstall" >&2; exit 2 ;;
+  esac
+done
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+confirm() {
+  if [[ $yes == "true" ]]; then
+    return 0
+  elif have gum && [[ -t 0 ]]; then
+    gum confirm "$1"
+  else
+    echo "$1 (skipped: run with --yes to agree)"
+    return 1
+  fi
+}
+
+# Take the backline:begin..backline:end block out of a file.
+strip_block() {
+  [[ -f $1 ]] || return 0
+  local tmp
+  tmp=$(mktemp)
+  awk '/^[[:space:]]*(\/\/|--) backline:begin$/{skip=1} !skip{print} /^[[:space:]]*(\/\/|--) backline:end$/{skip=0}' "$1" >"$tmp" && cat "$tmp" >"$1"
+  rm -f "$tmp"
+}
+
+# The menu block goes inside the JSONC object, before its closing brace. The
+# entry before it gets a trailing comma if it has none (JSONC allows one).
+merge_menu() {
+  local block
+  block=$(sed -n '/^\/\/ backline:begin$/,/^\/\/ backline:end$/p' "$src/extensions/omarchy-menu.jsonc")
+  mkdir -p "$(dirname "$menu_file")"
+  if [[ ! -s $menu_file ]] || ! grep -q '[{]' "$menu_file"; then
+    {
+      [[ -s $menu_file ]] && cat "$menu_file"
+      printf '{\n%s\n}\n' "$block"
+    } >"$menu_file.tmp" && mv "$menu_file.tmp" "$menu_file"
+    return
+  fi
+  strip_block "$menu_file"
+  BLOCK=$block python3 -I - "$menu_file" <<'PY'
+import os, re, sys
+path = sys.argv[1]
+text = open(path).read()
+end = text.rstrip().rfind("}")
+head, tail = text[:end], text[end:]
+# The last thing before the brace that isn't a comment or whitespace. If it
+# needs a comma, the comma goes inside the block, on its own line, so taking
+# the block out leaves the user's lines exactly as they were.
+block = os.environ["BLOCK"]
+code = [l for l in head.splitlines() if l.strip() and not l.strip().startswith("//")]
+if code and not code[-1].rstrip().endswith((",", "{")):
+    first, rest = block.split("\n", 1)
+    block = first + "\n  ,\n" + rest
+open(path, "w").write(head.rstrip("\n") + "\n" + block + "\n" + tail)
+PY
+}
+
+uninstall_all() {
+  for id in "${ids[@]}"; do
+    if have omarchy-plugin-disable; then
+      omarchy-plugin-disable "$id" >/dev/null 2>&1
+    fi
+    rm -rf "${plugins_dir:?}/$id"
+  done
+  have omarchy-shell && omarchy-shell -q shell rescanPlugins >/dev/null 2>&1
+  for link in "$bin"/omarchy-backline-*; do
+    [[ -L $link && $(readlink "$link") == "$share"/* ]] && rm -f "$link"
+  done
+  rm -rf "$share"
+  strip_block "$menu_file"
+  strip_block "$bindings_file"
+  rm -f "$bin/backline-mixer" "$data/applications/backline-mixer.desktop"
+  echo "Backline's Omarchy integration is removed."
+}
+
+if [[ $uninstall == "true" ]]; then
+  uninstall_all
+  exit 0
+fi
+
+# Commands, their lib and catalogs.
+rm -rf "$share"
+mkdir -p "$share" "$bin"
+cp -r "$src/bin" "$src/lib" "$src/i18n" "$src/hypr" "$src/extensions" "$share/"
+for command in "$share"/bin/omarchy-backline-*; do
+  ln -sfn "$command" "$bin/$(basename "$command")"
+done
+echo "commands: $(ls "$share/bin" | wc -l) in $bin"
+
+# Panels: copied with their shared model and catalogs resolved, since each
+# plugin directory is installed on its own.
+mkdir -p "$plugins_dir"
+for id in "${ids[@]}"; do
+  rm -rf "${plugins_dir:?}/$id"
+  cp -rL "$src/plugins/$id" "$plugins_dir/$id"
+done
+echo "panels: ${ids[*]} in $plugins_dir"
+if have omarchy-shell; then
+  omarchy-shell -q shell rescanPlugins >/dev/null 2>&1
+  if have omarchy-plugin-enable; then
+    for id in "${ids[@]}"; do
+      omarchy-plugin-enable "$id" >/dev/null 2>&1 || echo "  could not enable $id; run: omarchy plugin enable $id"
+    done
+  fi
+fi
+
+if [[ $menu == "true" ]]; then
+  merge_menu
+  echo "menu: Super+Space > Trigger > Backline"
+fi
+
+if [[ $hotkeys == "true" ]] && confirm "Add Backline's hotkeys (Super+Ctrl+I/M/G) to $bindings_file?"; then
+  strip_block "$bindings_file"
+  mkdir -p "$(dirname "$bindings_file")"
+  {
+    echo
+    sed -n '/^-- backline:begin$/,/^-- backline:end$/p' "$src/hypr/backline.lua"
+  } >>"$bindings_file"
+  echo "hotkeys: added; Hyprland applies them on its next config reload"
+fi
+
+if [[ -x $repo/ui/build/backline-mixer ]]; then
+  install -Dm755 "$repo/ui/build/backline-mixer" "$bin/backline-mixer"
+  install -Dm644 "$repo/ui/pkgbuild/backline-mixer.desktop" "$data/applications/backline-mixer.desktop"
+  echo "mixer: $bin/backline-mixer, in the app launcher as Backline Mixer"
+else
+  echo "mixer: not built; cmake -S ui -B ui/build && cmake --build ui/build, then run this again"
+fi
