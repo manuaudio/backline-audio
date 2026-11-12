@@ -51,7 +51,11 @@ plugin=$HOME/.config/omarchy/plugins/io.github.manuaudio.backline
 validator=${OMARCHY_PATH:-/usr/share/omarchy}/bin/omarchy-plugin-validate
 if [[ -x $validator ]]; then
   "$validator" "$plugin" >/dev/null || fail "Omarchy's validator accepts the installed plugin"
-  "$validator" "$ROOT/.." >/dev/null || fail "Omarchy's validator accepts the repository as a plugin"
+  # what `omarchy plugin add` clones: the tracked files (a local build/ isn't)
+  export_dir=$scratch/export
+  mkdir -p "$export_dir"
+  git -C "$ROOT/.." archive HEAD | tar -x -C "$export_dir"
+  "$validator" "$export_dir" >/dev/null || fail "Omarchy's validator accepts the repository as a plugin"
 fi
 [[ ! -e $HOME/.config/omarchy/plugins/backline.record ]] || fail "the old per-panel plugins are taken out"
 grep -q "enable io.github.manuaudio.backline" "$scratch/log" || fail "the plugin is enabled through Omarchy" "$(cat "$scratch/log")"
