@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "backline.instruments",
+  "name": "Instruments",
+  "version": "0.1.0",
+  "author": "Backline",
+  "description": "System instruments played from any MIDI keyboard",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Instruments",
+    "description": "System instruments played from any MIDI keyboard",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,44 @@
+#!/bin/bash
+
+# Writes the panels' English catalog (plugins/shared/i18n/en.json) from the
+# code: every t("key", "English") in the panels and the shared model. With
+# --check, fails when the catalog is stale instead.
+
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+catalog=$root/plugins/shared/i18n/en.json
+
+generated=$(node - "$root" <<'JS'
+const fs = require('fs'), path = require('path')
+const root = process.argv[2]
+const files = ['plugins/shared/Model.js', ...['instruments', 'record', 'plugins', 'transport'].map(p => `plugins/backline.${p}/Panel.qml`)]
+const out = {}
+const re = /\bt\(\s*"([A-Za-z0-9_.]+)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*\)/g
+for (const f of files) {
+  const text = fs.readFileSync(path.join(root, f), 'utf8')
+  let m
+  while ((m = re.exec(text))) {
+    const english = JSON.parse('"' + m[2] + '"')
+    if (out[m[1]] !== undefined && out[m[1]] !== english) {
+      console.error(`${f}: ${m[1]} has two English texts: "${out[m[1]]}" and "${english}"`)
+      process.exit(1)
+    }
+    out[m[1]] = english
+  }
+}
+const sorted = Object.fromEntries(Object.keys(out).sort().map(k => [k, out[k]]))
+process.stdout.write(JSON.stringify(sorted, null, 2) + '\n')
+JS
+)
+
+if [[ ${1:-} == "--check" ]]; then
+  if [[ $generated == "$(cat "$catalog")" ]]; then
+    echo "ok - panel catalog is current ($(jq length "$catalog") keys)"
+  else
+    echo "not ok - panel catalog is stale; run omarchy/dev/i18n-extract" >&2
+    exit 1
+  fi
+else
+  printf '%s\n' "$generated" >"$catalog"
+  echo "wrote $catalog ($(jq length "$catalog") keys)"
+fi
