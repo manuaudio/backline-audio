@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Backline Mixer
+Comment=Channel strips, meters, recording and transport for Backline
+Exec=backline-mixer
+Icon=backline-mixer
+Categories=AudioVideo;Audio;Mixer;
+Keywords=mixer;record;meter;timecode;instrument;
+StartupWMClass=backline-mixer
