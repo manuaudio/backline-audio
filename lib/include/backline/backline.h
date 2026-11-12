@@ -6,6 +6,8 @@
  *   Host1      io.github.manuaudio.Backline.Host       the plugin-host supervisor
  *   Instance1  io.github.manuaudio.Backline.Instance.* one hosted plugin
  *   Registry1  io.github.manuaudio.Backline.Registry   the plugin index
+ *   Recorder1  io.github.manuaudio.Backline.Recorder   the recorder daemon
+ *   Clock1     io.github.manuaudio.Backline.Clock      transport, tempo, timecode, Link
  *
  * It talks only D-Bus. It never loads plugin code, links no GPL code and has
  * no PipeWire dependency, so any application can use it.
@@ -152,6 +154,61 @@ int bl_instance_resolve(bl_client *c, const char *instance, char *bus_name, size
 int bl_plugins_query(bl_client *c, const char *filter_json, char **json_out);
 int bl_plugins_show(bl_client *c, const char *id_or_name, char **json_out);
 int bl_plugins_scan(bl_client *c, bool validate, char **summary_json_out);
+
+/* -------------------------------------------------------------- Recorder1 */
+/* docs/api/Recorder1.md. NULL strings and negative numbers mean the
+ * service's default. */
+typedef struct bl_rec_options {
+	const char *dir, *name, *format, *align, *latency;
+	double pre_roll, duration, ring_seconds;
+} bl_rec_options;
+#define BL_REC_OPTIONS_INIT { NULL, NULL, NULL, NULL, NULL, -1, -1, -1 }
+
+typedef struct bl_rec_status {
+	char state[16];          /* idle, armed, recording */
+	char take[128];
+	char soundcheck[128];
+	char last_take[1100];
+	uint32_t rate;
+	uint64_t frames, overruns;
+} bl_rec_status;
+
+/* sources: n strings NODE[:CHANNELS]. Returns once armed. */
+int bl_recorder_arm(bl_client *c, const char *const *sources, size_t n, const bl_rec_options *opt, char *take, size_t take_size);
+int bl_recorder_record(bl_client *c, char *take, size_t take_size);
+/* *sidecar (release with bl_free) is "" when it only disarmed. */
+int bl_recorder_stop(bl_client *c, char **sidecar);
+int bl_recorder_marker(bl_client *c, const char *name, uint64_t *frame);
+int bl_recorder_takes(bl_client *c, char **json);
+int bl_recorder_take(bl_client *c, const char *take, char **json);
+/* loop: -1 default (on), 0, 1. */
+int bl_recorder_soundcheck(bl_client *c, const char *take, int loop, uint64_t start);
+/* mode: "live" or "playback" */
+int bl_recorder_set_input(bl_client *c, const char *node, const char *mode);
+int bl_recorder_stop_soundcheck(bl_client *c);
+int bl_recorder_status(bl_client *c, bl_rec_status *st);
+
+/* ------------------------------------------------------------------ Clock1 */
+/* docs/api/Clock1.md. */
+typedef struct bl_clock_status {
+	bool rolling, link_enabled, locked;
+	uint64_t frame;
+	uint32_t rate, link_peers;
+	double tempo, beats_per_bar, beat_type, fps;
+	int64_t chase_error;
+	char timecode[32], bbt[32], source[32], ltc_mode[32], mtc_mode[32];
+} bl_clock_status;
+
+int bl_clock_play(bl_client *c);
+int bl_clock_stop(bl_client *c);
+/* position: frames, "tc:HH:MM:SS:FF" or "bbt:BAR|BEAT|TICK" */
+int bl_clock_locate(bl_client *c, const char *position, uint64_t *frame);
+int bl_clock_set_tempo(bl_client *c, double bpm);
+int bl_clock_set_meter(bl_client *c, double beats_per_bar, double beat_type);
+int bl_clock_link(bl_client *c, bool enable);
+/* ltc true: LTC, else MTC. mode: off, generate, chase. fps <= 0: keep. */
+int bl_clock_timecode(bl_client *c, bool ltc, const char *mode, double fps, const char *target, const char *source);
+int bl_clock_get(bl_client *c, bl_clock_status *st);
 
 /* --------------------------------------------------------------- helpers */
 /* The worker's bus name for a node name (non-alphanumerics become '_'). */

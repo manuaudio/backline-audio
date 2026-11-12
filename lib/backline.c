@@ -3,6 +3,7 @@
  */
 #define _GNU_SOURCE
 #include "backline/backline.h"
+#include "internal.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -57,6 +58,11 @@ static int fail_bus(bl_client *c, int r, const sd_bus_error *e, const char *what
 		return fail(c, r, "%s: %s", what, e->message ? e->message : e->name);
 	return fail(c, r, "%s: %s", what, strerror(-r));
 }
+
+/* for the other files of the library (internal.h) */
+sd_bus *bl__bus(bl_client *c) { return c->bus; }
+int bl__fail_bus(bl_client *c, int r, const sd_bus_error *e, const char *what) { return fail_bus(c, r, e, what); }
+int bl__fail(bl_client *c, int r, const char *msg) { return fail(c, r, "%s", msg); }
 
 int bl_client_open(bl_client **out)
 {

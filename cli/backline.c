@@ -18,6 +18,7 @@
 #include <json-c/json.h>
 
 #include "backline/backline.h"
+#include "services.h"
 
 static bool g_json;
 static bl_client *C;
@@ -48,7 +49,12 @@ static void usage(FILE *f)
 	      "  plugins show ID|NAME\n"
 	      "  plugins scan [--validate]\n"
 	      "\n"
-	      "  rec ARGS...            run backline-recorder (see backline rec -h)\n"
+	      "  rec arm NODE[:CH]... [opts]  arm the recorder daemon; rec record|stop|marker [NAME]|status\n"
+	      "  rec takes|take TAKE    list takes, show one take's sidecar\n"
+	      "  rec soundcheck TAKE [--once]|stop; rec input NODE live|playback   virtual soundcheck\n"
+	      "  rec -s NODE ... ARGS   run the one-shot recorder (see backline rec -h)\n"
+	      "  transport play|stop|locate POS|tempo BPM|meter N D|link on|off|status\n"
+	      "  transport ltc|mtc off|generate|chase [--fps F] [--target NODE] [--source NODE]\n"
 	      "  version\n",
 	      f);
 }
@@ -526,6 +532,16 @@ static int exec_sibling(const char *name, const char *subdir, char **argv)
 
 static int cmd_rec(int argc, char **argv)
 {
+	/* backline rec arm|record|stop|... talks to backline-recorderd; anything
+	 * else (-s NODE ...) runs the one-shot recorder */
+	if (argc > 1 && cli_rec_is_service(argv[1])) {
+		int r = C ? 0 : bl_client_open(&C);
+		if (r < 0) {
+			fprintf(stderr, "backline: session bus: %s\n", strerror(-r));
+			return 1;
+		}
+		return cli_rec(C, g_json, argc - 1, argv + 1);
+	}
 	return exec_sibling("backline-recorder", NULL, argv);
 }
 
@@ -595,6 +611,8 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(cmd, "host"))
 		r = cmd_host(n - 1, args + 1);
+	else if (!strcmp(cmd, "transport"))
+		r = cli_transport(C, g_json, n - 1, args + 1);
 	else if (!strcmp(cmd, "params"))
 		r = cmd_params(n, args);
 	else if (!strcmp(cmd, "get"))
