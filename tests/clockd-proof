@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# clockd-proof: the clock service (docs/api/Clock1.md), measured.
+#
+#  1. Transport on PipeWire's timeline. An independent native PipeWire node
+#     (backline-test-timecode --observe) logs spa_io_position every cycle.
+#     Play, Locate (frames, tc:, bbt:), Stop, SetTempo, SetMeter through D-Bus;
+#     the observer must see the state, frame and bar (bpm, beat) exactly.
+#  2. LTC generate. clockd generates LTC; the test node decodes it with libltc
+#     and checks where each frame starts against the transport it sees.
+#  3. LTC chase. The test node generates LTC from 01:00:00:00; clockd chases.
+#     Lock time and the transport error per cycle after lock; a jump to
+#     02:00:00:00; the generator stopping.
+#  4. MTC generate and 5. MTC chase, the same way with quarter frames.
+#  6. Ableton Link with a second peer (backline-test-linkpeer): peers, tempo
+#     both ways, and the beat phase between the PipeWire transport and the
+#     peer's own Link timeline.
+#
+# Throwaway: everything runs in its own network namespace (only loopback, so
+# Link can't reach another machine's session), on a private D-Bus, in a test
+# group of nodes driven by a test null sink (node.group), so the transport
+# that moves is the test group's, not the one of the real devices.
+set -euo pipefail
+if [[ -z ${BL_CLOCK_NS:-} ]]; then
+  BL_CLOCK_NS=1 exec unshare -rn bash -c 'ip link set lo up && ip link set lo multicast on && exec dbus-run-session -- "$0" "$@"' "$0" "$@"
+fi
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+out=$here/out/clockd
+rm -rf "$out"; mkdir -p "$out"
+exec > >(tee "$out/report.txt") 2>&1
+CK=; trap 'bl_cleanup; [[ -n $CK ]] && kill $CK 2>/dev/null; kill ${BL_WATCH:-} ${INTR:-} 2>/dev/null; true' EXIT
+trap 'exit 130' INT TERM
+G='node.group = backline-test.clock'
+export PIPEWIRE_PROPS="{ $G }"
+C=(io.github.manuaudio.Backline.Clock /io/github/manuaudio/Backline/Clock io.github.manuaudio.Backline.Clock1)
+call() { busctl --user call "${C[@]}" "$@"; }
+prop() { busctl --user get-property "${C[@]}" "$1" | cut -d' ' -f2-; }
+TT=$BL_BIN/clock/backline-test-timecode
+want() { [[ " ${SECTIONS:-1 2 3 4 5 6} " == *" $1 "* ]]; }
+
+echo "== clockd-proof $(date -Is)"
+echo "network: $(ip -br a | tr '\n' ' ')(own namespace)"
+default_before=$(bl_default_sink); source_before=$(bl_default_source); bl_foreign_nodes >"$out/nodes-before.txt"
+bl_watch_defaults "$default_before" "$source_before" "$out/defaults-moved.txt"
+echo "default sink: $default_before"
+{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.clk media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true %s }\n' "$G"; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+BL_PIDS+=($!)
+bl_wait_node backline-test.clk
+{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.ltcbus node.description = \"Backline test LTC bus\" media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -2 priority.session = 1 monitor.channel-volumes = false node.virtual = true %s }\n' "$G"; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+BL_PIDS+=($!)
+bl_wait_node backline-test.ltcbus
+( while sleep 0.5; do
+    pw-dump 2>/dev/null | jq -r '([.[] | select(.type=="PipeWire:Interface:Node" and .info.props["node.name"]=="backline-test.clk") | .id][0]) as $d
+      | .[] | select(.type=="PipeWire:Interface:Node") | select($d != null and .id != $d)
+      | select((.info.props["node.driver-id"] // -1) == $d and (.info.props["node.group"] // "") != "backline-test.clock")
+      | "\(.id) \(.info.props["node.name"])"' 2>/dev/null >>"$out/intruders.txt"
+  done ) &
+INTR=$!
+"$BL_BIN/clock/backline-clockd" --tolerance 2 2>"$out/clockd.log" & CK=$!
+for _ in $(seq 100); do busctl --user status io.github.manuaudio.Backline.Clock >/dev/null 2>&1 && break; sleep 0.05; done
+sleep 0.3
+echo "clockd: $(head -1 "$out/clockd.log")"
+pw-dump | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | select(.info.props["node.name"] | test("backline")) | select(.info.props["node.group"] == "backline-test.clock")
+  | "  node \(.info.props["node.name"]) in the test group, driver \(.info.props["node.driver-id"] // "self")"' 2>/dev/null || true
+
+########################################################################## 1
+if want 1; then
+echo; echo "-- 1. transport and tempo, as a native PipeWire node sees them"
+bl_spawn "$TT" -n backline-test.observer -o "$out/observe.log" --observe
+sleep 0.5
+call SetTempo d 120; call SetMeter dd 4 4
+call Locate s 0 >/dev/null
+call Play; sleep 1.5
+echo "  Locate tc:00:00:10:00 (25 fps) while rolling -> frame $(call Locate s tc:00:00:10:00 | cut -d' ' -f2)"; sleep 1
+echo "  SetTempo 90 while rolling"; call SetTempo d 90; sleep 1
+echo "  SetMeter 7/8"; call SetMeter dd 7 8; sleep 1
+echo "  Locate bbt:9|1|0 -> frame $(call Locate s 'bbt:9|1|0' | cut -d' ' -f2)"; sleep 1
+call Stop; sleep 0.5
+echo "  Locate 96000 while stopped"; call Locate s 96000 >/dev/null; sleep 0.5
+echo "  Play while chasing LTC: $(call Ltc 'sa{sv}' chase 1 source s backline-test.clk >/dev/null 2>&1; call Play 2>&1 || true)"
+call Ltc 'sa{sv}' off 0
+echo "  bad locate: $(call Locate s 'tc:99:99' 2>&1 || true)"
+echo "  bad tempo: $(call SetTempo d 5 2>&1 || true)"
+echo "  CLI, backline transport status: $("$BL_BIN/backline" transport status)"
+kill "${BL_PIDS[-1]}"; wait "${BL_PIDS[-1]}" 2>/dev/null || true; unset 'BL_PIDS[-1]'
+sleep 0.3
+python3 -I - "$out/observe.log" <<'EOF'
+import sys
+rows = [l.split() for l in open(sys.argv[1]) if l.startswith("C ")]
+# C pos rolling frame bar_valid bpm beat num denom nsec
+prev, steps, jumps = None, 0, []
+for r in rows:
+    pos, roll, fr = int(r[1]), int(r[2]), int(r[3])
+    if prev:
+        ppos, proll, pfr = int(prev[1]), int(prev[2]), int(prev[3])
+        expect = pfr + (pos - ppos if proll else 0)
+        if fr != expect: jumps.append((pfr, fr))
+        elif proll and roll: steps += 1
+    prev = r
+print(f"  observer: {len(rows)} cycles; rolling cycles where the frame advanced by exactly the graph's: {steps}; jumps: {jumps}")
+# bar: beat must follow the tempo map exactly (to the tick), cycle by cycle
+segs, last = [], None
+for r in rows:
+    if int(r[2]) != 1 or int(r[4]) != 1: continue
+    key = (float(r[5]), int(r[7]), int(r[8]))
+    if key != last: segs.append([key, []]); last = key
+    segs[-1][1].append((int(r[3]), float(r[6])))
+worst_all = 0
+for (bpm, num, den), pts in segs:
+    # within a segment of constant tempo the beat advances by frames x bpm / 60 / rate
+    d = [(b1 - b0) - (f1 - f0) * bpm / 60 / 48000 for (f0, b0), (f1, b1) in zip(pts, pts[1:]) if 0 < f1 - f0 < 8192]
+    worst = max((abs(x) for x in d), default=0)
+    worst_all = max(worst_all, worst * 1920)
+    print(f"  bar: {bpm:g} BPM {num}/{den}: {len(pts)} cycles, beat step error worst {worst*1920:.2f} ticks (1 tick = 1/1920 beat)")
+print(f"  tempo/meter segments seen: {[(k[0], f'{k[1]}/{k[2]}') for k, _ in segs]}")
+targets = [b for a, b in jumps]
+ok = steps > 100 and 480000 in targets and 96000 in targets and worst_all <= 1.0 and len(segs) >= 3
+print("  RESULT:", "PASS" if ok else "FAIL", "(rolling, locates and the bar arrive in spa_io_position exactly, to the tick)")
+EOF
+
+fi
+########################################################################## 2
+ltc_gen_test() { # FPS
+  local fps=$1
+  bl_spawn "$TT" -n backline-test.ltcread -o "$out/ltc-read-$fps.log" --ltc-read --fps "$fps"
+  bl_wait_node backline-test.ltcread; sleep 0.3
+  call Ltc 'sa{sv}' generate 2 fps d "$fps" target s backline-test.ltcread
+  call Locate s "tc:01:00:00:00" >/dev/null 2>&1 || call Locate s "tc:01:00:00;00" >/dev/null
+  call Play; sleep 3
+  call Locate s "tc:00:10:00:00" >/dev/null 2>&1 || call Locate s "tc:00:10:00;00" >/dev/null
+  sleep 2; call Stop; sleep 0.3
+  call Ltc 'sa{sv}' off 0
+  kill "${BL_PIDS[-1]}"; wait "${BL_PIDS[-1]}" 2>/dev/null || true; unset 'BL_PIDS[-1]'
+  python3 -I - "$out/ltc-read-$fps.log" "$fps" "$here/../clock" <<'EOF'
+import sys
+log, fps = sys.argv[1], float(sys.argv[2])
+num, den = {24: (24, 1), 25: (25, 1), 29.97: (30000, 1001), 30: (30, 1)}[fps]
+start = lambda k: -((-k * 48000 * den) // num)   # ceil
+rows = [l.split() for l in open(log) if l.startswith("L ")]
+errs = [int(r[3]) - start(int(r[1])) for r in rows if r[4] == "1"]
+near = [e for e in errs if abs(e) < 48000]
+print(f"  LTC {fps:g} fps: {len(rows)} frames decoded by libltc in the test node; frame start vs transport: "
+      f"error min {min(near)} max {max(near)} samples over {len(near)} frames ({len(errs)-len(near)} across the locate)")
+print("  RESULT:", "PASS" if near and max(abs(e) for e in near) <= 2 and len(near) > fps * 4 else "FAIL",
+      "(clockd's LTC is locked to the transport frame, through a locate)")
+EOF
+}
+want 2 && { echo; echo "-- 2. LTC generate, decoded by an independent libltc reader"; }
+want 2 && for f in 25 29.97 24 30; do ltc_gen_test $f; done
+
+########################################################################## 3
+chase_test() { # ltc|mtc FPS [via-sink]
+  local kind=$1 fps=$2 via=${3:-} gen src=backline-test.tcgen
+  bl_spawn "$TT" -n backline-test.tcgen -o "$out/$kind-gen-$fps$via.log" --$kind-gen 01:00:00:00 --jump 02:00:00:00 --fps "$fps"
+  gen=${BL_PIDS[-1]}
+  bl_wait_node backline-test.tcgen; sleep 0.3
+  if [[ -n $via ]]; then
+    # the LTC reaches clockd through a (follower) sink's monitor, the way a
+    # user picks a device: chase source = the sink's node.name
+    pw-link backline-test.tcgen:ltc_out backline-test.ltcbus:playback_FL
+    src=backline-test.ltcbus
+    echo "  [$kind $fps] chasing the monitor of sink $src"
+  fi
+  bl_spawn "$TT" -n backline-test.observer2 -o "$out/$kind-obs-$fps$via.log" --observe
+  bl_wait_node backline-test.observer2
+  call Stop 2>/dev/null || true
+  call ${kind^} 'sa{sv}' chase 2 fps d "$fps" source s "$src"
+  sleep 0.5
+  kill -USR1 $gen; sleep 4
+  echo "  [$kind $fps] after 4 s: Locked $(prop Locked), Source $(prop Source), Timecode $(prop Timecode), ChaseError $(prop ChaseError)"
+  kill -USR2 $gen; sleep 3
+  echo "  [$kind $fps] after the jump: Locked $(prop Locked), Timecode $(prop Timecode)"
+  kill -HUP $gen; sleep 1
+  echo "  [$kind $fps] generator stopped: Rolling $(prop Rolling)"
+  call ${kind^} 'sa{sv}' off 0
+  kill "${BL_PIDS[-1]}" "$gen"; wait "${BL_PIDS[-1]}" "$gen" 2>/dev/null || true
+  unset 'BL_PIDS[-1]'; unset 'BL_PIDS[-1]'
+  python3 -I - "$out/$kind-gen-$fps$via.log" "$out/$kind-obs-$fps$via.log" "$kind" "$fps" <<'EOF'
+import sys
+glog, olog, kind, fps = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+gens = [tuple(map(int, l.split()[1:3])) for l in open(glog) if l.startswith("G ")]   # (graph pos of origin, transport sample)
+obs = [l.split() for l in open(olog) if l.startswith("C ")]
+def incoming(pos):
+    g = [x for x in gens if x[0] <= pos]
+    return None if not g else g[-1][1] + (pos - g[-1][0])
+res = []
+for i, (o, b) in enumerate(gens):
+    end = gens[i + 1][0] if i + 1 < len(gens) else None
+    seg = [r for r in obs if int(r[1]) >= o and (end is None or int(r[1]) < end)]
+    rolling = [r for r in seg if r[2] == "1"]
+    errs = [(int(r[1]), int(r[3]) - incoming(int(r[1]))) for r in rolling]
+    lock = next((p for j, (p, e) in enumerate(errs) if all(abs(x) <= 2 for _, x in errs[j:j + 20]) and len(errs[j:j + 20]) == 20), None)
+    after = [e for p, e in errs if lock is not None and p >= lock]
+    res.append((lock, after))
+    lt = (lock - o) / 48000 * 1000 if lock is not None else None
+    print(f"  {kind.upper()} chase {fps:g} fps, {'start' if i == 0 else 'jump'}: locked {lt:.0f} ms after the timecode {'started' if i == 0 else 'jumped'}; "
+          f"then {len(after)} cycles, transport - incoming: min {min(after)} max {max(after)} samples" if after else f"  {kind} {fps}: no lock")
+ok = all(a and max(abs(x) for x in a) <= 2 for _, a in res) and len(res) == 2
+print("  RESULT:", "PASS" if ok else "FAIL", f"(the transport follows {kind.upper()} to within 2 samples, through a jump)")
+EOF
+}
+if want 3; then echo; echo "-- 3. LTC chase"
+for f in 25 29.97; do chase_test ltc $f; done
+chase_test ltc 25 -sink; fi
+
+########################################################################## 4
+if want 4; then
+echo; echo "-- 4. MTC generate, read by the test node"
+for fps in 25 29.97; do
+  bl_spawn "$TT" -n backline-test.mtcread -o "$out/mtc-read-$fps.log" --mtc-read --fps "$fps"
+  bl_wait_node backline-test.mtcread; sleep 0.3
+  call Mtc 'sa{sv}' generate 2 fps d "$fps" target s backline-test.mtcread
+  call Locate s 0 >/dev/null; call Play; sleep 3; call Stop; sleep 0.3
+  call Mtc 'sa{sv}' off 0
+  kill "${BL_PIDS[-1]}"; wait "${BL_PIDS[-1]}" 2>/dev/null || true; unset 'BL_PIDS[-1]'
+  python3 -I - "$out/mtc-read-$fps.log" "$fps" <<'EOF'
+import sys
+log, fps = sys.argv[1], float(sys.argv[2])
+num, den = {24: (24, 1), 25: (25, 1), 29.97: (30000, 1001), 30: (30, 1)}[fps]
+qs = lambda q: -((-q * 48000 * den) // (4 * num))
+rows = [l.split() for l in open(log) if l.startswith("Q ")]
+errs = [int(r[3]) - qs(int(r[1])) for r in rows if r[4] == "1"]
+print(f"  MTC {fps:g} fps: {len(rows)} quarter frames decoded; quarter-frame time vs transport: min {min(errs)} max {max(errs)} samples")
+print("  RESULT:", "PASS" if errs and max(map(abs, errs)) <= 1 and len(errs) > 4 * fps * 2 else "FAIL", "(MTC quarter frames sit on the transport's samples)")
+EOF
+done
+
+fi
+########################################################################## 5
+if want 5; then echo; echo "-- 5. MTC chase"
+for f in 25 29.97; do chase_test mtc $f; done; fi
+
+########################################################################## 6
+if want 6; then
+echo; echo "-- 6. Ableton Link with a second peer (loopback only)"
+if call Link b true 2>"$out/link.err"; then
+  call Locate s 0 >/dev/null; call SetTempo d 120; call SetMeter dd 4 4
+  coproc PEER { PIPEWIRE_PROPS="{ $G node.always-process = true }" exec "$BL_BIN/clock/backline-test-linkpeer" backline-test.linkpeer 2>&1; }
+  peer=$PEER_PID; BL_PIDS+=($peer)
+  sleep 2
+  echo "  LinkPeers on clockd: $(prop LinkPeers), Source $(prop Source)"
+  call Play; sleep 4
+  echo "tempo 133" >&"${PEER[1]}"; sleep 1.5
+  echo "  peer proposed 133 BPM -> clockd Tempo $(prop Tempo)"
+  call SetTempo d 97.5; sleep 1.5
+  timeout 4 cat <&"${PEER[0]}" >"$out/linkpeer.log" || true
+  call Stop; sleep 0.3
+  call Link b false
+  kill $peer 2>/dev/null || true; wait $peer 2>/dev/null || true
+  python3 -I - "$out/linkpeer.log" <<'EOF'
+import sys
+rows = [l.split() for l in open(sys.argv[1]) if l.startswith("P ")]
+last = rows[-1] if rows else None
+roll_all = [r for r in rows if r[8] == "1"]
+# a tempo change reaches the other peer over the network: while the two
+# tempos differ (the change is in flight) the phases aren't comparable
+roll = [r for r in roll_all if abs(float(r[3]) - float(r[4])) < 1e-3]
+print(f"  samples while a tempo change was in flight (the two tempos differ, excluded): {len(roll_all) - len(roll)}")
+d = [float(r[7]) for r in roll]
+bpm = float(roll[-1][3]) if roll else 0
+ms = [x * 60 / bpm * 1000 for x in d] if bpm else []
+print(f"  peer saw: peers {last[2] if last else '?'}, Link tempo {last[3] if last else '?'}, transport tempo {last[4] if last else '?'}")
+print(f"  beat phase, PipeWire transport vs the peer's Link timeline, {len(d)} samples while rolling: "
+      f"min {min(ms):+.3f} ms, max {max(ms):+.3f} ms (1 tick = {60/bpm/1920*1000:.3f} ms)" if ms else "  no samples")
+ok = last and last[2] == "1" and abs(float(last[3]) - 97.5) < 1e-3 and abs(float(last[4]) - 97.5) < 1e-3 and ms and max(map(abs, ms)) < 1.0
+print("  RESULT:", "PASS" if ok else "FAIL", "(one Link session: tempo both ways, phase within a millisecond)")
+EOF
+else
+  echo "  Link unsupported in this build: $(cat "$out/link.err")"
+fi
+
+fi
+
+echo; echo "-- clean up"
+kill $INTR 2>/dev/null; sleep 0.2
+echo "nodes from outside the test group that ran under its driver: $( [[ -s $out/intruders.txt ]] && sort -u "$out/intruders.txt" | tr '\n' ';' || echo none)"
+kill $CK; wait $CK 2>/dev/null || true; CK=
+bl_cleanup
+sleep 0.5
+left=$(pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.group"] // empty' | grep -c '^backline-test.clock' || true)
+echo "test-group nodes left: $left"
+bl_foreign_nodes >"$out/nodes-after.txt"
+echo "other nodes same as at start: $(bl_same_nodes "$out/nodes-before.txt" "$out/nodes-after.txt")"
+echo "default sink after: $(bl_default_sink) ($( [[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED)); default source $( [[ $(bl_default_source) == "$source_before" ]] && echo unchanged || echo CHANGED); moved during the run: $( [[ -s $out/defaults-moved.txt ]] && cat "$out/defaults-moved.txt" | head -3 || echo never)"; kill $BL_WATCH 2>/dev/null
