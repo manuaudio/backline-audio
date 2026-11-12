@@ -1,20 +1,20 @@
 // Backline's rows for the Omarchy menu (Super+Space), merged into
-// ~/.config/omarchy/extensions/omarchy-menu.jsonc by omarchy/install between
+// ~/.config/omarchy/extensions/omarchy-menu.jsonc by omarchy-backline-setup between
 // the backline:begin and backline:end lines. Guards are single cheap reads:
 // a process check, or one D-Bus property that never starts a service.
 // backline:begin
   "trigger.backline": {"icon":"󰌌","label":"Backline","description":"instruments recording plugins transport mixer"},
-  "trigger.backline.instruments": {"icon":"󰌌","label":"Instruments","action":"omarchy-shell shell toggle backline.instruments"},
+  "trigger.backline.instruments": {"icon":"󰌌","label":"Instruments","action":"omarchy-shell -q backline.instruments toggle"},
   "trigger.backline.add-instrument": {"icon":"󰐕","label":"Add Instrument","action":"omarchy-backline-instrument-add"},
   "trigger.backline.remove-instrument": {"icon":"󰍴","label":"Remove Instrument","when":"pgrep -f '^[^ ]*backline-plugin-worker' >/dev/null","action":"omarchy-backline-instrument-remove"},
   "trigger.backline.record": {"icon":"󰑊","label":"Record","when":"! omarchy-backline-record recording","action":"omarchy-backline-record toggle"},
   "trigger.backline.record-stop": {"icon":"󰓛","label":"Stop Recording","when":"omarchy-backline-record recording","action":"omarchy-backline-record stop"},
   "trigger.backline.marker": {"icon":"󰃃","label":"Add Marker","when":"omarchy-backline-record recording","action":"omarchy-backline-record marker"},
-  "trigger.backline.record-panel": {"icon":"󰻃","label":"Record Panel","action":"omarchy-shell shell toggle backline.record"},
+  "trigger.backline.record-panel": {"icon":"󰻃","label":"Record Panel","action":"omarchy-shell -q backline.record toggle"},
   "trigger.backline.soundcheck": {"icon":"󰐊","label":"Soundcheck Last Take","action":"omarchy-backline-soundcheck toggle"},
-  "trigger.backline.plugins": {"icon":"󰏗","label":"Plugins","action":"omarchy-shell shell toggle backline.plugins"},
+  "trigger.backline.plugins": {"icon":"󰏗","label":"Plugins","action":"omarchy-shell -q backline.plugins toggle"},
   "trigger.backline.rescan": {"icon":"󰑐","label":"Rescan Plugins","action":"omarchy-backline-plugins-scan"},
-  "trigger.backline.transport": {"icon":"󰔛","label":"Transport","action":"omarchy-shell shell toggle backline.transport"},
+  "trigger.backline.transport": {"icon":"󰔛","label":"Transport","action":"omarchy-shell -q backline.transport toggle"},
   "trigger.backline.play": {"icon":"󰐎","label":"Play or Stop","action":"omarchy-backline-transport toggle"},
   "trigger.backline.mixer": {"icon":"󰕾","label":"Backline Mixer","action":"omarchy-backline-mixer"},
 // backline:end

@@ -20,9 +20,9 @@ done)
 [[ -z $unused ]] || fail "every command catalog key is used" "$unused"
 pass "command strings: every key used exists, every key exists for a use"
 
-for panel in "$ROOT"/plugins/backline.*/Panel.qml; do
-  texts=$(grep -c '^\s*Text {' "$panel")
-  formats=$(grep -c 'textFormat:' "$panel")
-  ((formats >= texts)) || fail "$(basename "$(dirname "$panel")"): every Text declares textFormat ($formats of $texts)"
+for panel in "$ROOT"/plugin/*.qml; do
+  texts=$(grep -c '^\s*Text {' "$panel" || true)
+  formats=$(grep -c 'textFormat:' "$panel" || true)
+  ((formats >= texts)) || fail "$(basename "$panel"): every Text declares textFormat ($formats of $texts)"
 done
 pass "every Text in the panels declares its textFormat"

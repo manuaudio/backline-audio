@@ -19,7 +19,7 @@ Defaults remove most of the steps, so each one is listed here.
 
 ## Hotkeys
 
-These are optional. `omarchy/install` offers to add them to `~/.config/hypr/bindings.lua`. They are on the planes `manual/07-hotkeys.md` gives them, and use keys that are free in Omarchy's defaults.
+These are optional. `omarchy-backline-setup` (or `omarchy/install` from a checkout) offers to add them to `~/.config/hypr/bindings.lua`. They are on the planes `manual/07-hotkeys.md` gives them, and use keys that are free in Omarchy's defaults.
 
 | Hotkey | Plane | Opens or does |
 |---|---|---|

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(backline VERSION 0.3.0 LANGUAGES C CXX)
+project(backline VERSION 0.4.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
@@ -234,3 +234,22 @@ foreach(u backline-registry-rescan.path backline-registry-rescan.service)
 endforeach()
 install(FILES data/pacman/backline-plugins.hook DESTINATION ${CMAKE_INSTALL_DATADIR}/libalpm/hooks)
 install(DIRECTORY DESTINATION ${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/lib/backline)
+
+# Omarchy commands (omarchy-backline-*): the scripts, their lib, catalogs, menu
+# rows and hotkeys under share/backline-audio/omarchy, linked into bin. The
+# bar plugin itself is installed by `omarchy plugin add` (manifest.json at the
+# repository root); `omarchy-backline-setup` adds the menu rows and hotkeys.
+option(BACKLINE_OMARCHY "Install the omarchy-backline-* commands" ON)
+if(BACKLINE_OMARCHY)
+  set(_om ${CMAKE_INSTALL_DATADIR}/backline-audio/omarchy)
+  file(GLOB _om_bin ${PROJECT_SOURCE_DIR}/omarchy/bin/omarchy-backline-*)
+  install(PROGRAMS ${_om_bin} DESTINATION ${_om}/bin)
+  install(FILES omarchy/lib/omarchy-backline.sh DESTINATION ${_om}/lib)
+  install(DIRECTORY omarchy/i18n omarchy/hypr omarchy/extensions DESTINATION ${_om})
+  foreach(f ${_om_bin})
+    get_filename_component(n ${f} NAME)
+    file(RELATIVE_PATH _rel ${CMAKE_INSTALL_FULL_BINDIR} ${CMAKE_INSTALL_FULL_DATADIR}/backline-audio/omarchy/bin/${n})
+    install(CODE "file(MAKE_DIRECTORY \"\$ENV{DESTDIR}${CMAKE_INSTALL_FULL_BINDIR}\")
+file(CREATE_LINK \"${_rel}\" \"\$ENV{DESTDIR}${CMAKE_INSTALL_FULL_BINDIR}/${n}\" SYMBOLIC)")
+  endforeach()
+endif()

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.manuaudio.backline",
+  "name": "Backline",
+  "version": "0.4.0",
+  "author": "manuaudio",
+  "license": "MIT",
+  "description": "Mac-style pro audio for Omarchy Linux: system instruments, aligned multitrack recording, plugin index and one transport. Needs the backline-audio package (AUR).",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "omarchy/plugin/Backline.qml"
+  },
+  "barWidget": {
+    "displayName": "Backline",
+    "description": "Instruments, Record, Plugins and Transport panels",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

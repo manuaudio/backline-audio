@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# The panels' shared model (plugins/shared/Model.js), in Node: the logic that
+# The panels' shared model (plugin/Model.js), in Node: the logic that
 # decides what the panels offer and say.
 
 set -euo pipefail
