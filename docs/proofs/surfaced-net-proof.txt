@@ -1,0 +1,95 @@
+== surfaced-net-proof 2026-11-12T15:56:36-08:00
+pipewire 1.6.8, avahi 0.9-rc5, kernel 7.2.5-3-omarchy
+
+-- A. isolation
+  PASS  the namespace's only interfaces are lo and the dummy bl0 (nothing reaches a real network)
+  PASS  the private avahi-daemon runs on bl0 only
+  PASS  it is reached through the private system bus
+  PASS  a private PipeWire (surfaced's graph watcher needs one; network units have no node)
+
+-- B. found on the network: mDNS (RTP SLAVE) and an invitation (RTP MASTER)
+  PASS  surfaced listens on UDP 5004 (the RTP-MIDI port the X-Touch calls) and browses mDNS
+        both online 874 ms after the devices were switched on
+  PASS  the Extender was found by mDNS and invited (RTP SLAVE)
+  PASS  the X-Touch invited us (RTP MASTER) and was accepted
+  PASS  both online, by the same profiles as on USB (handshake, serials)
+  PASS  unit ids behringer-xtouch-ext@EXT0001 and behringer-xtouch@XT00002, transport network, with addresses
+
+-- C. the displays, meters and motors, over the network
+        extender LCD: "KickIn KickOt SnarTp SnarBt HiHat  Tom 1  Tom 2  FlorTm "
+        X-Touch   LCD: "OH L   OH R   BassDI BassMc Gtr L  Gtr R  Keys L Keys R "
+  PASS  one 16-strip group: inputs 1-8 on the Extender, 9-16 on the X-Touch
+  PASS  scribble colours (the X-Touch colour SysEx)
+  PASS  the motors went to the mixer's levels (in.6 -12 dB; main 0 dB)
+  PASS  the assignment display shows the view (IN)
+  PASS  meters (in.1 at -6 dB, in.2 clipping)
+
+-- D. faders: touch, gestures, motor feedback
+  PASS  an untouched fader move is never applied
+  PASS  touch: Gesture begin on in.11 from surface:behringer-xtouch@XT00002
+  PASS  the moves set the parameter (12000/16383 of travel -> -0.701337 dB)
+        surface move -> the mixer's Set: 293 us (sim -> RTP-MIDI -> surfaced -> controld -> mixer)
+  PASS  release: Gesture end; the motor holds the value
+  PASS  the mixer moves in.5 to 0 dB: the Extender's motor follows
+
+-- E. banking, LEDs
+  PASS  Bank >: the 16-wide window moves to offset 8
+  PASS  Shift + Bank <: back to the first bank
+  PASS  Mute 2 on the Extender: its LED lights
+  PASS  and goes off
+  PASS  Flip LED on the X-Touch
+
+-- F. backline surfaces
+        | UNIT                           MODEL                          VIA                      STATE     GROUP  TOUCHED
+        | behringer-xtouch@XT00002       Behringer X-Touch (MC mode)    network 10.77.0.1:5304   online    g1/2   0
+        | behringer-xtouch-ext@EXT0001   Behringer X-Touch Extender (MC mode) network 10.77.0.1:5204   online    g1/1   0
+  PASS  lists both units: online, network, address, group and position
+  PASS  --json has the units and the peers
+
+-- G. the X-Touch's network cable pulled while a fader is held
+  PASS  the held fader's gesture ends
+        cable pulled -> Gesture end at the mixer: 2800 ms (the session timeout: nothing heard for 3 s)
+  PASS  within 3.5 s (the RTP-MIDI silence timeout)
+  PASS  the unit is gone, its place kept; the window is dealt again over the Extender (width 8)
+  PASS  backline surfaces shows it gone
+        cable back -> online again: 986 ms (the X-Touch's next invitation, every second; the handshake)
+        the redraw: 1 device query (a new handshake), 218 LCD bytes
+  PASS  back online in the same group and place, fully redrawn
+  PASS  the stale touch from before the drop never applies: a move without a new touch is ignored
+
+-- G2. the Extender's cable (here surfaced is the one that invites), then its power switch
+  PASS  dropped: the Extender is gone (surfaced heard nothing for 3 s)
+        cable back -> online again: 988 ms
+  PASS  back: surfaced's next invitation (every second) opens it; redrawn in place
+  PASS  switched off: gone
+  PASS  switched on (its sessions forgotten, its display blank): online again and redrawn
+  PASS  the drops are counted: two lost sessions with the Extender
+
+-- I. two engines: a main and a standby
+        standby's peers: {"X-Touch-Ext 10.77.0.1:5204":"open","X-Touch 10.77.0.1:5304":"refused"}
+  PASS  the standby is on UDP 5006 (5004 is the main's) and says it is a standby
+  PASS  the Extender (two sessions) gave the standby a session of its own: open, held
+  PASS  the X-Touch (one session, the main's) refused the standby
+  PASS  the standby drives nothing: no units, nothing sent
+  PASS  the main still draws the Extender (its names, not blank)
+        | STANDBY: network sessions are held open, nothing is driven (backline surfaces activate)
+        | UNIT                           MODEL                          VIA                      STATE     GROUP  TOUCHED
+        | behringer-xtouch-ext@EXT0001   -                              -                        gone      foh/1  0
+        | behringer-xtouch@XT00002       -                              -                        gone      foh/2  0
+        | 
+        | network devices:
+        |   X-Touch-Ext              10.77.0.1:5204         session held (standby)
+        |   X-Touch                  10.77.0.1:5304         the device refused: its session is taken (it may allow one host only); asked again every 5 s
+  PASS  backline surfaces on the standby says so
+  PASS  the main stops: goodbye to both (dark, offline), BY to their sessions
+        main stopped -> the standby holds the X-Touch's free session: 2492 ms (it asks every 5 s after a NO)
+  PASS  the X-Touch's session is the standby's now
+        SetActive(true) -> both drawn by the standby: 1062 ms
+  PASS  active: the standby drives both units (online, 2)
+  PASS  its own mixer's names on the strips, in the same layout
+  PASS  a fader on the Extender now moves the standby's mixer (gesture, set)
+
+  PASS  PipeWire: no node of this proof's devices (network units have none)
+
+RESULT: 49 passed, 0 failed
+  PASS  the user's graph: no node of this proof, before or after (15 nodes, then 15)

@@ -1,5 +1,5 @@
-== surfaced-proof 2026-11-12T12:44:12-08:00
-pipewire 1.6.8, kernel 7.2.5-3-omarchy, load 2.35 2.03 1.96
+== surfaced-proof 2026-11-12T15:57:13-08:00
+pipewire 1.6.8, kernel 7.2.5-3-omarchy, load 1.23 1.52 1.93
 the user's graph: 15 nodes (left alone)
 
 -- A. a private PipeWire instance
@@ -16,18 +16,18 @@ the user's graph: 15 nodes (left alone)
   PASS  a second program can't take /mix
 
 -- C. Params1 over OSC
-        listeners: udp:127.0.0.1:35515 (role all), udp:127.0.0.1:47254 (read-only); a third without params serves Control1 only
+        listeners: udp:127.0.0.1:45990 (role all), udp:127.0.0.1:56470 (read-only); a third without params serves Control1 only
   PASS  get: /mix/in.1/fader replies 'f -2.0 s "-2.0 dB"'
   PASS  /backline/get /mix/in.2/* replies with its 9 parameters
   PASS  sub: the current value at once, then the echo of each set once the mixer confirms
   PASS  the sets reached the mixer as osc:udp:127.0.0.1:* in role all
-        OSC set -> mixer -> Update -> echo to the subscriber: 5.677333 ms
+        OSC set -> mixer -> Update -> echo to the subscriber: 5.315844 ms
   PASS  /touch 1 and 0 reach the mixer as Gesture begin and end
   PASS  a read-only listener: the set is refused with /backline/error, a get still works
   PASS  an unknown path under a registered root gets /backline/error
   PASS  over UDP one request answers at most 256 values, then /backline/error (no amplification)
   PASS  a listener without a params role answers nothing (Control1 rule 7 holds)
-        200 changes in ~1.3 s: 36 replies at a 30/s cap, the last 100.0
+        200 changes in ~1.3 s: 35 replies at a 30/s cap, the last 100.0
   PASS  the burst is rate-limited (<= 30/s + the first) and ends on the final value 100
   PASS  meter stream: /mix/meter/in.1 at ~15/s with -6 dB, in.2 with clip
         meter frames for in.1 in 1 s: 15
@@ -65,7 +65,7 @@ the user's graph: 15 nodes (left alone)
   PASS  an untouched fader move is never applied (motor overshoot rule)
   PASS  touch -> Gesture begin on /mix/in.11/fader (from surface:behringer-xtouch@XT00002)
   PASS  moves while touched set the parameter (12000/16383 = 0.7325 of travel -> -0.701337 dB)
-        surface move -> the mixer's Set: 5232 us (sim -> PipeWire -> surfaced -> controld -> mixer)
+        surface move -> the mixer's Set: 3592 us (sim -> PipeWire -> surfaced -> controld -> mixer)
   PASS  the position is echoed while held (the servo holds)
   PASS  release -> Gesture end
   PASS  after release the motor holds the confirmed value
@@ -106,10 +106,10 @@ the user's graph: 15 nodes (left alone)
 
 -- N. hot-plug: the X-Touch unplugged while a fader is held
   PASS  the held fader's gesture ends
-        unplug -> Gesture end at the mixer: 1139 us (node gone -> surfaced -> controld -> mixer)
+        unplug -> Gesture end at the mixer: 689 us (node gone -> surfaced -> controld -> mixer)
   PASS  within 50 ms of the unplug
   PASS  the unit is gone, its place kept; the window is dealt again over the extender (width 8)
-        plug -> redrawn (names on the strips): 1068 ms (handshake + the 1 s greeting)
+        plug -> redrawn (names on the strips): 1047 ms (handshake + the 1 s greeting)
   PASS  plugged back: online in the same group, same place, fully redrawn
 
 -- O/P. two groups, a locked view; a restart restores them

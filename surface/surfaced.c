@@ -3,10 +3,13 @@
  *
  * One process on the PipeWire main loop: the graph watcher (devices come and
  * go as MIDI ports), one small PipeWire node per unit (MIDI in and out,
- * linked to the device's ports), sd-bus for Surface1 and as a client of
- * controld's Params1, and a 5 ms timer that runs the engine (engine.c). The
- * only realtime code is each unit node's process callback: it copies the
- * device's MIDI into a wait-free ring and drains another ring out.
+ * linked to the device's ports), network devices over RTP-MIDI (rtpnet.c:
+ * found by mDNS, inviting us, or at an address we were given), sd-bus for
+ * Surface1 and as a client of controld's Params1, and a 5 ms timer that runs
+ * the engine (engine.c). The only realtime code is each unit node's process
+ * callback: it copies the device's MIDI into a wait-free ring and drains
+ * another ring out. A network device is the same unit with the same profile;
+ * only the bytes travel differently.
  *
  * Its own process, next to controld (ARCHITECTURE "one process per risk"): a
  * surface driver parses input from devices, and a misbehaving device must
@@ -41,6 +44,7 @@
 #include "engine.h"
 #include "mcu.h"
 #include "params.h"
+#include "rtpnet.h"
 
 #define BUS_NAME "io.github.manuaudio.Backline.Surface"
 #define OBJ_PATH "/io/github/manuaudio/Backline/Surface"
@@ -52,14 +56,16 @@
 #define ERR_STATE "io.github.manuaudio.Backline.Error.State"
 
 #define MAX_DEV 16
+#define MAX_NET_ADDRS 16
 #define MAX_ROOTS 16
 #define MAX_INFLIGHT 128
 #define MS 1000000ull
 
 /* A device: a pair of MIDI ports (to and from it) on one node, and our node
- * that talks to it. */
+ * that talks to it; or a network peer (peer >= 0, no node). */
 struct dport {
 	bool used;
+	int peer;                        /* rtpnet peer, -1 for a PipeWire MIDI device */
 	uint32_t node_id;
 	char alias[256];
 	char hay[700];
@@ -110,6 +116,10 @@ static struct {
 	struct meters meters[MAX_ROOTS];
 	struct inflight inflight[MAX_INFLIGHT];
 	bool params_up, listing;
+	bool active;                     /* false: a standby engine, its units not driven */
+	bool standby_opt;
+	char net_addrs[MAX_NET_ADDRS][96];  /* devices at an address (AddNetwork) */
+	int n_net_addrs;
 	char prefix[96];
 	char state_file[700];
 	char *profile_dirs[8];
@@ -204,6 +214,19 @@ static void sanitize(const char *in, char *out, size_t n)
 	out[k] = 0;
 }
 
+/* The device becomes a unit (handshake, then drawn), unless this engine is
+ * a standby. */
+static void dev_attach(struct dport *d)
+{
+	if (d->unit >= 0 || !S.active)
+		return;
+	S.attaching = (int)(d - S.devs);
+	d->unit = sf_unit_attach(S.eng, d->prof, d->hay, now_ns());
+	S.attaching = -1;
+	if (d->unit >= 0)
+		S.unit_dev[d->unit] = (int)(d - S.devs);
+}
+
 static void dev_open(struct dport *d)
 {
 	char name[200], tail[64];
@@ -226,12 +249,8 @@ static void dev_open(struct dport *d)
 					 pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi", PW_KEY_PORT_NAME, "to_device", NULL), NULL, 0);
 	if (pw_filter_connect(d->filter, PW_FILTER_FLAG_RT_PROCESS, NULL, 0) < 0)
 		LOG("%s: cannot connect its node\n", d->alias);
-	S.attaching = (int)(d - S.devs);
-	d->unit = sf_unit_attach(S.eng, d->prof, d->hay, now_ns());
-	S.attaching = -1;
-	if (d->unit >= 0)
-		S.unit_dev[d->unit] = (int)(d - S.devs);
 	LOG("found %s: %s (%s)\n", d->prof->name, d->alias, name);
+	dev_attach(d);
 }
 
 static void dev_close(struct dport *d, bool unplugged)
@@ -244,16 +263,17 @@ static void dev_close(struct dport *d, bool unplugged)
 	if (d->filter) {
 		spa_hook_remove(&d->listener);
 		pw_filter_destroy(d->filter);
+		bl_midi_ring_free(&d->rx);
+		bl_midi_ring_free(&d->tx);
 	}
-	bl_midi_ring_free(&d->rx);
-	bl_midi_ring_free(&d->tx);
 	memset(d, 0, sizeof(*d));
+	d->peer = -1;
 }
 
 static bool our_node(uint32_t node)
 {
 	for (int i = 0; i < MAX_DEV; i++)
-		if (S.devs[i].used && S.devs[i].node == node)
+		if (S.devs[i].used && S.devs[i].peer < 0 && S.devs[i].node == node)
 			return true;
 	return false;
 }
@@ -265,7 +285,7 @@ static void on_port_added(void *data, const struct bl_port *p)
 	/* our own nodes' ports: link once both are known */
 	for (int i = 0; i < MAX_DEV; i++) {
 		struct dport *d = &S.devs[i];
-		if (!d->used || d->node == SPA_ID_INVALID || p->node_id != d->node)
+		if (!d->used || d->peer >= 0 || d->node == SPA_ID_INVALID || p->node_id != d->node)
 			continue;
 		if (p->output)
 			d->my_out = p->id;
@@ -286,7 +306,7 @@ static void on_port_added(void *data, const struct bl_port *p)
 	/* pair by node and alias (a duplex device's two ports share both) */
 	struct dport *d = NULL, *free_d = NULL;
 	for (int i = 0; i < MAX_DEV; i++) {
-		if (S.devs[i].used && S.devs[i].node_id == p->node_id && !strcmp(S.devs[i].alias, p->alias))
+		if (S.devs[i].used && S.devs[i].peer < 0 && S.devs[i].node_id == p->node_id && !strcmp(S.devs[i].alias, p->alias))
 			d = &S.devs[i];
 		else if (!S.devs[i].used && !free_d)
 			free_d = &S.devs[i];
@@ -297,6 +317,7 @@ static void on_port_added(void *data, const struct bl_port *p)
 		d = free_d;
 		memset(d, 0, sizeof(*d));
 		d->used = true;
+		d->peer = -1;
 		d->node_id = p->node_id;
 		d->unit = -1;
 		d->dev_out = d->dev_in = SPA_ID_INVALID;
@@ -318,7 +339,7 @@ static void on_port_removed(void *data, uint32_t id)
 {
 	for (int i = 0; i < MAX_DEV; i++) {
 		struct dport *d = &S.devs[i];
-		if (!d->used)
+		if (!d->used || d->peer >= 0)
 			continue;
 		if (id == d->dev_out || id == d->dev_in) {
 			LOG("%s went away\n", d->alias);
@@ -364,6 +385,133 @@ static void on_rx(void *data, uint64_t count)
 			if (d->unit >= 0)
 				bl_midi_parse(&d->parser, buf, n, rx_msg, &c);
 	}
+}
+
+/* ============================================================ network devices */
+static void net_hay(const char *name, char *hay, size_t n)
+{
+	snprintf(hay, n, "rtpmidi:%s | %s", name, name);
+}
+
+static const struct sf_profile *net_profile(const char *name)
+{
+	char hay[700];
+	net_hay(name, hay, sizeof(hay));
+	if (S.only_on && regexec(&S.only, hay, 0, NULL, 0))
+		return NULL;
+	return sf_profile_for_port(S.eng, hay);
+}
+
+static struct dport *dev_of_peer(int peer)
+{
+	for (int i = 0; i < MAX_DEV; i++)
+		if (S.devs[i].used && S.devs[i].peer == peer)
+			return &S.devs[i];
+	return NULL;
+}
+
+static bool n_want(void *data, const char *name)
+{
+	return net_profile(name) != NULL;
+}
+
+static void n_opened(void *data, int peer)
+{
+	const char *name = rn_peer_name(peer);
+	const struct sf_profile *prof = net_profile(name);
+	if (!prof) {
+		LOG("'%s' at %s: no surface profile matches this name, so it is not driven (docs/SURFACES.md)\n", name,
+		    rn_peer_address(peer));
+		return;
+	}
+	struct dport *d = dev_of_peer(peer);
+	if (!d) {
+		for (int i = 0; i < MAX_DEV && !d; i++)
+			if (!S.devs[i].used)
+				d = &S.devs[i];
+		if (!d) {
+			LOG("%s: no room for another device (%d)\n", name, MAX_DEV);
+			return;
+		}
+		memset(d, 0, sizeof(*d));
+		d->used = true;
+		d->peer = peer;
+		d->unit = -1;
+		d->node = d->my_in = d->my_out = SPA_ID_INVALID;
+		snprintf(d->alias, sizeof(d->alias), "%s", name);
+		net_hay(name, d->hay, sizeof(d->hay));
+		d->prof = prof;
+	}
+	LOG("found %s: %s over the network (%s)\n", prof->name, name, rn_peer_address(peer));
+	dev_attach(d);
+}
+
+static void n_closed(void *data, int peer, bool lost)
+{
+	struct dport *d = dev_of_peer(peer);
+	if (!d)
+		return;
+	if (S.quitting) { /* our own goodbye: closed as at a clean shutdown, its place kept */
+		dev_close(d, false);
+		return;
+	}
+	LOG("%s %s\n", d->alias, lost ? "dropped off the network (no answer)" : "ended its session");
+	dev_close(d, true);
+}
+
+static void n_midi(void *data, int peer, const uint8_t *m, size_t n)
+{
+	struct dport *d = dev_of_peer(peer);
+	if (!d || d->unit < 0 || m[0] >= 0xf8)
+		return;
+	S.midi_in++;
+	sf_unit_input(S.eng, d->unit, m, n, now_ns());
+}
+
+static void n_log(void *data, const char *msg)
+{
+	LOG("%s\n", msg);
+}
+
+static const struct rn_events net_events = { n_want, n_opened, n_closed, n_midi, NULL, n_log };
+
+/* "host", "host:port" */
+static int split_address(const char *s, char *host, size_t hn, uint16_t *port)
+{
+	const char *c = strrchr(s, ':');
+	*port = 5004;
+	if (c) {
+		char *end;
+		long p = strtol(c + 1, &end, 10);
+		if (*end || p < 1 || p > 65534)
+			return -1;
+		*port = (uint16_t)p;
+		snprintf(host, hn, "%.*s", (int)(c - s), s);
+	} else {
+		snprintf(host, hn, "%s", s);
+	}
+	return host[0] ? 0 : -1;
+}
+
+static void set_active(bool on)
+{
+	if (S.active == on)
+		return;
+	S.active = on;
+	uint64_t now = now_ns();
+	for (int i = 0; i < MAX_DEV; i++) {
+		struct dport *d = &S.devs[i];
+		if (!d->used)
+			continue;
+		if (on && (d->filter || rn_peer_open(d->peer)))
+			dev_attach(d);
+		else if (!on && d->unit >= 0) {
+			sf_unit_detach(S.eng, d->unit, now);
+			S.unit_dev[d->unit] = -1;
+			d->unit = -1;
+		}
+	}
+	LOG("%s\n", on ? "active: driving the surfaces" : "standby: sessions held open, the surfaces are not driven");
 }
 
 /* ============================================================ Params1 client */
@@ -672,7 +820,7 @@ static void h_send(void *data, int unit, const uint8_t *msg, size_t n)
 	int di = S.unit_dev[unit] >= 0 ? S.unit_dev[unit] : S.attaching;
 	if (di < 0 || !S.devs[di].used)
 		return;
-	if (bl_midi_ring_push(&S.devs[di].tx, msg, n))
+	if (S.devs[di].peer >= 0 ? rn_send(S.devs[di].peer, msg, n) : bl_midi_ring_push(&S.devs[di].tx, msg, n))
 		S.midi_out++;
 }
 
@@ -723,6 +871,16 @@ static int mkdir_p(const char *path)
 static void on_save(void *data, uint64_t exp)
 {
 	char *js = sf_state_json(S.eng);
+	json_object *o = json_tokener_parse(js);
+	if (o) {
+		json_object *a = json_object_new_array();
+		for (int i = 0; i < S.n_net_addrs; i++)
+			json_object_array_add(a, json_object_new_string(S.net_addrs[i]));
+		json_object_object_add(o, "network", a);
+		free(js);
+		js = strdup(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE));
+		json_object_put(o);
+	}
 	char tmp[800];
 	mkdir_p(S.state_file);
 	snprintf(tmp, sizeof(tmp), "%s.tmp", S.state_file);
@@ -740,7 +898,10 @@ static void on_save(void *data, uint64_t exp)
 
 static void on_tick(void *data, uint64_t exp)
 {
-	sf_tick(S.eng, now_ns());
+	uint64_t now = now_ns();
+	rn_tick(now);
+	sf_tick(S.eng, now);
+	rn_flush(now);   /* what this tick queued for network units: one packet each */
 	sd_bus_flush(S.bus);
 }
 
@@ -756,6 +917,7 @@ static int append_json_dict(sd_bus_message *m, json_object *o)
 			r = sd_bus_message_append(m, "s", k);
 		switch (json_object_get_type(v)) {
 		case json_type_boolean: r = sd_bus_message_append(m, "v", "b", json_object_get_boolean(v)); break;
+		case json_type_double: r = sd_bus_message_append(m, "v", "d", json_object_get_double(v)); break;
 		case json_type_int: {
 			int64_t x = json_object_get_int64(v);
 			if (!strcmp(k, "position") || !strcmp(k, "offset"))
@@ -784,10 +946,8 @@ static int append_json_dict(sd_bus_message *m, json_object *o)
 	return r < 0 ? r : sd_bus_message_close_container(m);
 }
 
-static int reply_list(sd_bus_message *m, char *js)
+static int reply_array(sd_bus_message *m, json_object *a)
 {
-	json_object *a = json_tokener_parse(js);
-	free(js);
 	sd_bus_message *reply = NULL;
 	int r = sd_bus_message_new_method_return(m, &reply);
 	if (r >= 0)
@@ -803,8 +963,113 @@ static int reply_list(sd_bus_message *m, char *js)
 	return r;
 }
 
-static int m_units(sd_bus_message *m, void *ud, sd_bus_error *e) { return reply_list(m, sf_units_json(S.eng)); }
+static int reply_list(sd_bus_message *m, char *js)
+{
+	json_object *a = json_tokener_parse(js);
+	free(js);
+	return reply_array(m, a);
+}
+
+/* Units, with how each one is connected: transport "midi" (a MIDI port:
+ * USB, or DIN through an interface) or "network" (RTP-MIDI), and for a
+ * network unit its address. */
+static int m_units(sd_bus_message *m, void *ud, sd_bus_error *e)
+{
+	char *js = sf_units_json(S.eng);
+	json_object *a = json_tokener_parse(js);
+	free(js);
+	for (size_t i = 0; a && i < json_object_array_length(a); i++) {
+		json_object *o = json_object_array_get_idx(a, i), *v;
+		const char *port = json_object_object_get_ex(o, "port", &v) ? json_object_get_string(v) : NULL;
+		if (!port)
+			continue;
+		bool net = !strncmp(port, "rtpmidi:", 8);
+		json_object_object_add(o, "transport", json_object_new_string(net ? "network" : "midi"));
+		int u = json_object_object_get_ex(o, "id", &v) ? sf_unit_by_id(S.eng, json_object_get_string(v)) : -1;
+		int di = u >= 0 ? S.unit_dev[u] : -1;
+		if (net && di >= 0 && S.devs[di].peer >= 0)
+			json_object_object_add(o, "address", json_object_new_string(rn_peer_address(S.devs[di].peer)));
+	}
+	return reply_array(m, a);
+}
 static int m_groups(sd_bus_message *m, void *ud, sd_bus_error *e) { return reply_list(m, sf_groups_json(S.eng)); }
+
+/* Network devices and their sessions, driven or not (a refused one, one
+ * still being invited, one whose name matches no profile). */
+static int m_peers(sd_bus_message *m, void *ud, sd_bus_error *e)
+{
+	char *js = rn_peers_json();
+	json_object *a = json_tokener_parse(js);
+	free(js);
+	for (size_t i = 0; a && i < json_object_array_length(a); i++) {
+		json_object *o = json_object_array_get_idx(a, i), *v;
+		struct dport *d = json_object_object_get_ex(o, "peer", &v) ? dev_of_peer(json_object_get_int(v)) : NULL;
+		json_object_object_add(o, "unit", json_object_new_string(d && d->unit >= 0 ? sf_unit_id(S.eng, d->unit) : ""));
+		json_object_object_del(o, "peer");
+	}
+	return reply_array(m, a);
+}
+
+static int m_add_network(sd_bus_message *m, void *ud, sd_bus_error *e)
+{
+	const char *addr;
+	int r = sd_bus_message_read(m, "s", &addr);
+	if (r < 0)
+		return r;
+	char host[96];
+	uint16_t port;
+	if (split_address(addr, host, sizeof(host), &port) < 0)
+		return sd_bus_error_setf(e, SD_BUS_ERROR_INVALID_ARGS, "'%s': an address is IP or IP:PORT", addr);
+	if ((r = rn_add(host, port)) < 0)
+		return sd_bus_error_setf(e, SD_BUS_ERROR_INVALID_ARGS, "%s: %s", addr,
+					 r == -EINVAL ? "not an IPv4 address (the one on the surface's display)" : strerror(-r));
+	char norm[96];
+	snprintf(norm, sizeof(norm), "%s:%u", host, port);
+	bool known = false;
+	for (int i = 0; i < S.n_net_addrs; i++)
+		known |= !strcmp(S.net_addrs[i], norm);
+	if (!known && S.n_net_addrs < MAX_NET_ADDRS) {
+		snprintf(S.net_addrs[S.n_net_addrs++], sizeof(S.net_addrs[0]), "%s", norm);
+		h_state(NULL);
+	}
+	LOG("network surface at %s: inviting it\n", norm);
+	return sd_bus_reply_method_return(m, "");
+}
+
+static int m_remove_network(sd_bus_message *m, void *ud, sd_bus_error *e)
+{
+	const char *addr;
+	int r = sd_bus_message_read(m, "s", &addr);
+	if (r < 0)
+		return r;
+	char host[96], norm[96];
+	uint16_t port;
+	if (split_address(addr, host, sizeof(host), &port) < 0)
+		return sd_bus_error_setf(e, SD_BUS_ERROR_INVALID_ARGS, "'%s': an address is HOST or HOST:PORT", addr);
+	snprintf(norm, sizeof(norm), "%s:%u", host, port);
+	int k = -1;
+	for (int i = 0; i < S.n_net_addrs; i++)
+		if (!strcmp(S.net_addrs[i], norm))
+			k = i;
+	if (k < 0)
+		return sd_bus_error_setf(e, ERR_NOTFOUND, "%s was not added", norm);
+	rn_remove(host, port);
+	memmove(S.net_addrs[k], S.net_addrs[k + 1], sizeof(S.net_addrs[0]) * (size_t)(S.n_net_addrs - k - 1));
+	S.n_net_addrs--;
+	h_state(NULL);
+	return sd_bus_reply_method_return(m, "");
+}
+
+static int m_set_active(sd_bus_message *m, void *ud, sd_bus_error *e)
+{
+	int on;
+	int r = sd_bus_message_read(m, "b", &on);
+	if (r < 0)
+		return r;
+	set_active(on);
+	sd_bus_emit_properties_changed(S.bus, OBJ_PATH, IFACE, "Active", "UnitCount", NULL);
+	return sd_bus_reply_method_return(m, "");
+}
 
 static int status(sd_bus_message *m, sd_bus_error *e, int r, const char *err)
 {
@@ -967,6 +1232,10 @@ static int p_get(sd_bus *bus, const char *path, const char *iface, const char *p
 		return sd_bus_message_append(reply, "t", S.midi_in);
 	if (!strcmp(prop, "MidiOut"))
 		return sd_bus_message_append(reply, "t", S.midi_out);
+	if (!strcmp(prop, "Active"))
+		return sd_bus_message_append(reply, "b", S.active);
+	if (!strcmp(prop, "NetworkPort"))
+		return sd_bus_message_append(reply, "q", rn_port());
 	int r = sd_bus_message_open_container(reply, 'a', "s");
 	if (!strcmp(prop, "Groups")) {
 		const char *ids[SF_MAX_GROUPS];
@@ -997,12 +1266,18 @@ static const sd_bus_vtable vtable[] = {
 	SD_BUS_METHOD_WITH_ARGS("SetGlobalBinding", SD_BUS_ARGS("s", group, "s", control, "s", binding), SD_BUS_NO_RESULT, m_set_binding, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Text", SD_BUS_ARGS("s", group, "s", unit, "s", text, "u", ms), SD_BUS_NO_RESULT, m_text, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Profiles", SD_BUS_NO_ARGS, SD_BUS_RESULT("s", json), m_profiles, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("Peers", SD_BUS_NO_ARGS, SD_BUS_RESULT("aa{sv}", peers), m_peers, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("AddNetwork", SD_BUS_ARGS("s", address), SD_BUS_NO_RESULT, m_add_network, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("RemoveNetwork", SD_BUS_ARGS("s", address), SD_BUS_NO_RESULT, m_remove_network, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("SetActive", SD_BUS_ARGS("b", active), SD_BUS_NO_RESULT, m_set_active, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_PROPERTY("UnitCount", "u", p_get, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("Groups", "as", p_get, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("ParamsConnected", "b", p_get, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("ProfileDirs", "as", p_get, 0, SD_BUS_VTABLE_PROPERTY_CONST),
 	SD_BUS_PROPERTY("MidiIn", "t", p_get, 0, 0),
 	SD_BUS_PROPERTY("MidiOut", "t", p_get, 0, 0),
+	SD_BUS_PROPERTY("Active", "b", p_get, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+	SD_BUS_PROPERTY("NetworkPort", "q", p_get, 0, SD_BUS_VTABLE_PROPERTY_CONST),
 	SD_BUS_SIGNAL_WITH_ARGS("Navigated", SD_BUS_ARGS("s", group, "s", view, "i", offset, "s", mode, "i", page), 0),
 	SD_BUS_SIGNAL_WITH_ARGS("Action", SD_BUS_ARGS("s", group, "s", name, "b", down), 0),
 	SD_BUS_SIGNAL_WITH_ARGS("UnitAdded", SD_BUS_ARGS("s", unit), 0),
@@ -1024,14 +1299,13 @@ static void on_signal(void *data, int sig)
 
 static void usage(FILE *f)
 {
-	fputs("usage: backline-surfaced [--name PREFIX] [--profile-dir DIR]... [--state-file FILE] [--only REGEX]\n"
-	      "                         [--replace] [--verbose]\n"
+	fputs("usage: backline-surfaced [--standby] [--verbose] [--replace]\n"
 	      "  Control surfaces for any program, on the session bus (" BUS_NAME ", " IFACE ").\n"
-	      "  Parameters come from controld's Params1 (docs/api/Params1.md, Surface1.md).\n"
-	      "  --name PREFIX     node names (default backline.surface)\n"
-	      "  --profile-dir DIR more *.surface.json (before the user's and the shipped ones)\n"
-	      "  --state-file FILE groups (default $XDG_STATE_HOME/backline/surfaces.json)\n"
-	      "  --only REGEX      consider only MIDI ports whose node:port | alias matches\n", f);
+	      "  Mackie Control devices on USB/MIDI ports and on the network (RTP-MIDI) are found\n"
+	      "  and driven with no setup; `backline surfaces` lists them. docs/api/Surface1.md.\n"
+	      "  --standby  a standby engine: hold network sessions open, drive nothing until SetActive\n"
+	      "  for tests: --name PREFIX (node names), --profile-dir DIR, --state-file FILE,\n"
+	      "             --only REGEX (only ports or network names that match)\n", f);
 }
 
 int main(int argc, char **argv)
@@ -1042,16 +1316,19 @@ int main(int argc, char **argv)
 		{ "state-file", required_argument, NULL, 's' },
 		{ "only", required_argument, NULL, 'o' },
 		{ "replace", no_argument, NULL, 'r' },
+		{ "standby", no_argument, NULL, 'S' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
 	int c, replace = 0;
 	snprintf(S.prefix, sizeof(S.prefix), "backline.surface");
+	for (int i = 0; i < MAX_DEV; i++)
+		S.devs[i].peer = -1;
 	S.attaching = -1;
 	for (int i = 0; i < SF_MAX_UNITS; i++)
 		S.unit_dev[i] = -1;
-	while ((c = getopt_long(argc, argv, "n:p:s:o:rvh", opts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "n:p:s:o:rSvh", opts, NULL)) != -1) {
 		switch (c) {
 		case 'n': snprintf(S.prefix, sizeof(S.prefix), "%s", optarg); break;
 		case 'p': if (S.n_profile_dirs < 5) S.profile_dirs[S.n_profile_dirs++] = strdup(optarg); break;
@@ -1064,6 +1341,7 @@ int main(int argc, char **argv)
 			S.only_on = true;
 			break;
 		case 'r': replace = 1; break;
+		case 'S': S.standby_opt = true; break;
 		case 'v': S.verbose = true; break;
 		case 'h': usage(stdout); return 0;
 		default: usage(stderr); return 2;
@@ -1130,19 +1408,41 @@ int main(int argc, char **argv)
 		char err[256];
 		if (n && sf_state_load(S.eng, js, err, sizeof(err)) < 0)
 			LOG("%s: %s\n", S.state_file, err);
+		json_object *o = json_tokener_parse(js), *a;
+		if (o && json_object_object_get_ex(o, "network", &a) && json_object_is_type(a, json_type_array))
+			for (size_t i = 0; i < json_object_array_length(a) && S.n_net_addrs < MAX_NET_ADDRS; i++)
+				snprintf(S.net_addrs[S.n_net_addrs++], sizeof(S.net_addrs[0]), "%s",
+					 json_object_get_string(json_object_array_get_idx(a, i)));
+		json_object_put(o);
 		free(js);
 	}
 
 
 	relist();
+	S.active = !S.standby_opt;
 	S.graph = bl_graph_new(S.core, &graph_events, NULL);
+	char hostname[64] = "", netname[96];
+	gethostname(hostname, sizeof(hostname) - 1);
+	snprintf(netname, sizeof(netname), "Backline %s", hostname);
+	if ((r = rn_init(S.l, netname, &net_events, NULL)) < 0)
+		LOG("network surfaces: no free UDP port pair from 5004 (%s)\n", strerror(-r));
+	else if (rn_port() != 5004)
+		LOG("network surfaces on UDP %u: 5004 is taken, so a device set to call this computer (RTP MASTER) can't reach it\n",
+		    rn_port());
+	for (int i = 0; i < S.n_net_addrs; i++) {
+		char h[96];
+		uint16_t port;
+		if (split_address(S.net_addrs[i], h, sizeof(h), &port) == 0)
+			rn_add(h, port);
+	}
 	r = sd_bus_request_name(S.bus, BUS_NAME, replace ? SD_BUS_NAME_REPLACE_EXISTING | SD_BUS_NAME_ALLOW_REPLACEMENT
 							 : SD_BUS_NAME_ALLOW_REPLACEMENT);
 	if (r < 0) {
 		fprintf(stderr, "backline-surfaced: cannot own %s: %s\n", BUS_NAME, strerror(-r));
 		return 1;
 	}
-	LOG("on the session bus as %s; node prefix %s; state %s\n", BUS_NAME, S.prefix, S.state_file);
+	LOG("on the session bus as %s; node prefix %s; state %s; network UDP %u%s\n", BUS_NAME, S.prefix, S.state_file,
+	    rn_port(), S.active ? "" : "; STANDBY: nothing is driven until SetActive(true)");
 	on_bus_io(NULL, 0, 0);
 
 	pw_main_loop_run(S.loop);
@@ -1155,6 +1455,9 @@ int main(int argc, char **argv)
 	uint64_t until = now_ns() + 200 * MS;
 	while (now_ns() < until)
 		pw_loop_iterate(S.l, 10);
+	S.quitting = true;
+	rn_bye_all();
+	rn_close();
 	on_save(NULL, 0);
 	for (int i = 0; i < MAX_DEV; i++)
 		if (S.devs[i].used)

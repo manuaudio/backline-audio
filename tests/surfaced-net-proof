@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# surfaced-net-proof: Mackie Control surfaces on the network (RTP-MIDI),
+# measured without hardware and without touching the real network.
+#
+#  A. Isolation: a user, network and mount namespace (no sudo). Its only
+#     interfaces are lo and a dummy "bl0" (10.77.0.1/24); a private
+#     avahi-daemon on a private system bus publishes and browses on bl0
+#     only; a private PipeWire (a dummy driver, no devices) and session bus.
+#     Manu's PipeWire graph is checked before and after.
+#  B. Two software devices on the network (tools/mcu-sim.c --net): an
+#     X-Touch Extender in "RTP SLAVE" mode, found by mDNS (_apple-midi._udp),
+#     and an X-Touch in "RTP MASTER" mode, which invites this computer on
+#     UDP 5004 itself. The same profiles, detection, handshake and grouping as
+#     on USB: one 16-strip group.
+#  C-G. Over the network: names and colours on the LCDs, meters, faders with
+#     touch and gestures (an untouched move never applied), the mixer's own
+#     changes on the motors, banking, LEDs, `backline surfaces`.
+#  H. Network drops: the X-Touch's cable pulled while a fader is held (the
+#     gesture ends, the unit goes, the window is dealt again), then back (the
+#     same place, redrawn, a stale touch never applies); the Extender's cable,
+#     and its power switch.
+#  I. Two engines: a standby surfaced on its own session bus with its own
+#     controld and mixer holds its own session with the Extender (it allows
+#     two) and drives nothing; the X-Touch (one session) refuses it. The main
+#     engine stops: the X-Touch's session is free and the standby gets it;
+#     SetActive(true): the standby draws both units and their faders work.
+#
+# Real hardware is not used here: see docs/HARDWARE-TEST.md.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+if [[ -z ${BL_NETNS_STAGE:-} ]]; then
+  if ! unshare --map-auto --map-root-user -n true 2>/dev/null; then
+    echo "SKIP: needs unprivileged user namespaces with subordinate ids (/etc/subuid, newuidmap)"; exit 77
+  fi
+  for t in avahi-daemon avahi-publish dbus-daemon dbus-run-session pipewire jq busctl; do
+    command -v "$t" >/dev/null || { echo "SKIP: $t is not installed"; exit 77; }
+  done
+  # the real graph, before (outside the namespace)
+  rm -rf "$here/out/surfaced-net"; mkdir -p "$here/out/surfaced-net"
+  timeout 10 pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // ""' | sort \
+    >"$here/out/surfaced-net/real-before.txt" || true
+  rc=0
+  BL_NETNS_STAGE=1 unshare --map-auto --map-root-user -nm bash "$0" "$@" || rc=$?
+  o=$here/out/surfaced-net
+  timeout 10 pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // ""' | sort >"$o/real-after.txt" || true
+  if grep -q 'backline-test\.' "$o/real-before.txt" "$o/real-after.txt"; then
+    echo "  FAIL  the user's graph has a node of this proof" | tee -a "$o/report.txt"; rc=1
+  else
+    echo "  PASS  the user's graph: no node of this proof, before or after ($(wc -l <"$o/real-before.txt") nodes, then $(wc -l <"$o/real-after.txt"))" | tee -a "$o/report.txt"
+  fi
+  exit $rc
+fi
+BL_ROOT=$(cd "$here/.." && pwd)
+BL_BIN=${BL_BIN:-$BL_ROOT/build}
+out=$here/out/surfaced-net
+if [[ $BL_NETNS_STAGE == 1 ]]; then
+  # ---- inside the namespace, as its root: the network and mDNS
+  ip link set lo up
+  ip link add bl0 type dummy
+  ip link set bl0 multicast on up
+  ip addr add 10.77.0.1/24 dev bl0
+  [[ -d /run/avahi-daemon ]] && mount -t tmpfs none /run/avahi-daemon
+  [[ -d /etc/avahi/services ]] && mount -t tmpfs none /etc/avahi/services   # not the host's own services
+  rm -rf "$out/sys" "$out/avahi.conf"; mkdir -p "$out/sys"
+  cat >"$out/sys/bus.conf" <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig><type>system</type><listen>unix:path=$out/sys/bus.sock</listen><auth>EXTERNAL</auth>
+<policy context="default"><allow user="*"/><allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/></policy></busconfig>
+EOF
+  cat >"$out/avahi.conf" <<'EOF'
+[server]
+host-name=backline-net-proof
+use-ipv4=yes
+use-ipv6=no
+allow-interfaces=bl0
+enable-dbus=yes
+[publish]
+publish-hinfo=no
+publish-workstation=no
+EOF
+  dbus-daemon --config-file="$out/sys/bus.conf" --fork --print-pid >"$out/sys/bus.pid"
+  export DBUS_SYSTEM_BUS_ADDRESS=unix:path=$out/sys/bus.sock
+  avahi-daemon -f "$out/avahi.conf" --no-chroot --no-drop-root --no-proc-title >"$out/avahi.log" 2>&1 &
+  echo $! >"$out/sys/avahi.pid"
+  for _ in $(seq 50); do grep -q 'Server startup complete' "$out/avahi.log" && break; sleep 0.1; done
+  rc=0
+  BL_NETNS_STAGE=2 dbus-run-session -- bash "$0" "$@" || rc=$?
+  kill "$(cat "$out/sys/avahi.pid")" "$(cat "$out/sys/bus.pid")" 2>/dev/null || true
+  exit $rc
+fi
+
+# ---- stage 2: the proof, on a private session bus
+exec > >(tee "$out/report.txt") 2>&1
+PIDS=()
+PASS=0; FAIL=0
+cleanup() {
+  for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+  sleep 0.3
+  [[ -n ${PWPID:-} ]] && kill "$PWPID" 2>/dev/null || true
+  [[ -n ${BUS2PID:-} ]] && kill "$BUS2PID" 2>/dev/null || true
+  wait 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+check() { local d=$1; shift; if "$@" >/dev/null 2>&1; then PASS=$((PASS + 1)); echo "  PASS  $d"; else FAIL=$((FAIL + 1)); echo "  FAIL  $d"; fi; }
+note() { echo "        $*"; }
+mono() { python3 -c 'import time; print(time.monotonic_ns())'; }
+export out
+
+echo "== surfaced-net-proof $(date -Is)"
+echo "pipewire $(pipewire --version | sed -n 's/.*libpipewire \(.*\)/\1/p' | tail -1), avahi $(avahi-daemon --version | cut -d' ' -f2), kernel $(uname -r)"
+
+########################################################################## A
+echo; echo "-- A. isolation"
+check "the namespace's only interfaces are lo and the dummy bl0 (nothing reaches a real network)" \
+  bash -c "[[ \$(ip -o link | awk -F': ' '{print \$2}' | sort | tr '\n' ' ') == 'bl0 lo ' ]]"
+check "the private avahi-daemon runs on bl0 only" grep -q 'Joining mDNS multicast group on interface bl0.IPv4' "$out/avahi.log"
+check "it is reached through the private system bus" bash -c "[[ \$DBUS_SYSTEM_BUS_ADDRESS == unix:path=$out/sys/bus.sock ]] && busctl --system status org.freedesktop.Avahi"
+mkdir -p "$out/pw"
+cat >"$out/pw.conf" <<'EOF'
+context.properties = { core.daemon = true core.name = pipewire-backline-net default.clock.rate = 48000 default.clock.quantum = 256 mem.allow-mlock = false support.dbus = false }
+context.spa-libs = { support.* = support/libspa-support }
+context.modules = [
+  { name = libpipewire-module-protocol-native }
+  { name = libpipewire-module-client-node }
+  { name = libpipewire-module-access args = { access.socket = { pipewire-backline-net = "unrestricted" } } }
+  { name = libpipewire-module-adapter }
+  { name = libpipewire-module-link-factory }
+  { name = libpipewire-module-metadata }
+]
+EOF
+export PIPEWIRE_RUNTIME_DIR=$out/pw PIPEWIRE_REMOTE=pipewire-backline-net
+pipewire -c "$out/pw.conf" >"$out/pipewire.log" 2>&1 &
+PWPID=$!
+for _ in $(seq 50); do timeout 2 pw-cli info 0 >/dev/null 2>&1 && break; sleep 0.1; done
+check "a private PipeWire (surfaced's graph watcher needs one; network units have no node)" timeout 5 pw-cli info 0
+
+P=(io.github.manuaudio.Backline.Control /io/github/manuaudio/Backline/Params io.github.manuaudio.Backline.Params1)
+S=(io.github.manuaudio.Backline.Surface /io/github/manuaudio/Backline/Surface io.github.manuaudio.Backline.Surface1)
+srf() { busctl --user call -- "${S[@]}" "$@"; }
+srfj() { busctl --user --json=short call -- "${S[@]}" "$@"; }
+wait_name() { for _ in $(seq 100); do busctl --user status "$1" >/dev/null 2>&1 && return 0; sleep 0.05; done; return 1; }
+BL=$BL_BIN/backline
+export BL
+"$BL_BIN/control/backline-controld" --no-config --idle-exit 0 --name backline-test.net-ctl 2>"$out/controld.log" &
+PIDS+=($!)
+wait_name io.github.manuaudio.Backline.Control
+mkfifo "$out/mixer.in"
+"$BL_BIN/surface/backline-test-mixer" --views --log "$out/mixer.jsonl" <"$out/mixer.in" >"$out/mixer.out" 2>&1 &
+PIDS+=($!)
+exec 7>"$out/mixer.in"
+mixer() { echo "$*" >&7; }
+for _ in $(seq 100); do grep -q registered "$out/mixer.out" 2>/dev/null && break; sleep 0.05; done
+mark() { wc -l <"$out/mixer.jsonl" 2>/dev/null || echo 0; }
+since() { tail -n +"$(($1 + 1))" "$out/mixer.jsonl"; }
+export -f mark since
+
+########################################################################## B
+echo; echo "-- B. found on the network: mDNS (RTP SLAVE) and an invitation (RTP MASTER)"
+"$BL_BIN/surface/backline-surfaced" --name backline-test.net --state-file "$out/surfaces.json" --verbose 2>"$out/surfaced.log" &
+SURF=$!; PIDS+=($SURF)
+wait_name io.github.manuaudio.Backline.Surface
+for _ in $(seq 100); do grep -q 'looking for network surfaces' "$out/surfaced.log" && break; sleep 0.05; done
+check "surfaced listens on UDP 5004 (the RTP-MIDI port the X-Touch calls) and browses mDNS" \
+  bash -c "busctl --user get-property ${S[*]} NetworkPort | grep -q 'q 5004' && grep -q 'looking for network surfaces (mDNS _apple-midi._udp)' $out/surfaced.log"
+mkfifo "$out/ext.in" "$out/xt.in"
+"$BL_BIN/surface/backline-test-mcu-sim" --model xtouch-ext --serial EXT0001 --net 5204 --sessions 2 <"$out/ext.in" >"$out/ext.out" 2>&1 &
+PIDS+=($!); exec 8>"$out/ext.in"
+avahi-publish -s X-Touch-Ext _apple-midi._udp 5204 >"$out/publish.log" 2>&1 &
+PUB=$!; PIDS+=($PUB)
+"$BL_BIN/surface/backline-test-mcu-sim" --model xtouch --serial XT00002 --net 5304 --sessions 1 --invite 10.77.0.1:5004 <"$out/xt.in" >"$out/xt.out" 2>&1 &
+PIDS+=($!); exec 9>"$out/xt.in"
+ext() { echo "$*" >&8; }
+xt() { echo "$*" >&9; }
+dump() {
+  local f=$out/$1.json; rm -f "$f"; echo "dump $f" >&"$([[ $1 == ext ]] && echo 8 || echo 9)"
+  for _ in $(seq 150); do [[ -s $f ]] && break; sleep 0.02; done; cat "$f"
+}
+export -f dump
+ustate() { busctl --user --json=short call -- "${S[@]}" Units | jq -r "[.data[0][] | select(.id.data==\"$1\")][0].state.data"; }
+wait_online() { for _ in $(seq 300); do [[ $(ustate "$1") == online ]] && return 0; sleep 0.05; done; return 1; }
+lcd_bytes() { dump "$1" | jq '.received["lcd-bytes"]'; }
+queries() { dump "$1" | jq '.received.query'; }
+t0=$(mono)
+for _ in $(seq 200); do [[ $(busctl --user get-property "${S[@]}" UnitCount) == "u 2" ]] && break; sleep 0.05; done
+note "both online $(( ($(mono) - t0) / 1000000 )) ms after the devices were switched on"
+check "the Extender was found by mDNS and invited (RTP SLAVE)" grep -q 'found X-Touch-Ext at 10.77.0.1:5204 (mDNS)' "$out/surfaced.log"
+check "the X-Touch invited us (RTP MASTER) and was accepted" grep -q 'X-Touch (10.77.0.1:5304) invites us' "$out/surfaced.log"
+check "both online, by the same profiles as on USB (handshake, serials)" bash -c "[[ \$(busctl --user get-property ${S[*]} UnitCount) == 'u 2' ]]"
+srfj Units >"$out/units.json"
+check "unit ids behringer-xtouch-ext@EXT0001 and behringer-xtouch@XT00002, transport network, with addresses" \
+  jq -e '[.data[0][] | {id: .id.data, t: .transport.data, a: .address.data}] | sort_by(.id) == [{id: "behringer-xtouch-ext@EXT0001", t: "network", a: "10.77.0.1:5204"}, {id: "behringer-xtouch@XT00002", t: "network", a: "10.77.0.1:5304"}]' "$out/units.json"
+G=$(jq -r '.data[0][0].group.data' "$out/units.json")
+srf SetGroup sasa{sv} "$G" 2 behringer-xtouch-ext@EXT0001 behringer-xtouch@XT00002 0 >/dev/null
+sleep 1.5
+
+########################################################################## C
+echo; echo "-- C. the displays, meters and motors, over the network"
+dump ext >"$out/e1.json"; dump xt >"$out/x1.json"
+note "extender LCD: $(jq -c '.lcd[0]' "$out/e1.json")"
+note "X-Touch   LCD: $(jq -c '.lcd[0]' "$out/x1.json")"
+check "one 16-strip group: inputs 1-8 on the Extender, 9-16 on the X-Touch" bash -c "jq -e '.cells[0][0] == \"KickIn\" and .cells[0][7] == \"FlorTm\"' $out/e1.json && jq -e '.cells[0][0] == \"OH L\" and .cells[0][7] == \"Keys R\"' $out/x1.json"
+check "scribble colours (the X-Touch colour SysEx)" jq -e '.colour[0:4] == ["red", "yellow", "green", "blue"]' "$out/e1.json"
+check "the motors went to the mixer's levels (in.6 -12 dB; main 0 dB)" bash -c "jq -e '(.fader[5] - 7782 | fabs) <= 16' $out/e1.json && jq -e '.fader[8] == 12287' $out/x1.json"
+check "the assignment display shows the view (IN)" jq -e '.assignment == "IN"' "$out/x1.json"
+mixer "meter 1 -6"; mixer "meter 2 3"; sleep 0.5
+check "meters (in.1 at -6 dB, in.2 clipping)" bash -c "dump ext | jq -e '.meter[0] == 9 and .clip[1] == true'"
+
+########################################################################## D
+echo; echo "-- D. faders: touch, gestures, motor feedback"
+m=$(mark)
+xt "move 3 12000"; sleep 0.3
+check "an untouched fader move is never applied" bash -c "! since $m | grep -q 'in.11/fader'"
+xt "touch 3 1"; sleep 0.1
+for v in 9000 10000 11000 12000; do xt "move 3 $v"; sleep 0.03; done
+sleep 0.3
+t_sent=$(grep 'done move' "$out/xt.out" | tail -1 | sed 's/.*t=//')
+t_set=$(since "$m" | jq -r 'select(.kind=="set" and .path=="/mix/in.11/fader") | .t' | tail -1)
+check "touch: Gesture begin on in.11 from surface:behringer-xtouch@XT00002" bash -c "since $m | grep -q 'gesture-begin.*in.11/fader.*surface:behringer-xtouch@XT00002'"
+v=$(since "$m" | jq -r 'select(.kind=="set" and .path=="/mix/in.11/fader") | .value' | tail -1)
+check "the moves set the parameter (12000/16383 of travel -> $v dB)" bash -c "awk -v v=$v 'BEGIN { exit !(v > -0.75 && v < -0.65) }'"
+note "surface move -> the mixer's Set: $(( (t_set - t_sent) / 1000 )) us (sim -> RTP-MIDI -> surfaced -> controld -> mixer)"
+xt "touch 3 0"; sleep 0.3
+check "release: Gesture end; the motor holds the value" bash -c "since $m | grep -q 'gesture-end.*in.11/fader' && dump xt | jq -e '(.fader[2] - 12000 | fabs) <= 2'"
+mixer "set /mix/in.5/fader 0"; sleep 0.3
+check "the mixer moves in.5 to 0 dB: the Extender's motor follows" bash -c "dump ext | jq -e '(.fader[4] - 12287 | fabs) <= 1'"
+
+########################################################################## E
+echo; echo "-- E. banking, LEDs"
+xt "tap bank-right"; sleep 0.4
+check "Bank >: the 16-wide window moves to offset 8" bash -c "dump ext | jq -e '.cells[0][0] == \"OH L\"'"
+xt "press shift"; xt "tap bank-left"; xt "release shift"; sleep 0.4
+check "Shift + Bank <: back to the first bank" bash -c "dump ext | jq -e '.cells[0][0] == \"KickIn\"'"
+ext "tap mute-2"; sleep 0.3
+check "Mute 2 on the Extender: its LED lights" bash -c "dump ext | jq -e '.leds[\"mute-2\"] == \"on\"'"
+ext "tap mute-2"; sleep 0.3
+check "and goes off" bash -c "dump ext | jq -e '.leds[\"mute-2\"] == null'"
+xt "tap flip"; sleep 0.3
+check "Flip LED on the X-Touch" bash -c "dump xt | jq -e '.leds.flip == \"on\"'"
+xt "tap flip"; sleep 0.3
+
+########################################################################## F
+echo; echo "-- F. backline surfaces"
+"$BL" surfaces >"$out/surfaces.txt" 2>&1 || true
+sed 's/^/        | /' "$out/surfaces.txt"
+check "lists both units: online, network, address, group and position" bash -c "grep -q 'behringer-xtouch-ext@EXT0001.*network 10.77.0.1:5204 *online *$G/1' $out/surfaces.txt && grep -q 'behringer-xtouch@XT00002.*network 10.77.0.1:5304 *online *$G/2' $out/surfaces.txt"
+check "--json has the units and the peers" bash -c "\"$BL\" surfaces --json | jq -e '(.units | length) == 2 and (.peers | length) == 2 and .active and .[\"network-port\"] == 5004'"
+
+########################################################################## G
+echo; echo "-- G. the X-Touch's network cable pulled while a fader is held"
+m=$(mark)
+xt "touch 5 1"; sleep 0.2
+xt "netdrop"
+t_drop=$(grep 'done netdrop' "$out/xt.out" | tail -1 | sed 's/.*t=//')
+for _ in $(seq 120); do since "$m" | grep -q 'gesture-end.*in.13/fader' && break; sleep 0.05; done
+t_end=$(since "$m" | jq -r 'select(.kind=="gesture-end" and .path=="/mix/in.13/fader") | .t' | tail -1)
+check "the held fader's gesture ends" test -n "$t_end"
+lat=$(( ${t_end:-0} - ${t_drop:-0} ))
+note "cable pulled -> Gesture end at the mixer: $((lat / 1000000)) ms (the session timeout: nothing heard for 3 s)"
+check "within 3.5 s (the RTP-MIDI silence timeout)" bash -c "(( $lat > 0 && $lat < 3500000000 ))"
+check "the unit is gone, its place kept; the window is dealt again over the Extender (width 8)" bash -c "busctl --user --json=short call ${S[*]} Units | jq -e '[.data[0][] | select(.state.data==\"gone\")] | length == 1' && busctl --user --json=short call ${S[*]} Groups | jq -e '.data[0][0].width.data == 8'"
+"$BL" surfaces >"$out/surfaces-gone.txt" 2>&1 || true
+check "backline surfaces shows it gone" grep -q 'behringer-xtouch@XT00002.*gone' "$out/surfaces-gone.txt"
+b0=$(lcd_bytes xt); q0=$(queries xt)
+t_back=$(mono); xt "netback"
+wait_online behringer-xtouch@XT00002 || true
+note "cable back -> online again: $(( ($(mono) - t_back) / 1000000 )) ms (the X-Touch's next invitation, every second; the handshake)"
+sleep 1.5   # the greeting, then the strips
+b1=$(lcd_bytes xt); q1=$(queries xt)
+note "the redraw: $((q1 - q0)) device query (a new handshake), $((b1 - b0)) LCD bytes"
+check "back online in the same group and place, fully redrawn" bash -c "busctl --user --json=short call ${S[*]} Groups | jq -e '.data[0][0].width.data == 16 and .data[0][0].units.data == [\"behringer-xtouch-ext@EXT0001\", \"behringer-xtouch@XT00002\"]' && (( $q1 > $q0 && $b1 - $b0 >= 112 )) && dump xt | jq -e '.cells[0][0] == \"OH L\" and .fader[8] == 12287'"
+m=$(mark)
+xt "move 5 3000"; sleep 0.3
+check "the stale touch from before the drop never applies: a move without a new touch is ignored" bash -c "! since $m | grep -q 'in.13/fader'"
+xt "touch 5 0"
+
+echo; echo "-- G2. the Extender's cable (here surfaced is the one that invites), then its power switch"
+ext "netdrop"; sleep 3.6
+check "dropped: the Extender is gone (surfaced heard nothing for 3 s)" bash -c "busctl --user --json=short call ${S[*]} Units | jq -e '[.data[0][] | select(.id.data==\"behringer-xtouch-ext@EXT0001\")][0].state.data == \"gone\"'"
+b0=$(lcd_bytes ext); q0=$(queries ext)
+t_back=$(mono); ext "netback"
+wait_online behringer-xtouch-ext@EXT0001 || true
+note "cable back -> online again: $(( ($(mono) - t_back) / 1000000 )) ms"
+sleep 1.5; b1=$(lcd_bytes ext); q1=$(queries ext)
+check "back: surfaced's next invitation (every second) opens it; redrawn in place" bash -c "(( $q1 > $q0 && $b1 - $b0 >= 112 )) && dump ext | jq -e '.cells[0][0] == \"KickIn\"' && busctl --user --json=short call ${S[*]} Groups | jq -e '.data[0][0].width.data == 16'"
+ext "unplug"; sleep 3.6
+check "switched off: gone" bash -c "[[ \$(busctl --user --json=short call ${S[*]} Units | jq -r '[.data[0][] | select(.id.data==\"behringer-xtouch-ext@EXT0001\")][0].state.data') == gone ]]"
+ext "plug"
+wait_online behringer-xtouch-ext@EXT0001 || true
+sleep 1.5
+check "switched on (its sessions forgotten, its display blank): online again and redrawn" bash -c "dump ext | jq -e '.cells[0][0] == \"KickIn\" and .connected'"
+check "the drops are counted: two lost sessions with the Extender" bash -c "busctl --user --json=short call ${S[*]} Peers | jq -e '[.data[0][] | select(.name.data==\"X-Touch-Ext\")][0].lost.data == 2'"
+
+########################################################################## I
+echo; echo "-- I. two engines: a main and a standby"
+BUS2=$(dbus-daemon --session --fork --print-address=1 --print-pid=1 | head -2 | tr '\n' ' ')
+BUS2ADDR=${BUS2%% *}; BUS2PID=${BUS2##* }; BUS2PID=${BUS2PID// /}
+on2() { DBUS_SESSION_BUS_ADDRESS=$BUS2ADDR "$@"; }
+on2 "$BL_BIN/control/backline-controld" --no-config --idle-exit 0 --name backline-test.net-ctl2 2>"$out/controld2.log" &
+PIDS+=($!)
+for _ in $(seq 100); do on2 busctl --user status io.github.manuaudio.Backline.Control >/dev/null 2>&1 && break; sleep 0.05; done
+mkfifo "$out/mixer2.in"
+on2 "$BL_BIN/surface/backline-test-mixer" --views --log "$out/mixer2.jsonl" <"$out/mixer2.in" >"$out/mixer2.out" 2>&1 &
+PIDS+=($!); exec 6>"$out/mixer2.in"
+for _ in $(seq 100); do grep -q registered "$out/mixer2.out" 2>/dev/null && break; sleep 0.05; done
+on2 "$BL_BIN/surface/backline-surfaced" --standby --name backline-test.net2 --state-file "$out/surfaces2.json" --verbose 2>"$out/surfaced2.log" &
+SURF2=$!; PIDS+=($SURF2)
+for _ in $(seq 100); do on2 busctl --user status io.github.manuaudio.Backline.Surface >/dev/null 2>&1 && break; sleep 0.05; done
+echo views >&6   # the standby's mixer pushes its views to its own surfaced
+# the standby is set up like the main: the same group, Extender on the left
+on2 busctl --user call -- "${S[@]}" SetGroup sasa{sv} foh 2 behringer-xtouch-ext@EXT0001 behringer-xtouch@XT00002 0 >/dev/null
+on2 "$BL" surfaces add 10.77.0.1:5304 >/dev/null
+sleep 2.5
+on2 busctl --user --json=short call -- "${S[@]}" Peers >"$out/peers2.json"
+note "standby's peers: $(jq -c '[.data[0][] | {(.name.data + " " + .address.data): .state.data}] | add' "$out/peers2.json")"
+check "the standby is on UDP 5006 (5004 is the main's) and says it is a standby" bash -c "on2() { DBUS_SESSION_BUS_ADDRESS=$BUS2ADDR \"\$@\"; }; on2 busctl --user get-property ${S[*]} NetworkPort | grep -q 'q 5006' && on2 busctl --user get-property ${S[*]} Active | grep -q 'b false'"
+check "the Extender (two sessions) gave the standby a session of its own: open, held" jq -e '[.data[0][] | select(.name.data=="X-Touch-Ext")][0].state.data == "open"' "$out/peers2.json"
+check "the X-Touch (one session, the main's) refused the standby" bash -c "jq -e '[.data[0][] | select(.address.data==\"10.77.0.1:5304\")][0].state.data == \"refused\"' $out/peers2.json && grep -q 'refused Backline' $out/xt.out"
+check "the standby drives nothing: no units, nothing sent" bash -c "on2() { DBUS_SESSION_BUS_ADDRESS=$BUS2ADDR \"\$@\"; }; on2 busctl --user get-property ${S[*]} UnitCount | grep -q 'u 0' && on2 busctl --user get-property ${S[*]} MidiOut | grep -q 't 0'"
+check "the main still draws the Extender (its names, not blank)" bash -c "dump ext | jq -e '.cells[0][0] == \"KickIn\"'"
+on2 "$BL" surfaces >"$out/surfaces2.txt" 2>&1 || true
+sed 's/^/        | /' "$out/surfaces2.txt"
+check "backline surfaces on the standby says so" bash -c "grep -q STANDBY $out/surfaces2.txt && grep -q 'session held (standby)' $out/surfaces2.txt && grep -q 'refused' $out/surfaces2.txt"
+
+t_stop=$(mono)
+kill "$SURF"; wait "$SURF" 2>/dev/null || true
+sleep 0.2
+check "the main stops: goodbye to both (dark, offline), BY to their sessions" bash -c "dump xt | jq -e '.offline' && dump ext | jq -e '.offline' && grep -q 'session 10.77.0.1:5004 lost' $out/xt.out"
+for _ in $(seq 160); do
+  on2 busctl --user --json=short call -- "${S[@]}" Peers | jq -e '[.data[0][] | select(.address.data=="10.77.0.1:5304")][0].state.data == "open"' >/dev/null 2>&1 && break
+  sleep 0.05
+done
+note "main stopped -> the standby holds the X-Touch's free session: $(( ($(mono) - t_stop) / 1000000 )) ms (it asks every 5 s after a NO)"
+check "the X-Touch's session is the standby's now" bash -c "on2() { DBUS_SESSION_BUS_ADDRESS=$BUS2ADDR \"\$@\"; }; on2 busctl --user --json=short call ${S[*]} Peers | jq -e '[.data[0][] | select(.address.data==\"10.77.0.1:5304\")][0].state.data == \"open\"'"
+t_act=$(mono)
+on2 "$BL" surfaces activate
+for _ in $(seq 200); do [[ $(dump xt | jq -r '.cells[0][0]') == "OH L" && $(dump ext | jq -r '.cells[0][0]') == "KickIn" ]] && break; sleep 0.05; done
+note "SetActive(true) -> both drawn by the standby: $(( ($(mono) - t_act) / 1000000 )) ms"
+check "active: the standby drives both units (online, 2)" bash -c "on2() { DBUS_SESSION_BUS_ADDRESS=$BUS2ADDR \"\$@\"; }; on2 busctl --user get-property ${S[*]} UnitCount | grep -q 'u 2' && on2 busctl --user get-property ${S[*]} Active | grep -q 'b true'"
+check "its own mixer's names on the strips, in the same layout" bash -c "dump ext | jq -e '.cells[0][0] == \"KickIn\"' && dump xt | jq -e '.cells[0][0] == \"OH L\"'"
+m2=$(wc -l <"$out/mixer2.jsonl")
+ext "touch 1 1"; ext "move 1 8000"; sleep 0.2; ext "touch 1 0"; sleep 0.3
+check "a fader on the Extender now moves the standby's mixer (gesture, set)" bash -c "tail -n +$((m2 + 1)) $out/mixer2.jsonl | grep -q 'gesture-begin.*in.1/fader' && tail -n +$((m2 + 1)) $out/mixer2.jsonl | grep -q '\"kind\":\"set\",\"path\":\"/mix/in.1/fader\"'"
+
+########################################################################## end
+echo
+check "PipeWire: no node of this proof's devices (network units have none)" bash -c "! timeout 5 pw-dump | jq -r '.[] | select(.type==\"PipeWire:Interface:Node\") | .info.props[\"node.name\"]' | grep -q 'sim'"
+echo
+echo "RESULT: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]

@@ -1,14 +1,23 @@
 # Surface service (docs/api/Surface1.md). The protocol, profile and engine
 # code is pure and unit-tested without PipeWire or a bus (tests/unit).
-add_library(bl_surface_core STATIC mcu.c profile.c engine.c)
+add_library(bl_surface_core STATIC mcu.c profile.c engine.c rtpmidi.c)
 target_include_directories(bl_surface_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(bl_surface_core PUBLIC bl_params PkgConfig::JSONC m)
 
 add_library(bl_midi STATIC ${PROJECT_SOURCE_DIR}/common/bl_midibuf.c)
 target_include_directories(bl_midi PUBLIC ${PROJECT_SOURCE_DIR}/common)
 
-add_executable(backline-surfaced surfaced.c)
+# Network surfaces (RTP-MIDI) are found by mDNS through avahi-daemon when
+# avahi-client is there; without it, only by invitation or address.
+pkg_check_modules(AVAHI IMPORTED_TARGET avahi-client)
+add_executable(backline-surfaced surfaced.c rtpnet.c)
 target_link_libraries(backline-surfaced PRIVATE bl_surface_core bl_midi bl_graph PkgConfig::PIPEWIRE PkgConfig::SYSTEMD PkgConfig::JSONC)
+if(AVAHI_FOUND)
+  target_link_libraries(backline-surfaced PRIVATE PkgConfig::AVAHI)
+  target_compile_definitions(backline-surfaced PRIVATE BL_HAVE_AVAHI=1)
+else()
+  message(STATUS "avahi-client not found: backline-surfaced finds network surfaces by invitation or address only")
+endif()
 if(BL_HAVE_SPA_PARSER_BODY)
   target_compile_definitions(backline-surfaced PRIVATE BL_HAVE_SPA_PARSER_BODY=1)
 endif()
@@ -37,6 +46,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_surface PRIVATE bl_surface_core bl_mcusim bl_midi)
   target_compile_definitions(test_surface PRIVATE BL_SURFACE_SRCDIR="${PROJECT_SOURCE_DIR}/data/surfaces")
   add_test(NAME surface_mcu_engine_sim COMMAND test_surface)
+  add_executable(test_rtpmidi ${PROJECT_SOURCE_DIR}/tests/unit/test_rtpmidi.c)
+  target_link_libraries(test_rtpmidi PRIVATE bl_surface_core)
+  add_test(NAME surface_rtpmidi COMMAND test_rtpmidi)
   # Real hardware: pending (reported as skipped) until a bench pass.
   add_test(NAME surface_real_hardware COMMAND ${PROJECT_SOURCE_DIR}/tests/surface-hardware-pending)
   set_tests_properties(surface_real_hardware PROPERTIES SKIP_RETURN_CODE 77)

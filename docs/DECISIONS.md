@@ -165,3 +165,45 @@ instance nothing outside the proof can see its devices, and the proof can't
 touch anything outside it. The user's graph is listed before and after to
 show it is untouched. Real-hardware checks run on the real graph, by hand
 (docs/HARDWARE-TEST.md).
+
+## D10. Network surfaces: surfaced speaks RTP-MIDI itself (2026-11-12)
+
+**Decision.** Mackie Control surfaces on the network (the X-Touch and
+X-Touch Extender's Ethernet port) are driven by a small RTP-MIDI
+implementation inside `backline-surfaced`. It has two parts:
+`surface/rtpmidi.c`, the AppleMIDI session and the RFC 6295 payload, pure and
+unit-tested; `surface/rtpnet.c`, the UDP sockets and mDNS through
+avahi-daemon. PipeWire's RTP-MIDI module is not used. A network device is a
+unit with the same profile as on USB.
+
+**Why.** PipeWire's AppleMIDI module (`libpipewire-module-rtp-session`) is
+the only alternative without extra software, and it doesn't fit:
+
+- It isn't in Arch's main `pipewire` package. It ships in `pipewire-zeroconf`,
+  so it is one more package and a root install.
+- It has to be configured into the user's PipeWire for every session, which
+  is setup a surface shouldn't need.
+- It turns each session into an anonymous MIDI node, so surfaced would lose
+  the device's name and the session's state. It couldn't end a held fader's
+  gesture on a drop any faster than PipeWire notices one.
+
+PipeWire's plain RTP sink and source (`module-rtp-sink`/`-source` with
+`sess.media = "midi"`) send RTP-MIDI without the session handshake, and the
+X-Touch needs the handshake. Speaking the protocol
+in surfaced keeps it all in one process with no setup. surfaced invites,
+accepts invitations, sees every session's state, notices a silent device in
+3 s, invites again until it is back, and refuses a second session it doesn't
+want. It is about 1,100 lines and needs no new dependency beyond the optional
+avahi-client.
+
+**Standby.** `--standby` (or `SetActive(false)`) holds network sessions open
+and drives nothing. That gives a second engine an instant takeover of devices
+that allow two sessions, and a takeover within 5 s of the main's session
+ending for devices that allow one. Which kind the X-Touch is, is a bench item
+(docs/SURFACES.md).
+
+**Revisit when** PipeWire's session module ships in the base package and
+exposes per-session state, or devices need the recovery journal for lossy
+links (Wi-Fi). surfaced sends no journal today, as the X-Touch's wired link
+doesn't lose packets in practice. The session code would then grow a journal
+writer, or the module would take over.

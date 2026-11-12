@@ -45,6 +45,11 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 export out
+# surfaced browses mDNS through avahi-daemon on the system bus. A network
+# namespace doesn't hide the real one's socket, so point it nowhere: this
+# proof never asks the real network anything (tests/surfaced-net-proof has
+# its own avahi-daemon on a dummy interface).
+export DBUS_SYSTEM_BUS_ADDRESS=unix:path=$out/no-system-bus
 check() { # description, then a command that must succeed
   local d=$1; shift
   if "$@" >/dev/null 2>&1; then PASS=$((PASS + 1)); echo "  PASS  $d"; else FAIL=$((FAIL + 1)); echo "  FAIL  $d"; fi

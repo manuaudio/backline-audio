@@ -22,6 +22,14 @@ else
 fi
 grep -qxF "$dir" <<<"$paths" || { echo "not ok - prefix $prefix: units in $dir, which systemd doesn't read"; echo "$paths"; exit 1; }
 echo "ok - prefix $prefix: user units in $dir, on systemd's user unit path"
+if [[ -f $dest$dir/backline-surfaced.service ]] || grep -q 'backline-surfaced' "$build/build.ninja" 2>/dev/null; then
+  [[ -f $dest$dir/backline-surfaced.service ]] || { echo "not ok - backline-surfaced.service is installed next to the other units"; exit 1; }
+  link=$dest$dir/default.target.wants/backline-surfaced.service
+  [[ -L $link && $(readlink "$link") == ../backline-surfaced.service ]] || { echo "not ok - surfaced is enabled at login (default.target.wants)"; exit 1; }
+  grep -q '^SystemdService=backline-surfaced.service' "$(find "$dest" -name io.github.manuaudio.Backline.Surface.service -path '*dbus-1*' -print -quit)" \
+    || { echo "not ok - D-Bus activation goes through the unit"; exit 1; }
+  echo "ok - surfaced starts at login: its unit, enabled in default.target.wants, and D-Bus activation through it"
+fi
 hook=$(find "$dest" -name backline-plugins.hook -print -quit)
 if [[ $prefix == /usr ]]; then
   [[ -n $hook ]] || { echo "not ok - a /usr install has the pacman hook"; exit 1; }

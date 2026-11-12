@@ -2,6 +2,8 @@
 post_install() {
   echo ':: To keep the plugin index current as plugins come and go, each user can run:'
   echo '     systemctl --user enable --now backline-registry-rescan.path'
+  echo ':: Control surfaces (backline-surfaced) start at the next login; to start them now:'
+  echo '     systemctl --user daemon-reload && systemctl --user start backline-surfaced'
 }
 post_upgrade() {
   :

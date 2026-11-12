@@ -22,7 +22,7 @@ and follow-selection are a program's policy, built from the primitives here
 
 | Word | Meaning |
 |---|---|
-| **Unit** | One physical device on one MIDI port pair: an X-Touch, an X-Touch Extender, an MCU Pro. It has strips (8 for these), and maybe a master fader and the global buttons (a **master** unit; an **extender** has strips only) |
+| **Unit** | One physical device on one MIDI port pair, or one RTP-MIDI session on the network: an X-Touch, an X-Touch Extender, an MCU Pro. It has strips (8 for these), and maybe a master fader and the global buttons (a **master** unit; an **extender** has strips only) |
 | **Profile** | What a model is: its driver, strips, displays, quirks, button labels. Data, in `*.surface.json` (below) |
 | **Group** | An ordered list of units used as one wide surface: `[X-Touch Ext, X-Touch]` is 16 strips. Each group has its own views, window, pot mode and role |
 | **View** | An ordered list of slots with an id, a label and a 2-character code for the assignment display |
@@ -41,7 +41,36 @@ Every unit surfaced knows, plugged in or remembered: `id` (`s`, stable:
 `profile` (`s`), `name` (`s`, the model), `port` (`s`), `serial` (`s`),
 `group` (`s`), `position` (`i`, in the group; -1 in none), `state` (`s`: `handshake`,
 `online`, `gone`), `strips` (`u`), `master` (`b`), `touched` (`u`, faders held
-now).
+now), `transport` (`s`: `midi`, a MIDI port, USB or DIN; `network`, RTP-MIDI),
+`address` (`s`, a network unit's `IP:PORT` while it is connected). A network
+unit's `port` is `rtpmidi:NAME | NAME`, NAME being its session or mDNS name.
+
+### `Peers() → (aa{sv} peers)`
+
+The network devices surfaced knows, driven or not: `name` (`s`), `address`
+(`s`), `state` (`s`: `inviting`, `open`, `refused`, which means the device
+said no because its sessions are taken, `lost` or `closed`), `found` (`s`:
+`mdns`, `invited` when the device called us, or `address` when it was added),
+`advertised` (`b`, still on mDNS), `latency-ms` (`d`, one way, from the last
+clock sync), `lost` (`u`, how many times the session dropped), `unit` (`s`,
+its unit id while driven, `""` otherwise).
+
+### `AddNetwork(s address)`, `RemoveNetwork(s address)` → `()`
+
+A device that isn't found by mDNS and doesn't call us (an X-Touch in RTP
+SLAVE mode): an IPv4 address, `IP` or `IP:PORT` (default 5004), as on the
+unit's display; names are not looked up. surfaced invites it, again
+every second until it answers, and keeps the address in its state file.
+Errors: `InvalidArgs` (not an IPv4 address), `NotFound` (`RemoveNetwork` of an
+address never added).
+
+### `SetActive(b active) → ()`
+
+`false`: this engine is a **standby**. Its network sessions stay open and
+nothing is driven: no handshake, nothing drawn, input ignored. `true`: every
+connected device becomes a unit at once (handshake, then drawn). Going to
+standby ends any held fader's gesture. `backline-surfaced --standby`
+starts as a standby.
 
 ### `Groups() → (aa{sv} groups)`
 
@@ -174,9 +203,22 @@ The profiles found, `{"schema": "backline.surface/1", "profiles": [...]}`.
 | `ProfileDirs` | `as` | Where profiles are read from |
 | `MidiIn` | `t` | MIDI messages from devices (*polled*) |
 | `MidiOut` | `t` | MIDI messages sent to devices (*polled*) |
+| `Active` | `b` | `false` on a standby engine (`SetActive`) |
+| `NetworkPort` | `q` | The RTP-MIDI control port surfaced listens on (5004, or the next free pair; 0 if none); data is the port after it |
 
 ## What surfaced does on its own
 
+- **Network surfaces** (RTP-MIDI, [SURFACES.md](../SURFACES.md)): surfaced
+  listens on UDP 5004/5005 and browses mDNS `_apple-midi._udp` through
+  avahi-daemon. A device whose name matches a profile is driven: one found
+  on mDNS or added by address is invited, and one that invites us is accepted
+  if it is on one of this computer's own networks (nothing routed from
+  further away).
+  Others (a Mac's session) are ignored or refused. Its MIDI is batched into
+  one packet per 5 ms tick. The side that invited syncs clocks every second,
+  and surfaced probes when the device invited. When nothing is heard for 3 s,
+  the session is lost, which is an **unplug** (below). surfaced invites again
+  every second, after a refusal every 5 s.
 - **Detection** (in order, first match wins): the port's
   `node:port | alias` against each profile's `match`, then the MCU device
   query (`F0 00 00 66 <model> 00 F7`), whose answer carries the unit's
@@ -187,7 +229,8 @@ The profiles found, `{"schema": "backline.surface/1", "profiles": [...]}`.
 - **Grouping**: a unit goes back to the group and position it had (by its
   id); a new master unit starts a new group; a new extender joins the first
   group with a master, on its right. Groups are remembered in
-  `$XDG_STATE_HOME/backline/surfaces.json`.
+  `$XDG_STATE_HOME/backline/surfaces.json`, with the network addresses
+  (`"network": ["10.0.0.5:5004"]`).
 - **Unplug**: every fader of that unit that is touched gets its gesture
   ended at once (automation never writes forever), the unit becomes `gone`,
   and the window is dealt again over the units that remain. A replug puts it
@@ -275,4 +318,11 @@ busctl --user call "${S[@]}" Units
 busctl --user call "${S[@]}" SetGroup sasa{sv} foh 2 behringer-xtouch-ext@1 behringer-xtouch@2 0
 busctl --user call "${S[@]}" SetViews ss foh "$(cat views.json)"
 busctl --user call "${S[@]}" Text sssu foh "" "LOCKED" 2000
+busctl --user call "${S[@]}" AddNetwork s 192.168.1.50
 ```
+
+`backline surfaces` lists the units and network devices, and `backline
+surfaces add|remove ADDRESS` and `activate|standby` call the methods above.
+libbackline: `bl_surface_units`, `bl_surface_peers`,
+`bl_surface_add_network`, `bl_surface_remove_network`,
+`bl_surface_set_active`, `bl_surface_status`.

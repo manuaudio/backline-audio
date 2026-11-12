@@ -1,8 +1,10 @@
 # Control surfaces on real hardware: the bench checklist
 
 Everything in the surface layer has been tested against software devices
-only (`tests/surfaced-proof`, `tests/unit/test_surface.c`). This list is
-what to check, and write down, the first time a real device is plugged in.
+only (`tests/surfaced-proof`, `tests/surfaced-net-proof`,
+`tests/unit/test_surface.c`, `tests/unit/test_rtpmidi.c`). This list is
+what to check, and write down, the first time a real device is plugged in:
+by USB first, then on the network (below).
 In ctest the hardware pass shows as **skipped** (`surface_real_hardware`)
 until it is done.
 
@@ -53,8 +55,49 @@ encoders, takeover, feedback): map a few controls with `backline map add
 … param:/mix/in.1/fader --feedback` (see Control1.md), and note which
 `encoding` its encoders send and whether its LEDs or motors follow.
 
+## On the network (X-Touch, X-Touch Extender)
+
+What the network adds is only the transport, so a USB pass first saves
+time. Then:
+
+### Set up (about 10 minutes)
+
+1. Cable the unit's **REMOTE** port to the same switch as the computer (or
+   straight to it). Note the computer's address: `ip -4 addr`.
+2. On the unit: hold **Channel 1 SELECT** while switching it on.
+   - **Encoder 1**: **MC**.
+   - **Encoder 2**: **Network**.
+   - **Encoder 3**: **DHCP** on (or set the IP, mask and gateway with
+     encoders 4–7).
+   - **Encoder 3** again: **MODE**, set to **RTP SLAVE** first.
+   - Press **Channel 1 SELECT** to leave.
+   - Write down the unit's IP, which the display shows after `Wait…`.
+3. Run the services as in the USB setup above. surfaced's log shows
+   `network UDP 5004` at the start. SLAVE mode needs no firewall change.
+   MASTER mode (N6 onwards) needs UDP 5004–5005 let in. Omarchy's ufw
+   denies incoming, so: `sudo ufw allow 5004:5005/udp`; remove the rule
+   afterwards with `sudo ufw delete allow 5004:5005/udp`.
+
+### Check and note
+
+| # | Check | Write down |
+|---|---|---|
+| N1 | `avahi-browse -rt _apple-midi._udp` | **Whether the unit announces itself on mDNS**, and under which name |
+| N2 | If N1 found it: the log says `found … (mDNS)`, then `online`, with nothing to do. If not: `backline surfaces add UNIT-IP`, then `online`; the display's "Wait" goes away | The **session name** the unit gives (`backline surfaces`, or the log). If the log says `no surface profile matches this name`, put that name in the profile's `match` |
+| N3 | `backline surfaces` lists it: `network IP:5004`, `online` | The unit id (does it end in a serial?) |
+| N4 | Checks 3–13 of the USB table, over the network | Anything that differs from USB (missing text: long SysEx in one packet) |
+| N5 | Pull the network cable while holding a fader: `gesture-end` in the mixer log within ~3 s; `backline surfaces` says `gone`. Plug it back: online within ~1 s, same place, redrawn | The two times. Does the display say "Wait" while unplugged? |
+| N6 | **RTP MASTER** with this computer's IP (and the ufw rule): `X-Touch (IP:PORT) invites us`, then `online` (first `backline surfaces remove UNIT-IP`) | The session name it calls with |
+| N7 | In MASTER mode, the cable pull of N5, and the same with **no** fader held, for 60 s, then back | Does the unit call again by itself? |
+| N8 | Clock syncs both ways: in MASTER mode, `busctl --user call io.github.manuaudio.Backline.Surface /io/github/manuaudio/Backline/Surface io.github.manuaudio.Backline.Surface1 Peers` shows `latency-ms` > 0 | Whether the unit answers surfaced's probes (if not, a drop is only noticed after 30 s: note it) |
+| N9 | **Two sessions** (RTP SLAVE): a second computer running `backline-surfaced --standby` and `backline surfaces add UNIT-IP` | Does the unit take a second session (`session held (standby)`) or refuse it (`refused`)? Does it send to both? |
+| N10 | With two: stop the main engine; `backline surfaces activate` on the standby | How long until the standby drives it |
+| N11 | The Extender the same way (N1–N5) and next to an X-Touch: one 16-wide group | Its session name |
+
 ## When done
 
 Put what you found into the profile (`match`, `labels`, `quirks`,
 `bytes-per-second`), set `"verified": true`, and note the device, firmware
-and date in the profile's `comment`.
+and date in the profile's `comment`. The network answers (mDNS, the session
+name, how many sessions) go into [SURFACES.md](SURFACES.md), in place of its
+"not confirmed" list.

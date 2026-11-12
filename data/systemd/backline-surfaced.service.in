@@ -1,0 +1,21 @@
+# backline-surfaced: control surfaces (Mackie Control on USB/MIDI ports and
+# on the network) for any program. It starts at login, so a surface that is
+# plugged in or on the network works without anything asking for it first;
+# D-Bus activation of io.github.manuaudio.Backline.Surface starts this unit
+# too. Installed enabled (default.target.wants); to turn it off:
+#   systemctl --user mask backline-surfaced
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Backline control surfaces (Mackie Control, USB and network)
+After=pipewire.service
+ConditionUser=!@system
+
+[Service]
+Type=dbus
+BusName=io.github.manuaudio.Backline.Surface
+ExecStart=@bindir@/backline-surfaced
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

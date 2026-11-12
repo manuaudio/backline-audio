@@ -1,7 +1,9 @@
 # D-Bus activation for the Backline surface service (session bus).
 # Installed as /usr/share/dbus-1/services/io.github.manuaudio.Backline.Surface.service
-# with @bindir@ replaced (CMake does this at install time).
+# with @bindir@ replaced (CMake does this at install time). Activation goes
+# through the systemd user unit, so there is only ever one surfaced.
 # SPDX-License-Identifier: MIT
 [D-BUS Service]
 Name=io.github.manuaudio.Backline.Surface
 Exec=@bindir@/backline-surfaced
+SystemdService=backline-surfaced.service

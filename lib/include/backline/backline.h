@@ -248,6 +248,20 @@ int bl_player_set_start(bl_client *c, const char *id, const char *position, uint
 int bl_player_list(bl_client *c, char **json);
 int bl_player_get(bl_client *c, const char *id, char **json);
 
+/* ---------------------------------------------------------------- Surface1 */
+/* docs/api/Surface1.md: control surfaces (Mackie Control, USB/MIDI or the
+ * network). JSON arrays of objects, released with bl_free: the units
+ * (Units(): id, name, state, transport, address, group, ...) and the
+ * network devices with their sessions (Peers(): name, address, state, unit). */
+int bl_surface_units(bl_client *c, char **json);
+int bl_surface_peers(bl_client *c, char **json);
+/* A network device at an address ("10.0.0.5" or "10.0.0.5:5004"), kept. */
+int bl_surface_add_network(bl_client *c, const char *address);
+int bl_surface_remove_network(bl_client *c, const char *address);
+/* A standby engine holds its sessions and drives nothing until active. */
+int bl_surface_set_active(bl_client *c, bool active);
+int bl_surface_status(bl_client *c, bool *active, uint16_t *network_port, bool *params_connected);
+
 /* ---------------------------------------------------------------- Control1 */
 /* docs/api/Control1.md: OSC and MIDI mapped to any parameter. */
 typedef struct bl_map_options {

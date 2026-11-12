@@ -71,7 +71,7 @@ effect-insert component.
 | `backline-playerd` | Plays files into the graph on the shared timeline: each file a node, starting on an exact transport frame, with its own gain | C | **Built and measured** (§4.9): `Player1`, sample-exact starts, streaming past an in-memory head |
 | `backline-clockd` | Transport, tempo and timecode: the PipeWire timeline owner, Ableton Link, LTC/MTC generation and chase | C++ (Link is C++) | **Built and measured** (§4.8): `Clock1`, LTC/MTC to the sample, Link |
 | `backline-controld` | Maps OSC and MIDI to any parameter in the system: Backline instances, filter-chain/clap-pipewire controls, volumes, transport, recorder; serves the parameter trees programs publish (`Params1`) | C | **Built and measured** (§4.11, §4.12): `Control1`, MIDI and OSC learn, no socket unless asked, allow-lists and TCP secrets; `Params1` with OSC get/set/subscribe and meters; 14-bit CC, NRPN, relative encoders, takeover, MIDI feedback |
-| `backline-surfaced` | Control surfaces (Mackie Control family: MCU Pro/XT, X-Touch/Extender) for any program: detection, handshake, groups of units, views, banking, layers, flip, motor faders, scribble strips, meters, hot-plug | C | **Built; measured against software devices only** (§4.12): `Surface1`; a real-hardware pass is pending ([HARDWARE-TEST.md](docs/HARDWARE-TEST.md)) |
+| `backline-surfaced` | Control surfaces (Mackie Control family: MCU Pro/XT, X-Touch/Extender) for any program, on USB/MIDI and on the network (RTP-MIDI): detection, handshake, groups of units, views, banking, layers, flip, motor faders, scribble strips, meters, hot-plug and network drops, a standby engine | C | **Built; measured against software devices only** (§4.12, §4.13): `Surface1`, `backline surfaces`, started at login; a real-hardware pass is pending ([HARDWARE-TEST.md](docs/HARDWARE-TEST.md)) |
 | `libbackline` + `backline` CLI + `Backline` QML module | The client surface for apps and Omarchy panels | C (lib), C (CLI), C++/QML (module) | Library skeleton and CLI built (host, instance, plugins, rec); QML is design |
 | clap-pipewire (separate project) | CLAP effects inside filter-chain: device effects and virtual sinks, in-graph | C | v0.1, separate project |
 
@@ -635,6 +635,15 @@ effect-insert component.
   every button id). HUI, the Waves FIT's native mode and others are next
   (§5). Written from the Logic Control MIDI implementation and the console
   spec's tables; Ardour's GPL surface code was read for facts only.
+- **Network.** RTP-MIDI in surfaced itself (`surface/rtpmidi.c`, pure;
+  `surface/rtpnet.c`, sockets and mDNS through avahi-daemon; DECISIONS D10).
+  A network device is a unit like a USB one: same profile, same engine. It is
+  found on mDNS, invites us, or is added by address. Its MIDI is batched into
+  one packet per engine tick. Silence for 3 s is an unplug: gestures end, it
+  is invited again, and it returns to its place. `--standby` holds sessions
+  without driving them, for a second engine ([SURFACES.md](docs/SURFACES.md)).
+- **Start.** A systemd user unit, installed enabled; D-Bus activation goes
+  through it. `backline surfaces` lists what is connected.
 - **Omarchy.** A panel row listing surfaces is plausible once a mixer uses
   them.
 
@@ -1081,6 +1090,31 @@ and a third plays a generic CC/NRPN controller. 82 checks; full report in
   redraw (577 bytes, complete in 190 ms, at most 315 bytes in any 100 ms).
 - **Not measured: real hardware.** Pending; [HARDWARE-TEST.md](docs/HARDWARE-TEST.md).
 
+### 4.13 Network surfaces (`tests/surfaced-net-proof`)
+
+In a user, network and mount namespace (no sudo), whose only interfaces are
+`lo` and a dummy `bl0`. A private avahi-daemon runs on a private system bus,
+plus a private PipeWire and session bus, and the user's graph is checked
+before and after. An X-Touch Extender in RTP SLAVE mode (found on mDNS) and
+an X-Touch in RTP MASTER mode (it invites surfaced on UDP 5004) are software
+devices (`tools/mcu-sim.c --net`). 50 checks; full report in
+`docs/proofs/surfaced-net-proof.txt`.
+
+- **The same as USB.** Same profiles and unit ids (`profile@serial`), one
+  16-strip group, names, colours, motors, meters, touch and gestures (an
+  untouched move is never applied), banking, LEDs. A surface move reaches
+  the mixer in about 0.2 ms; feedback goes out once per 5 ms engine tick, one
+  packet per unit.
+- **Drops.** With the X-Touch's cable pulled while a fader is held, the
+  gesture ends at the mixer 2.8 s later and the window is dealt again. With
+  the cable back, the unit is online in 1 s, in the same group and place,
+  with a new handshake and a full redraw. A touch from before the drop never
+  applies. The Extender's cable and its power switch behave the same way.
+- **Two engines.** A standby surfaced, with its own bus, controld and mixer,
+  holds its own session with the Extender (it allows two) and sends
+  nothing. The X-Touch (one session) refuses it. When the main stops, the
+  standby gets the X-Touch 2.5 s later, and `backline surfaces activate`
+  draws both in about 1 s. Their faders then move the standby's mixer.
 ## 5. Build order
 
 1. **Host supervisor and client skeleton.** *Done (§4.3).*
@@ -1133,8 +1167,9 @@ and a third plays a generic CC/NRPN controller. 82 checks; full report in
      meters); the Waves FIT in MCU mode (two units, one profile) and then its
      native LV1-mode driver after a bench capture; more MCU profiles (X-Touch
      One, iCON, FaderPort in MCU mode, …); `Instance1` additions surfaces want
-     (value text, gesture passthrough, `ParamsChanged`, latency); a user unit
-     to start surfaced at login.
+     (value text, gesture passthrough, `ParamsChanged`, latency).
+   - *Done (§4.13)*: network surfaces (RTP-MIDI), the standby engine,
+     `backline surfaces`, the user unit that starts surfaced at login.
 9. **Omarchy PRs**, each one problem with measured evidence, in this order:
    - "Record this app or device" (a panel action over `backline rec`);
    - "Play a system instrument from any MIDI keyboard" (an instrument

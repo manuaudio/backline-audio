@@ -64,6 +64,8 @@ static void usage(FILE *f)
 	      "  map add SOURCE TARGET [--min X --max Y ...] | learn TARGET | list | remove ID | status\n"
 	      "  map listen udp|tcp ADDRESS PORT [--allow CIDR] [--secret S] | unlisten ID | follow REGEX | save\n"
 	      "     OSC and MIDI to any parameter (backline map -h; docs/api/Control1.md)\n"
+	      "  surfaces               connected control surfaces (Mackie Control, USB or network) and their state\n"
+	      "  surfaces add IP | remove IP   a network surface that isn't found by itself (docs/SURFACES.md)\n"
 	      "  version\n",
 	      f);
 }
@@ -680,6 +682,8 @@ int main(int argc, char **argv)
 		r = cli_play(C, g_json, n - 1, args + 1);
 	else if (!strcmp(cmd, "map"))
 		r = cli_map(C, g_json, n - 1, args + 1);
+	else if (!strcmp(cmd, "surfaces"))
+		r = cli_surfaces(C, g_json, n - 1, args + 1);
 	else if (!strcmp(cmd, "params"))
 		r = cmd_params(n, args);
 	else if (!strcmp(cmd, "get"))

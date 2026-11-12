@@ -71,6 +71,36 @@ real hardware comes first ([docs/HARDWARE-TEST.md](docs/HARDWARE-TEST.md)).
   stub program on the public APIs). Proof: `tests/surfaced-proof`, 82 checks
   on a private PipeWire instance (`docs/proofs/surfaced-proof.txt`); in CI
   the engine against two device models, 233 checks.
+- **Network surfaces** ([SURFACES.md](docs/SURFACES.md)): an X-Touch or
+  X-Touch Extender on Ethernet (MC mode, Interface Network) works exactly as
+  on USB, with the same profiles, banking, touch safety and grouping, and no
+  helper software. surfaced speaks RTP-MIDI itself (DECISIONS D10): it is
+  found on mDNS (`_apple-midi._udp`, through avahi-daemon), invited by the
+  device (RTP MASTER), or added once with `backline surfaces add ADDRESS`
+  (RTP SLAVE, no firewall change). A drop ends a held fader's gesture within
+  3 s, and the unit comes back to its place when the network does. A
+  standby engine (`backline-surfaced --standby`, `SetActive`) holds its own
+  sessions and takes over on `backline surfaces activate`. `Surface1`
+  additions: `Peers`, `AddNetwork`, `RemoveNetwork`, `SetActive`, the
+  `Active` and `NetworkPort` properties, and `transport`/`address` in
+  `Units`. Proof: `tests/surfaced-net-proof`, 50 checks in a user network
+  namespace with a dummy interface and a private avahi-daemon
+  (`docs/proofs/surfaced-net-proof.txt`); in CI the protocol and session
+  code, `tests/unit/test_rtpmidi.c`.
+- **`backline surfaces`**: the connected surfaces, how each is connected
+  (USB/MIDI or network and its address), its state, group and position, and
+  the network devices that aren't driven (refused, not answering). It also
+  takes `add`, `remove`, `activate` and `standby`. libbackline `bl_surface_*`.
+- **surfaced starts at login**: a systemd user unit
+  (`backline-surfaced.service`), installed enabled, so a surface works with
+  nothing to set up. D-Bus activation goes through it. To turn it off:
+  `systemctl --user mask backline-surfaced`.
+
+### Packaging
+
+- `backline-surfaced` links avahi-client when it is found (Arch `avahi`,
+  Debian `libavahi-client-dev`). Without it, network surfaces still work by
+  invitation or address, with no mDNS. The next PKGBUILD should list `avahi`.
 
 
 ## 0.4.0 (2026-11-12)
