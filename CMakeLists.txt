@@ -177,6 +177,8 @@ if(BUILD_TESTING)
   add_executable(test_rec_cues tests/unit/test_rec_cues.c)
   target_link_libraries(test_rec_cues PRIVATE bl_rec_engine)
   add_test(NAME rec_cues COMMAND test_rec_cues)
+  add_executable(test_midi_follow tests/unit/test_midi_follow.c)
+  add_test(NAME midi_follow COMMAND test_midi_follow)
   # LD_PRELOAD shim for the slow-disk proof (tests/recorderd-proof).
   add_library(slowdisk MODULE tests/tools/slowdisk.c)
   set_target_properties(slowdisk PROPERTIES PREFIX "")

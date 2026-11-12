@@ -60,6 +60,7 @@
 #include <systemd/sd-bus.h>
 
 #include "../common/bl_graph.h"
+#include "../common/bl_midi.h"
 #include "osc.h"
 #include "plugin.h"
 #include "spsc.h"
@@ -725,6 +726,14 @@ void on_housekeeping(void *, uint64_t)
 }
 
 // ---------------------------------------------------------------- linking
+// A MIDI source "follow" may link: a controller, never Backline's own nodes,
+// Midi Through or an app's MIDI output (common/bl_midi.h).
+bool midi_controller(bl_graph *g, const bl_port *p)
+{
+    const bl_node *n = bl_graph_node(g, p->node_id);
+    return n && bl_midi_is_controller(n->media_class, p->node_name, p->name, p->alias);
+}
+
 int reconcile_port(void *, const bl_port *p)
 {
     Worker *w = W;
@@ -736,8 +745,9 @@ int reconcile_port(void *, const bl_port *p)
             w->midi_port_id = p->id;
         return 0;
     }
-    // MIDI follow: any MIDI source that matches (hotplugged keyboards too).
-    if (w->midi_re && p->midi && p->output && w->midi_port_id != SPA_ID_INVALID) {
+    // MIDI follow: any MIDI controller that matches (hotplugged keyboards too).
+    if (w->midi_re && p->midi && p->output && w->midi_port_id != SPA_ID_INVALID &&
+        midi_controller(w->graph, p)) {
         std::string hay = std::string(p->node_name) + ":" + p->name + " | " + p->alias;
         if (std::regex_search(hay, *w->midi_re) && !bl_graph_is_linked(w->graph, p->id, w->midi_port_id)) {
             LOG("midi-follow: linking %s\n", hay.c_str());

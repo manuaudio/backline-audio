@@ -15,7 +15,9 @@ export HOME=$scratch/home XDG_STATE_HOME=$scratch/home/.local/state XDG_CONFIG_H
 export PATH="$stubs:$ROOT/bin:$PATH" LOG=$scratch/log
 unset BACKLINE_BIN BACKLINE_MIDI_ALL_MATCH BACKLINE_MIDI_FILTER BACKLINE_INSTRUMENT_TARGET BACKLINE_NODE_FILTER
 
-# A graph with a USB keyboard, Midi Through and a running instrument's MIDI port.
+# A graph with a USB keyboard, Midi Through, a running instrument's MIDI port,
+# Backline's clock (a JACK client with an MTC output, no media.class) and an
+# app's MIDI clock output.
 cat >"$scratch/pw-dump.json" <<'JSON'
 [
   {"id": 30, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "Midi-Bridge", "media.class": "Midi/Bridge"}}},
@@ -23,7 +25,11 @@ cat >"$scratch/pw-dump.json" <<'JSON'
   {"id": 32, "type": "PipeWire:Interface:Port", "info": {"direction": "output", "props": {"node.id": 30, "port.name": "KeyStep 37: KeyStep 37 MIDI 1 (capture)", "port.alias": "KeyStep 37:KeyStep 37 MIDI 1", "format.dsp": "8 bit raw midi"}}},
   {"id": 40, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "backline.surge", "media.class": "Stream/Output/Audio"}}},
   {"id": 41, "type": "PipeWire:Interface:Port", "info": {"direction": "output", "props": {"node.id": 40, "port.name": "midi_out", "format.dsp": "8 bit raw midi"}}},
-  {"id": 50, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "alsa_input.usb-mic", "media.class": "Audio/Source"}}}
+  {"id": 50, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "alsa_input.usb-mic", "media.class": "Audio/Source"}}},
+  {"id": 60, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "backline.clock", "client.api": "jack"}}},
+  {"id": 61, "type": "PipeWire:Interface:Port", "info": {"direction": "output", "props": {"node.id": 60, "port.name": "mtc_out", "port.alias": "backline.clock:mtc_out", "format.dsp": "8 bit raw midi"}}},
+  {"id": 70, "type": "PipeWire:Interface:Node", "info": {"props": {"node.name": "seq24", "client.api": "jack"}}},
+  {"id": 71, "type": "PipeWire:Interface:Port", "info": {"direction": "output", "props": {"node.id": 70, "port.name": "clock out", "port.alias": "seq24:clock out", "format.dsp": "8 bit raw midi"}}}
 ]
 JSON
 printf '#!/bin/bash\ncat "%s/pw-dump.json"\n' "$scratch" >"$stubs/pw-dump"
@@ -73,7 +79,7 @@ pass "every command has #!/bin/bash and omarchy:summary metadata"
 inputs=$(bash -c "source '$ROOT/lib/omarchy-backline.sh'; bl_midi_inputs")
 [[ $(jq -r '.[0].all' <<<"$inputs") == "true" ]] || fail "the first MIDI choice is every keyboard" "$inputs"
 [[ $(jq -r '[.[].label] | join("|")' <<<"$inputs") == "|KeyStep 37 MIDI 1" ]] ||
-  fail "Midi Through and Backline's own ports are not offered; a port named after its device reads as the port" "$inputs"
+  fail "only controllers are offered (not Midi Through, Backline's own ports or its clock, or an app's MIDI out); a port named after its device reads as the port" "$inputs"
 match=$(jq -r '.[1].match' <<<"$inputs")
 node -e '
 const [match, all] = process.argv.slice(1)

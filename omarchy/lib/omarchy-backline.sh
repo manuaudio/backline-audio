@@ -70,21 +70,26 @@ bl_ensure_host() {
   return 1
 }
 
-# MIDI sources as JSON rows {label, match}: first "every keyboard" (every
-# hardware MIDI output except Midi Through), then each source. `match` is the
-# regex the plugin worker's --midi-follow tests against
-# "<node.name>:<port.name> | <port.alias>".
+# MIDI sources as JSON rows {label, match}: first "every keyboard", then each
+# source. `match` is the regex the plugin worker's --midi-follow tests against
+# "<node.name>:<port.name> | <port.alias>". Both list MIDI controllers only,
+# the rule the worker itself applies (common/bl_midi.h): a port on a MIDI
+# device node (media.class Midi/...), never Midi Through, never one of
+# Backline's own nodes (the clock's MTC output), never an app's MIDI output.
 bl_midi_inputs() {
   pw-dump 2>/dev/null | jq -c '
     def esc: gsub("(?<c>[.^$|()\\[\\]{}*+?\\\\])"; "\\\(.c)");
-    [.[] | select(.type == "PipeWire:Interface:Node") | {key: (.id | tostring), value: .info.props["node.name"]}] as $nodes
-    | ($nodes | from_entries) as $names
+    [.[] | select(.type == "PipeWire:Interface:Node") | {key: (.id | tostring), value: .info.props}] as $nodes
+    | ($nodes | from_entries) as $props
     | [.[] | select(.type == "PipeWire:Interface:Port")
         | select(.info.direction == "output")
         | select((.info.props["format.dsp"] // "") | test("midi|UMP"))
-        | {node: ($names[(.info.props["node.id"] | tostring)] // ""), port: .info.props["port.name"], alias: (.info.props["port.alias"] // .info.props["port.name"])}
+        | ($props[(.info.props["node.id"] | tostring)] // {}) as $n
+        | {node: ($n["node.name"] // ""), class: ($n["media.class"] // ""), port: .info.props["port.name"], alias: (.info.props["port.alias"] // .info.props["port.name"])}
+        | select(.class | startswith("Midi/"))
         | select(.node != "" and (.node | startswith("backline") | not))
-        | select((.alias | test("Midi Through")) | not)
+        | select((.alias | startswith("backline.") or startswith("backline:")) | not)
+        | select((.alias + " " + .port) | test("Midi Through") | not)
         | select($filter == "" or (.alias | test($filter)))
         | (.alias | split(":")) as $a
         | {label: (if ($a | length) < 2 then .alias elif ($a[1:] | join(":") | startswith($a[0])) then ($a[1:] | join(":")) else $a[0] + " · " + ($a[1:] | join(":")) end),
