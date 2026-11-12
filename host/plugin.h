@@ -50,9 +50,34 @@ struct ParamEv {
     double value;               // adapter units (see PluginInstance::prepare_set)
 };
 
+// The shared transport for one cycle, from PipeWire's position segment (the
+// one backline-clockd owns; any JACK timebase master works the same way).
+// Everything describes the cycle's first frame. Beats are the meter's own
+// beats (a 7/8 bar has 7 of them); adapters convert to what their format
+// wants (VST3 and CLAP: quarter notes).
+struct Transport {
+    bool valid = false;         // a segment with a position
+    bool rolling = false;
+    bool bar_valid = false;     // bpm, beat and signature below are set
+    bool changed = true;        // not the continuation of the previous cycle (start, stop, locate, tempo or meter)
+    int64_t frame = 0;          // transport position in frames
+    uint32_t rate = 48000;
+    double bpm = 120;           // beats (of sig_den) per minute
+    double beat = 0;            // beats since the transport's beat 0
+    double bar_start = 0;       // beat at which the current bar starts
+    int32_t bar = 0;            // 0-based bar of `beat`
+    double sig_num = 4, sig_den = 4;
+    uint64_t nsec = 0;          // the cycle's CLOCK_MONOTONIC time
+    // quarter notes, for formats that count in them
+    double qn() const { return beat * 4.0 / sig_den; }
+    double qn_bar_start() const { return bar_start * 4.0 / sig_den; }
+    double qn_tempo() const { return bpm * 4.0 / sig_den; }
+};
+
 struct ProcessArgs {
     uint32_t frames;
     int64_t steady;             // frames processed since start
+    const Transport *transport; // never null
     float *const *const *ins;   // ins[bus][channel], never null (zeros when unlinked)
     float *const *const *outs;  // outs[bus][channel], never null
     const ParamEv *params;

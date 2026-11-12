@@ -278,6 +278,20 @@ effect-insert component.
     LV2 fixes the rate at instantiation, so a rate change re-instantiates
     and carries the state over. For in-graph LV2 effects, PipeWire's own
     filter-chain is already the answer.
+- **Transport** (built, §4.10). Every cycle the worker reads the shared
+  transport from `spa_io_position` (the segment backline-clockd owns, or
+  any JACK timebase master's): rolling, frame, tempo, meter and the beat at
+  the cycle's first frame (`host/transport.h`). Each format gets it its own
+  way: CLAP `clap_process.transport` (beats and tempo in quarter notes,
+  seconds, bar start and number, signature, `IS_PLAYING`), VST3
+  `ProcessContext` (`projectTimeSamples`, `projectTimeMusic`,
+  `barPositionMusic` in quarter notes, tempo, signature, `kPlaying`,
+  `systemTime`), LV2 a `time:Position` object (frame, speed, bar,
+  barBeat, beat, beatUnit, beatsPerBar, beatsPerMinute) on every atom input
+  that `atom:supports time:Position`, sent when the transport starts,
+  stops, locates or changes tempo or meter, as jalv does. Without a segment
+  owner, CLAP and VST3 get the frame and the rolling state only (no tempo
+  flags) and LV2 gets frame and speed.
 - **GUIs.** Later. The worker opens the plugin's own window (CLAP `gui`,
   X11/XWayland today, Wayland when CLAP and VST3 settle), on request from
   hostd.
@@ -442,7 +456,25 @@ effect-insert component.
   - clockd becomes the **segment owner and JACK timebase master**. Ardour,
     Bitwig, the Backline worker (as CLAP `transport`) and every other
     JACK/PipeWire client then follow one transport without new APIs.
-  - The worker's TODO, `clap_process.transport`, is filled from this.
+  - The worker fills every hosted plugin's transport from it (CLAP
+    `transport`, VST3 `ProcessContext`, LV2 `time:Position`; §2.2, §4.10).
+  - **Beat to the frame.** pipewire-jack carries JACK's BBT as the bar's
+    `beat`, floored to the tick (1/1920 beat: 12.5 frames at 120 BPM), and
+    JACK's `bbt_offset` as the bar's `offset`. clockd sets `bbt_offset` to
+    the frames since that tick, so a reader gets the beat at the cycle's
+    first frame to within a frame (`bar.beat + offset × bpm / 60 / rate`).
+    pipewire-jack writes `bar.beat` with JACK's 1-based bar (bar 1, beat 1
+    is `beat = beats_per_bar`) and reads it back the same way; the worker
+    uses that exact inverse.
+  - **Tempo map.** Frame 0 is always bar 1, beat 1. A tempo or meter change
+    while stopped sets the song's tempo from the start; a change while
+    rolling adds a stretch at the transport's frame (the beat doesn't jump),
+    and the map keeps it, so locating back before it plays the earlier
+    tempo. (The first version kept one anchor at the last change and
+    clamped earlier beats to 0: after a tempo change, `Locate 0` froze the
+    beat until the transport passed the old anchor. §4.10 found it.) Bars
+    are counted in the current meter from beat 0, so bar numbers after a
+    meter change while rolling are not a real multi-meter map yet.
 - **Ableton Link.** It's open source (GPLv2+, or a commercial licence) and
   has Linux support. clockd embeds Link and bridges Link tempo and phase to
   the PipeWire segment both ways. Because Link is GPL, it stays inside
@@ -831,6 +863,52 @@ the graph's quantum (128) and a forced 1000:
 - No link to a non-test node at any time (a watchdog checks every 0.3 s);
   nothing left; the other nodes and the defaults unchanged.
 
+### 4.10 Transport in hosted plugins (`tests/transport-proof`)
+
+In its own network namespace, on a private bus, in a test node group, as
+§4.8. Full report: `docs/proofs/transport-proof.txt`.
+
+- **Beat-click test plugins**, one source built as CLAP, VST3 and LV2
+  (`tests/plugins/beatclick*`): a unit impulse on the first sample at or
+  after every beat the host reports. Each runs in the worker while clockd
+  plays 120 BPM 4/4 from frame 0, changes to 90 BPM, then 7/8, locates to
+  `bbt:9|1|0` while rolling, stops, locates to frame 96000 and plays again.
+  An independent native node records the plugin's output with the
+  `spa_io_position` of the same cycle, so every sample has its transport
+  frame. **All three formats: every click on the sample PipeWire's segment
+  says. Against clockd's tempo map, CLAP and VST3 are 0 samples off in every
+  stretch, LV2 0-1** (one click per quarter note for CLAP and VST3, per 1/8
+  in 7/8 for LV2; spacing exactly 24 000, 32 000 and 64 000 samples; a click
+  on the first frame after each locate to a beat). LV2's 1 is the position
+  sent at a tempo change, which the plugin then counts from: that cycle's
+  beat is floored to a whole frame, which CLAP and VST3 get corrected on the
+  next cycle (the worker carries the beat forward, `host/transport.h`).
+  Without the bar's `offset` (the tick-floored beat alone), up to 7 of 12-14
+  clicks land 0-15 samples off across runs.
+- **A real tempo-synced plugin.** Odin2's arpeggiator (CLAP, VST3, LV2), one
+  held note, 120 then 90 BPM: every eighth-note step is on clockd's grid,
+  none missing, within two 128-frame cycles of spread and drift, at both
+  tempos. Odin2 plays each step early: 260-291 samples as CLAP and VST3
+  (identical in every run), 130-430 samples as LV2, varying from run to
+  run, and re-phasing by about one cycle when it gets a new position
+  mid-roll (after a missed graph cycle). With the test plugins exact, the
+  offsets are Odin2's own: they scale with the block size (about 1 540
+  samples at quantum 2048). It also plays the first step at note-on while
+  the transport is stopped, then waits for it to roll.
+- **Found and fixed.** clockd's tempo anchor (§2.5, *Tempo map*): after a
+  tempo change, `Locate 0` froze the beat at 0 until the transport passed
+  the old anchor, 0.25 s more with every take. And the beat's tick floor:
+  clockd now sets `bbt_offset`.
+- Another clockd on the same machine (another proof running at the same
+  time), outside the test group, ended up under the test group's driver
+  and moved its transport during development. PipeWire schedules a node
+  without links under whichever driver is running, so concurrent proofs
+  meet. The proof now waits for a graph without other Backline test nodes,
+  forces quantum 128 on its driver, fails on any JACK client from outside
+  the group under its driver, and voids a take whose transport jumps
+  anywhere it didn't locate to. Load 3-5 from other agents, no realtime
+  priority.
+
 ## 5. Build order
 
 1. **Host supervisor and client skeleton.** *Done (§4.3).*
@@ -856,8 +934,10 @@ the graph's quantum (128) and a forced 1000:
      measured round trip; resampling in soundcheck.
 4. **Clock and transport.** *Done (§4.8)*: clockd as segment owner, LTC
    and MTC generate and chase, Link.
-   - Still open: fill CLAP `transport` in the worker from the segment; Link
-     phase against an output-latency-compensated timeline.
+   - The transport in hosted plugins *done (§4.10)*: CLAP, VST3 and LV2,
+     to the sample.
+   - Still open: Link phase against an output-latency-compensated timeline;
+     bar numbering across meter changes (a multi-meter map).
 5. **Host formats.** *VST3, LV2 and presets done (§4.5).*
    - Still open: moving the CLAP adapter onto the shared core (`cph_*`, §6),
      a VST3 run check in the registry, LV2 `patch:Parameter` parameters

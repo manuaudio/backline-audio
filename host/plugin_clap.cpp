@@ -18,6 +18,7 @@
 #include <pipewire/loop.h>
 
 #include "plugin.h"
+#include "transport.h"
 
 namespace bl {
 namespace {
@@ -48,6 +49,7 @@ public:
     std::vector<EvSlot> evs = std::vector<EvSlot>(kMaxEvents);
     uint32_t n_evs = 0;
     std::vector<clap_audio_buffer> in_bufs, out_bufs;
+    clap_event_transport transport_ev{}; // audio thread
     clap_input_events in_events{};
     clap_output_events out_events{};
 
@@ -442,7 +444,13 @@ public:
         clap_process p{};
         p.steady_time = a.steady;
         p.frames_count = a.frames;
-        p.transport = nullptr; // TODO: from the Backline clock service / spa_io_position segment
+        // The shared transport (backline-clockd's segment), every cycle.
+        if (a.transport->valid) {
+            clap_transport_from(*a.transport, transport_ev);
+            p.transport = &transport_ev;
+        } else {
+            p.transport = nullptr;
+        }
         p.audio_inputs = in_bufs.data();
         p.audio_outputs = out_bufs.data();
         p.audio_inputs_count = (uint32_t)in_bufs.size();

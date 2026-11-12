@@ -7,7 +7,7 @@
  * --observe    log the transport this node sees in spa_io_position every
  *              cycle: graph position, state, transport frame (computed from
  *              the segment as pipewire-jack does), and the segment's bar
- *   C  pos rolling frame bar_valid bpm beat sig_num sig_denom nsec
+ *   C  pos rolling frame bar_valid bpm beat sig_num sig_denom nsec bar_offset
  * --ltc-read   decode LTC on input port ltc_in with libltc:
  *   L  k start_graph_pos transport_frame_at_start rolling   (k: the frame
  *      that starts right after a decoded frame ends)
@@ -17,6 +17,9 @@
  *              from timecode TC, starting at the first cycle after SIGUSR1;
  *              SIGUSR2 jumps to --jump TC; SIGHUP stops (silence). Logs
  *   G  graph_pos_of_start start_frame_samples
+ * --tap FILE   two input ports, tap_1 and tap_2: their samples go to FILE
+ *              (float32, interleaved), one record per cycle in the log:
+ *   A  pos n transport_frame rolling dropped
  * The log is written by the main thread from a lock-free ring.
  */
 #define _GNU_SOURCE
@@ -39,14 +42,18 @@
 #include "timecode.h"
 
 #define HIST 256
+#define TAP_SIZE (1u << 23)
 
-struct rec { char kind; int64_t a, b, c, d; double e, f; int64_t g, h; uint64_t nsec; };
+struct rec { char kind; int64_t a, b, c, d; double e, f; int64_t g, h; uint64_t nsec; int64_t i; };
 
 static struct {
 	struct pw_main_loop *loop;
 	struct pw_filter *filter;
 	struct spa_hook listener;
-	void *ltc_in, *ltc_out, *mtc_in, *mtc_out;
+	void *ltc_in, *ltc_out, *mtc_in, *mtc_out, *tap[2];
+	FILE *tapf;
+	struct spa_ringbuffer tring;
+	float *tbuf;          /* TAP_SIZE floats */
 	bool observe;
 	struct tc_rate r;
 	uint32_t rate;
@@ -178,7 +185,7 @@ static void on_process(void *data, struct spa_io_position *p)
 	if (T.observe) {
 		const struct spa_io_segment_bar *bar = &p->segments[0].bar;
 		push((struct rec){ 'C', pos, roll, fr, (bar->flags & SPA_IO_SEGMENT_BAR_FLAG_VALID) != 0, bar->bpm, bar->beat,
-				   (int64_t)bar->signature_num, (int64_t)bar->signature_denom, p->clock.nsec });
+				   (int64_t)bar->signature_num, (int64_t)bar->signature_denom, p->clock.nsec, (int64_t)bar->offset });
 	}
 	/* generators */
 	if (atomic_exchange(&T.go, 0)) {
@@ -241,6 +248,22 @@ static void on_process(void *data, struct spa_io_position *p)
 	}
 	if (T.mtc_in)
 		read_mtc(n, pos);
+	if (T.tap[0]) {
+		uint32_t idx, bytes = n * 2 * sizeof(float);
+		int32_t fill = spa_ringbuffer_get_write_index(&T.tring, &idx);
+		bool drop = (uint32_t)fill + bytes > TAP_SIZE * sizeof(float) || n > 8192;
+		if (!drop) {
+			static float il[8192 * 2];
+			for (int k = 0; k < 2; k++) {
+				float *in = pw_filter_get_dsp_buffer(T.tap[k], n);
+				for (uint32_t i = 0; i < n; i++)
+					il[i * 2 + k] = in ? in[i] : 0.0f;
+			}
+			spa_ringbuffer_write_data(&T.tring, T.tbuf, TAP_SIZE * sizeof(float), idx & (TAP_SIZE * sizeof(float) - 1), il, bytes);
+			spa_ringbuffer_write_update(&T.tring, idx + bytes);
+		}
+		push((struct rec){ 'A', pos, n, fr, roll, .h = drop });
+	}
 }
 
 static const struct pw_filter_events events = { PW_VERSION_FILTER_EVENTS, .process = on_process };
@@ -253,11 +276,14 @@ static void on_drain(void *data, uint64_t exp)
 		struct rec *r = &T.recs[(idx + i) & 8191];
 		switch (r->kind) {
 		case 'C':
-			fprintf(T.log, "C %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %.6f %.9f %" PRId64 " %" PRId64 " %" PRIu64 "\n",
-				r->a, r->b, r->c, r->d, r->e, r->f, r->g, r->h, r->nsec);
+			fprintf(T.log, "C %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %.6f %.9f %" PRId64 " %" PRId64 " %" PRIu64 " %" PRId64 "\n",
+				r->a, r->b, r->c, r->d, r->e, r->f, r->g, r->h, r->nsec, r->i);
 			break;
 		case 'G':
 			fprintf(T.log, "G %" PRId64 " %" PRId64 "\n", r->a, r->b);
+			break;
+		case 'A':
+			fprintf(T.log, "A %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 "\n", r->a, r->b, r->c, r->d, r->h);
 			break;
 		default:
 			fprintf(T.log, "%c %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 "\n", r->kind, r->a, r->b, r->c, r->d);
@@ -265,6 +291,20 @@ static void on_drain(void *data, uint64_t exp)
 	}
 	spa_ringbuffer_read_update(&T.ring, idx + avail);
 	fflush(T.log);
+	if (T.tapf) {
+		uint32_t ti;
+		int32_t tav = spa_ringbuffer_get_read_index(&T.tring, &ti);
+		static float tmp[65536];
+		while (tav > 0) {
+			uint32_t chunk = SPA_MIN((uint32_t)tav, (uint32_t)sizeof(tmp));
+			spa_ringbuffer_read_data(&T.tring, T.tbuf, TAP_SIZE * sizeof(float), ti & (TAP_SIZE * sizeof(float) - 1), tmp, chunk);
+			fwrite(tmp, 1, chunk, T.tapf);
+			ti += chunk;
+			tav -= chunk;
+		}
+		spa_ringbuffer_read_update(&T.tring, ti);
+		fflush(T.tapf);
+	}
 }
 
 static void on_signal(void *data, int sig)
@@ -281,7 +321,7 @@ int main(int argc, char **argv)
 		{ "observe", no_argument, NULL, 'O' }, { "ltc-read", no_argument, NULL, 'l' },
 		{ "mtc-read", no_argument, NULL, 'm' }, { "ltc-gen", required_argument, NULL, 'L' },
 		{ "mtc-gen", required_argument, NULL, 'M' }, { "jump", required_argument, NULL, 'j' },
-		{ "fps", required_argument, NULL, 'f' }, { NULL, 0, NULL, 0 },
+		{ "fps", required_argument, NULL, 'f' }, { "tap", required_argument, NULL, 't' }, { NULL, 0, NULL, 0 },
 	};
 	const char *name = "backline-test.timecode", *logp = "/dev/stdout", *gen = NULL, *jump = "02:00:00:00";
 	bool lr = false, mr = false, lg = false, mg = false;
@@ -298,6 +338,11 @@ int main(int argc, char **argv)
 		case 'M': mg = true; gen = optarg; break;
 		case 'j': jump = optarg; break;
 		case 'f': fps = atof(optarg); break;
+		case 't':
+			T.tapf = fopen(optarg, "wb");
+			if (!T.tapf)
+				return 1;
+			break;
 		default: return 2;
 		}
 	}
@@ -330,6 +375,12 @@ int main(int argc, char **argv)
 	if (lg) ADD(T.ltc_out, PW_DIRECTION_OUTPUT, "32 bit float mono audio", "ltc_out");
 	if (mr) ADD(T.mtc_in, PW_DIRECTION_INPUT, "8 bit raw midi", "mtc_in");
 	if (mg) ADD(T.mtc_out, PW_DIRECTION_OUTPUT, "8 bit raw midi", "mtc_out");
+	if (T.tapf) {
+		T.tbuf = calloc(TAP_SIZE, sizeof(float));
+		spa_ringbuffer_init(&T.tring);
+		ADD(T.tap[0], PW_DIRECTION_INPUT, "32 bit float mono audio", "tap_1");
+		ADD(T.tap[1], PW_DIRECTION_INPUT, "32 bit float mono audio", "tap_2");
+	}
 	/* an always-present dummy port keeps an observe-only node schedulable */
 	void *dummy = NULL;
 	ADD(dummy, PW_DIRECTION_INPUT, "32 bit float mono audio", "in");
@@ -345,5 +396,7 @@ int main(int argc, char **argv)
 	pw_context_destroy(ctx);
 	pw_main_loop_destroy(T.loop);
 	fclose(T.log);
+	if (T.tapf)
+		fclose(T.tapf);
 	return 0;
 }

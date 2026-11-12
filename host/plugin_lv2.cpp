@@ -23,6 +23,7 @@
 
 #include <lilv/lilv.h>
 #include <lv2/atom/atom.h>
+#include <lv2/atom/forge.h>
 #include <lv2/atom/util.h>
 #include <lv2/buf-size/buf-size.h>
 #include <lv2/core/lv2.h>
@@ -34,6 +35,7 @@
 #include <lv2/presets/presets.h>
 #include <lv2/resize-port/resize-port.h>
 #include <lv2/state/state.h>
+#include <lv2/time/time.h>
 #include <lv2/urid/urid.h>
 #include <lv2/worker/worker.h>
 
@@ -68,6 +70,7 @@ struct Port {
     float value = 0;                    // control: what the plugin reads (audio thread writes)
     std::atomic<float> mirror{0};       // control input: main thread's copy (state save)
     bool midi = false;                  // atom input that takes MIDI
+    bool time = false;                  // atom input that supports time:Position
     bool freewheel = false;             // control input designated lv2:freeWheeling
     std::vector<uint64_t> atom;         // atom buffer (8-byte aligned)
     uint32_t atom_size = 0;             // bytes
@@ -91,6 +94,13 @@ public:
     LV2_URID_Unmap unmap{this, unmap_uri};
     LV2_URID u_atom_Sequence, u_atom_Chunk, u_atom_Float, u_atom_Double, u_atom_Int, u_atom_Long, u_atom_Bool,
         u_midi_Event, u_min_block, u_max_block, u_nominal_block, u_seq_size, u_sample_rate, u_frame_time;
+    LV2_URID u_time_Position, u_time_frame, u_time_speed, u_time_bar, u_time_barBeat, u_time_beat, u_time_beatUnit,
+        u_time_beatsPerBar, u_time_beatsPerMinute;
+    // The transport, as time:Position objects to the ports that take them,
+    // whenever it changes (start, stop, locate, tempo, meter), as jalv does.
+    LV2_Atom_Forge forge{};             // audio thread (initialised at load)
+    bool time_ports = false;
+    bool send_position = true;          // audio thread: the next cycle sends one
 
     // features
     LV2_Log_Log log_feature{this, log_printf, log_vprintf};
@@ -337,6 +347,7 @@ public:
         }
         lilv_instance_activate(instance);
         active = true;
+        send_position = true;   // the audio thread isn't running yet
         return true;
     }
 
@@ -497,6 +508,37 @@ public:
         seq->body.pad = 0;
     }
 
+    // A time:Position at frame 0 of the (just reset, empty) sequence. Units
+    // are LV2's own: beats of time:beatUnit.
+    void write_position(Port &p, const Transport &t)
+    {
+        lv2_atom_forge_set_buffer(&forge, reinterpret_cast<uint8_t *>(p.atom.data()), p.atom_size);
+        LV2_Atom_Forge_Frame seq, obj;
+        lv2_atom_forge_sequence_head(&forge, &seq, u_frame_time);
+        lv2_atom_forge_frame_time(&forge, 0);
+        lv2_atom_forge_object(&forge, &obj, 0, u_time_Position);
+        lv2_atom_forge_key(&forge, u_time_frame);
+        lv2_atom_forge_long(&forge, t.frame);
+        lv2_atom_forge_key(&forge, u_time_speed);
+        lv2_atom_forge_float(&forge, t.rolling ? 1.0f : 0.0f);
+        if (t.bar_valid) {
+            lv2_atom_forge_key(&forge, u_time_bar);
+            lv2_atom_forge_long(&forge, t.bar);
+            lv2_atom_forge_key(&forge, u_time_barBeat);
+            lv2_atom_forge_float(&forge, (float)(t.beat - t.bar_start));
+            lv2_atom_forge_key(&forge, u_time_beat);
+            lv2_atom_forge_double(&forge, t.beat);
+            lv2_atom_forge_key(&forge, u_time_beatUnit);
+            lv2_atom_forge_int(&forge, (int32_t)std::lround(t.sig_den));
+            lv2_atom_forge_key(&forge, u_time_beatsPerBar);
+            lv2_atom_forge_float(&forge, (float)t.sig_num);
+            lv2_atom_forge_key(&forge, u_time_beatsPerMinute);
+            lv2_atom_forge_float(&forge, (float)t.bpm);
+        }
+        lv2_atom_forge_pop(&forge, &obj);
+        lv2_atom_forge_pop(&forge, &seq);   // the buffer (>= 64 KiB) always holds one object
+    }
+
     bool process(const ProcessArgs &a) override
     {
         for (uint32_t i = 0; i < a.n_params; i++)
@@ -512,6 +554,12 @@ public:
                 atom->type = u_atom_Chunk;
                 atom->size = p.atom_size - sizeof(LV2_Atom);
             }
+        }
+        if (time_ports && (send_position || a.transport->changed)) {
+            send_position = false;
+            for (auto &pp : ports)
+                if (pp->kind == Port::Atom && pp->input && pp->time)
+                    write_position(*pp, *a.transport);
         }
         if (midi_port) {
             auto *seq = reinterpret_cast<LV2_Atom_Sequence *>(midi_port->atom.data());
@@ -557,7 +605,8 @@ public:
                  *n_min_size = lilv_new_uri(world, LV2_RESIZE_PORT__minimumSize),
                  *n_optional = lilv_new_uri(world, LV2_CORE__connectionOptional),
                  *n_group = lilv_new_uri(world, "http://lv2plug.in/ns/ext/port-groups#group"),
-                 *n_designation = lilv_new_uri(world, LV2_CORE__designation);
+                 *n_designation = lilv_new_uri(world, LV2_CORE__designation),
+                 *n_time = lilv_new_uri(world, LV2_TIME__Position);
         // audio ports go into buses by port group (pg:group), in order of
         // first appearance; ungrouped ports share one bus per direction
         std::vector<std::string> in_keys, out_keys;
@@ -605,6 +654,10 @@ public:
                 }
                 p->atom_size = sz;
                 p->atom.assign((sz + 7) / 8, 0);
+                if (p->input && lilv_port_supports_event(plugin, lp, n_time)) {
+                    p->time = true;
+                    time_ports = true;
+                }
                 if (p->input && lilv_port_supports_event(plugin, lp, n_midi) && !midi_port) {
                     p->midi = true;
                     midi_port = p.get();
@@ -620,7 +673,7 @@ public:
             }
             ports.push_back(std::move(p));
         }
-        for (LilvNode *x : {n_audio, n_control, n_input, n_atom, n_cv, n_midi, n_min_size, n_optional, n_group, n_designation})
+        for (LilvNode *x : {n_audio, n_control, n_input, n_atom, n_cv, n_midi, n_min_size, n_optional, n_group, n_designation, n_time})
             lilv_node_free(x);
         for (size_t b = 0; b < audio_in.size(); b++)
             inputs.push_back({in_keys[b], (uint32_t)audio_in[b].size()});
@@ -795,6 +848,16 @@ std::unique_ptr<PluginInstance> load_lv2(Host *h, const std::string &arg, const 
     I->u_seq_size = I->m(LV2_BUF_SIZE__sequenceSize);
     I->u_sample_rate = I->m(LV2_PARAMETERS__sampleRate);
     I->u_frame_time = I->m(LV2_ATOM__frameTime);
+    I->u_time_Position = I->m(LV2_TIME__Position);
+    I->u_time_frame = I->m(LV2_TIME__frame);
+    I->u_time_speed = I->m(LV2_TIME__speed);
+    I->u_time_bar = I->m(LV2_TIME__bar);
+    I->u_time_barBeat = I->m(LV2_TIME__barBeat);
+    I->u_time_beat = I->m(LV2_TIME__beat);
+    I->u_time_beatUnit = I->m(LV2_TIME__beatUnit);
+    I->u_time_beatsPerBar = I->m(LV2_TIME__beatsPerBar);
+    I->u_time_beatsPerMinute = I->m(LV2_TIME__beatsPerMinute);
+    lv2_atom_forge_init(&I->forge, &I->map);
 
     std::string err;
     if (!I->setup_ports(&err))

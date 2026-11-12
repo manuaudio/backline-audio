@@ -183,6 +183,46 @@ if(BUILD_TESTING)
   add_executable(rf64check tests/tools/rf64check.c)
   target_link_libraries(rf64check PRIVATE PkgConfig::SNDFILE m)
   target_link_libraries(slowdisk PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  # The transport into plugins: position math and CLAP conversion.
+  add_executable(test_transport tests/unit/test_transport.cpp)
+  target_include_directories(test_transport PRIVATE host third_party/clap/include)
+  target_link_libraries(test_transport PRIVATE PkgConfig::PIPEWIRE)
+  add_test(NAME transport COMMAND test_transport)
+  # Beat-click test plugins for tests/transport-proof: they click on every
+  # beat of the host transport (tests/plugins/beatclick.h).
+  add_library(backline-test-beatclick-clap MODULE tests/plugins/beatclick-clap.c)
+  target_include_directories(backline-test-beatclick-clap PRIVATE third_party/clap/include)
+  target_link_libraries(backline-test-beatclick-clap PRIVATE m)
+  set_target_properties(backline-test-beatclick-clap PROPERTIES PREFIX "" OUTPUT_NAME backline-test-beatclick SUFFIX ".clap"
+    C_VISIBILITY_PRESET hidden LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/transport-plugins)
+  if(BACKLINE_LV2)
+    set(_bc ${CMAKE_BINARY_DIR}/transport-plugins/lv2/backline-test-beatclick.lv2)
+    add_library(backline-test-beatclick-lv2 MODULE tests/plugins/beatclick-lv2.c)
+    target_include_directories(backline-test-beatclick-lv2 PRIVATE ${LILV_INCLUDE_DIRS})
+    target_link_libraries(backline-test-beatclick-lv2 PRIVATE m)
+    set_target_properties(backline-test-beatclick-lv2 PROPERTIES PREFIX "" OUTPUT_NAME backline-test-beatclick
+      C_VISIBILITY_PRESET hidden LIBRARY_OUTPUT_DIRECTORY ${_bc})
+    configure_file(tests/plugins/beatclick.lv2/manifest.ttl.in ${_bc}/manifest.ttl @ONLY)
+    configure_file(tests/plugins/beatclick.lv2/beatclick.ttl ${_bc}/beatclick.ttl COPYONLY)
+  endif()
+  if(BACKLINE_VST3)
+    set(_s ${BACKLINE_VST3SDK_DIR})
+    add_library(backline-test-beatclick-vst3 MODULE tests/plugins/beatclick-vst3.cpp
+      ${_s}/public.sdk/source/main/pluginfactory.cpp
+      ${_s}/public.sdk/source/main/linuxmain.cpp
+      ${_s}/public.sdk/source/vst/vstsinglecomponenteffect.cpp
+      ${_s}/public.sdk/source/vst/vstcomponentbase.cpp
+      ${_s}/public.sdk/source/vst/vstbus.cpp
+      ${_s}/public.sdk/source/vst/vstparameters.cpp
+      ${_s}/public.sdk/source/common/pluginview.cpp
+      ${_s}/public.sdk/source/common/commoniids.cpp)
+    target_include_directories(backline-test-beatclick-vst3 PRIVATE tests/plugins)
+    target_compile_options(backline-test-beatclick-vst3 PRIVATE -w)
+    target_link_libraries(backline-test-beatclick-vst3 PRIVATE bl_vst3sdk)
+    set_target_properties(backline-test-beatclick-vst3 PROPERTIES PREFIX "" OUTPUT_NAME backline-test-beatclick
+      CXX_VISIBILITY_PRESET hidden
+      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/transport-plugins/backline-test-beatclick.vst3/Contents/${CMAKE_SYSTEM_PROCESSOR}-linux)
+  endif()
 endif()
 
 # Clock service: transport, tempo, LTC/MTC, Ableton Link (clock/).

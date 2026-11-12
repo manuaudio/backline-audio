@@ -1,0 +1,79 @@
+== transport-proof 2026-11-12T01:07:41-08:00
+machine: 7.2.5-3-omarchy, PipeWire 1.6.8
+1.6.8, load 4.06 3.49 3.78
+default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
+clockd: backline-clockd: backline.clock at 48000 Hz, OSC 127.0.0.1:53009, Link available
+
+-- 1. beat-click test plugins: clicks against PipeWire's segment and clockd's tempo map
+   sequence: 120 BPM 4/4 from frame 0, play 2 s; tempo 90, 1.5 s; meter 7/8, 1.5 s; locate bbt:9|1|0 rolling, 1.5 s;
+   stop; locate 96000 stopped; play 1 s; stop
+  [beat-clap] loaded Backline Test Beat Click (clap, backline.test.beatclick) from /home/ai/Developer-lab/backline-wt-transp
+  [beat-clap] located bbt:9|1|0 -> frame 1760000
+  [clap] 3344 cycles tapped (0 dropped, 0 without an observer line), 12 clicks
+  [clap] 1. clicks where the segment's beat says, sample for sample: 12 of 12 expected, 0 unexpected
+  [clap] 2. 120 BPM 4/4, frames 0-96256: 5 clicks, one per quarter note (24000.0 samples); starts on beat 0: click on its first frame yes; vs the tempo map: error min 0 max 0 samples; spacing 24000-24000
+  [clap] 2. 90 BPM 4/4, frames 96256-168320: 2 clicks, one per quarter note (32000.0 samples); vs the tempo map: error min 0 max 0 samples; spacing 32000-32000
+  [clap] 2. 90 BPM 7/8, frames 168320-240512: 1 clicks, one per quarter note (64000.0 samples); vs the tempo map: error min 0 max 0 samples; spacing 0-0
+  [clap] 2. 90 BPM 7/8, frames 1760000-1832064: 2 clicks, one per quarter note (64000.0 samples); starts on beat 28: click on its first frame yes; vs the tempo map: error min 0 max 0 samples; spacing 64000-64000
+  [clap] 2. 90 BPM 4/4, frames 96000-144128: 2 clicks, one per quarter note (32000.0 samples); starts on beat 4: click on its first frame yes; vs the tempo map: error min 0 max 0 samples; spacing 32000-32000
+  [clap] 3. without bar.offset (tick-floored beat only): 10 of 12 clicks on the same sample; the rest 0-11 samples off
+  [clap] the plugin's own beat output vs the segment's per-cycle beat (floored to whole frames): worst 1.053 samples
+  [clap] RESULT: PASS (the plugin clicks on clockd's beats, to the sample)
+  [beat-vst3] loaded Backline Test Beat Click (vst3, 42AC11A16B6C4E2A9B1E7C3D5F0A2B44) from /home/ai/Developer-lab/backline-
+  [beat-vst3] located bbt:9|1|0 -> frame 1760000
+  [vst3] 3322 cycles tapped (0 dropped, 0 without an observer line), 12 clicks
+  [vst3] 1. clicks where the segment's beat says, sample for sample: 12 of 12 expected, 0 unexpected
+  [vst3] 2. 120 BPM 4/4, frames 0-96256: 5 clicks, one per quarter note (24000.0 samples); starts on beat 0: click on its first frame yes; vs the tempo map: error min 0 max 0 samples; spacing 24000-24000
+  [vst3] 2. 90 BPM 4/4, frames 96256-168448: 2 clicks, one per quarter note (32000.0 samples); vs the tempo map: error min 0 max 0 samples; spacing 32000-32000
+  [vst3] 2. 90 BPM 7/8, frames 168448-240512: 1 clicks, one per quarter note (64000.0 samples); vs the tempo map: error min 0 max 0 samples; spacing 0-0
+  [vst3] 2. 90 BPM 7/8, frames 1760000-1832064: 2 clicks, one per quarter note (64000.0 samples); starts on beat 28: click on its first frame yes; vs the tempo map: error min 0 max 0 samples; spacing 64000-64000
+  [vst3] 2. 90 BPM 4/4, frames 96000-144000: 2 clicks, one per quarter note (32000.0 samples); starts on beat 4: click on its first frame yes; vs the tempo map: error min 0 max 0 samples; spacing 32000-32000
+  [vst3] 3. without bar.offset (tick-floored beat only): 10 of 12 clicks on the same sample; the rest 0-11 samples off
+  [vst3] the plugin's own beat output vs the segment's per-cycle beat (floored to whole frames): worst 1.059 samples
+  [vst3] RESULT: PASS (the plugin clicks on clockd's beats, to the sample)
+  [beat-lv2] loaded Backline Test Beat Click (lv2, https://github.com/manuaudio/backline-audio/test/beatclick) from /home/a
+  [beat-lv2] located bbt:9|1|0 -> frame 1760043
+  [lv2] 3344 cycles tapped (0 dropped, 0 without an observer line), 14 clicks
+  [lv2] 1. clicks where the segment's beat says, sample for sample: 14 of 14 expected, 0 unexpected
+  [lv2] 2. 120 BPM 4/4, frames 0-96128: 5 clicks, one per 1/4 note (24000.0 samples); starts on beat 0: click on its first frame yes; vs the tempo map: error min 0 max 0 samples; spacing 24000-24000
+  [lv2] 2. 90 BPM 4/4, frames 96128-168320: 2 clicks, one per 1/4 note (32000.0 samples); vs the tempo map: error min 1 max 1 samples; spacing 32000-32000
+  [lv2] 2. 90 BPM 7/8, frames 168320-240384: 2 clicks, one per 1/8 note (32000.0 samples); vs the tempo map: error min 1 max 1 samples; spacing 32000-32000
+  [lv2] 2. 90 BPM 7/8, frames 1760043-1832107: 3 clicks, one per 1/8 note (32000.0 samples); vs the tempo map: error min 0 max 0 samples; spacing 32000-32000
+  [lv2] 2. 90 BPM 4/4, frames 96000-144128: 2 clicks, one per 1/4 note (32000.0 samples); vs the tempo map: error min 0 max 0 samples; spacing 32000-32000
+  [lv2] 3. without bar.offset (tick-floored beat only): 8 of 14 clicks on the same sample; the rest 0-10 samples off
+  [lv2] the plugin's own beat output vs the segment's per-cycle beat (floored to whole frames): worst 1.007 samples
+  [lv2] RESULT: PASS (the plugin clicks on clockd's beats, to the sample)
+
+-- 2. a real tempo-synced plugin: Odin2's arpeggiator, one held note (A3), 120 then 90 BPM
+  [odin2-clap] loaded Odin2 (clap, com.thewavewarden.odin2) from /home/ai/.clap/Odin2.clap: 258 params, note input: midi
+  [odin2-clap] onsets while the transport was stopped (a held note, arpeggiator on): 3
+  [odin2-clap] 120 BPM: 12 onsets on 12 consecutive grid steps of 0.5 beat (12000 samples), 0 steps missing; onset - grid: mean -260.5, min -301.0, max -223.0 samples (spread 78.0)
+  [odin2-clap] 90 BPM: 9 onsets on 9 consecutive grid steps of 0.5 beat (16000 samples), 0 steps missing; onset - grid: mean -291.2, min -329.7, max -229.7 samples (spread 100.0)
+  [odin2-clap] 120 BPM: drift first -> last step +22.0 samples over 12 steps
+  [odin2-clap] 90 BPM: drift first -> last step +54.0 samples over 9 steps
+  [odin2-clap] RESULT: PASS (every step on clockd's grid at every tempo: no step missing, spread and drift within two 128-frame cycles, every onset within 1/8 step)
+  [odin2-vst3] loaded Odin2 (vst3, ABCDEF019182FAEB574157414F44494E) from /home/ai/.vst3/Odin2.vst3: 2339 params, note input:
+  [odin2-vst3] onsets while the transport was stopped (a held note, arpeggiator on): 3
+  [odin2-vst3] 120 BPM: 12 onsets on 12 consecutive grid steps of 0.5 beat (12000 samples), 0 steps missing; onset - grid: mean -260.5, min -301.0, max -223.0 samples (spread 78.0)
+  [odin2-vst3] 90 BPM: 9 onsets on 9 consecutive grid steps of 0.5 beat (16000 samples), 0 steps missing; onset - grid: mean -291.2, min -329.7, max -229.7 samples (spread 100.0)
+  [odin2-vst3] 120 BPM: drift first -> last step +22.0 samples over 12 steps
+  [odin2-vst3] 90 BPM: drift first -> last step +54.0 samples over 9 steps
+  [odin2-vst3] RESULT: PASS (every step on clockd's grid at every tempo: no step missing, spread and drift within two 128-frame cycles, every onset within 1/8 step)
+  [odin2-lv2] loaded Odin2 (lv2, https://thewavewarden.com/odin2) from /home/ai/.lv2/Odin2.lv2: 258 params, note input: atom
+  [odin2-lv2] onsets while the transport was stopped (a held note, arpeggiator on): 3
+  [odin2-lv2] 120 BPM: 12 onsets on 12 consecutive grid steps of 0.5 beat (12000 samples), 0 steps missing; onset - grid: mean -265.1, min -301.0, max -228.0 samples (spread 73.0)
+  [odin2-lv2] 90 BPM: 9 onsets on 9 consecutive grid steps of 0.5 beat (16000 samples), 0 steps missing; onset - grid: mean -301.7, min -329.7, max -256.7 samples (spread 73.0)
+  [odin2-lv2] 120 BPM: drift first -> last step +16.0 samples over 12 steps
+  [odin2-lv2] 90 BPM: drift first -> last step +46.0 samples over 9 steps
+  [odin2-lv2] RESULT: PASS (every step on clockd's grid at every tempo: no step missing, spread and drift within two 128-frame cycles, every onset within 1/8 step)
+  (Odin2 also plays the first step at note-on while the transport is stopped, then waits for it to roll)
+
+-- clean up
+JACK clients from outside the test group under its driver: 
+other nodes from outside the group that ran under its driver (not transport owners): bluez_midi.server 
+links between this proof's nodes and any other node: none
+test-group nodes left: 0
+other nodes same as at start: yes (6 nodes)
+default sink after: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} (unchanged); default source unchanged; moved during the run: never
+
+== ALL PASS

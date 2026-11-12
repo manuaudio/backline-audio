@@ -10,6 +10,7 @@
 // only non-audio threads take, then handled on main.
 
 #include <algorithm>
+#include <cmath>
 #include <cerrno>
 #include <cstring>
 #include <dirent.h>
@@ -557,13 +558,30 @@ public:
             out_bb[b].silenceFlags = 0;
             out_bb[b].channelBuffers32 = out_buses[b].exposed ? const_cast<float **>(a.outs[k++]) : trash_ptrs.data();
         }
-        ctx.state = ProcessContext::kTempoValid | ProcessContext::kTimeSigValid | ProcessContext::kContTimeValid;
+        // The shared transport (backline-clockd's segment). Musical positions
+        // and tempo are in quarter notes, as VST3 defines them.
+        const Transport &t = *a.transport;
+        ctx = {};
+        ctx.state = ProcessContext::kContTimeValid | ProcessContext::kSystemTimeValid;
         ctx.sampleRate = rate;
-        ctx.projectTimeSamples = a.steady;
         ctx.continousTimeSamples = a.steady;
-        ctx.tempo = 120;
-        ctx.timeSigNumerator = 4;
-        ctx.timeSigDenominator = 4;
+        ctx.systemTime = (int64)t.nsec;
+        ctx.projectTimeSamples = t.valid ? t.frame : a.steady;
+        if (t.rolling)
+            ctx.state |= ProcessContext::kPlaying;
+        if (t.bar_valid) {
+            ctx.state |= ProcessContext::kTempoValid | ProcessContext::kTimeSigValid |
+                         ProcessContext::kProjectTimeMusicValid | ProcessContext::kBarPositionValid;
+            ctx.tempo = t.qn_tempo();
+            ctx.projectTimeMusic = t.qn();
+            ctx.barPositionMusic = t.qn_bar_start();
+            ctx.timeSigNumerator = (int32)std::lround(t.sig_num);
+            ctx.timeSigDenominator = (int32)std::lround(t.sig_den);
+        } else {
+            ctx.tempo = 120;
+            ctx.timeSigNumerator = 4;
+            ctx.timeSigDenominator = 4;
+        }
 
         ProcessData d;
         d.processMode = kRealtime;

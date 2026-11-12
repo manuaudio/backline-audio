@@ -152,6 +152,21 @@ optional on incoming addresses.
 | `/backline/preset/list` *(0.2)* | | one `/backline/preset s id, s name, s location` per preset, then `/backline/preset/end i count` |
 | `/backline/preset/load` *(0.2)* | `s\|i key` | `/backline/preset/loaded i ok, s name-or-error` |
 
+## Transport
+
+The worker gives the plugin the shared transport every cycle, from
+PipeWire's position segment (the one
+[backline-clockd](Clock1.md) owns; any JACK timebase master works too),
+described at the cycle's first frame:
+
+| Format | What the plugin gets |
+|---|---|
+| CLAP | `clap_process.transport`: `song_pos_beats` and `tempo` in quarter notes, `song_pos_seconds`, `bar_start`, `bar_number` (0-based), `tsig_num`/`tsig_denom`, `IS_PLAYING`. Tempo and beat flags only while the segment has a bar. |
+| VST3 | `ProcessContext`: `projectTimeSamples` (the transport frame), `projectTimeMusic` and `barPositionMusic` in quarter notes, `tempo` (quarter notes per minute), `timeSigNumerator`/`Denominator`, `kPlaying`, `systemTime`, `continousTimeSamples` (frames processed). |
+| LV2 | A `time:Position` object at frame 0 on every atom input that `atom:supports time:Position`: `frame`, `speed` (1 or 0), `bar` (0-based), `barBeat`, `beat`, `beatUnit`, `beatsPerBar`, `beatsPerMinute`, in the meter's own beats. Sent when the transport starts, stops, locates, or changes tempo or meter, and after activation; between them the plugin counts. |
+
+The beat is exact to the frame (measured: `tests/transport-proof`).
+
 ## The node
 
 The worker's node carries `media.class` `Stream/Output/Audio` for
