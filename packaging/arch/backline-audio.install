@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+post_install() {
+  echo ':: To keep the plugin index current as plugins come and go, each user can run:'
+  echo '     systemctl --user enable --now backline-registry-rescan.path'
+}
+post_upgrade() {
+  :
+}

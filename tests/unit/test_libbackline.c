@@ -25,7 +25,9 @@ int main(void)
 	char small[10];
 	bl_bus_name_for_node("backline.synth", small, sizeof(small));
 	CHECK(strlen(small) == 9);
-	CHECK(!strcmp(bl_version(), "0.2.0"));
+	char want[32];
+	snprintf(want, sizeof(want), "%d.%d.%d", BACKLINE_VERSION_MAJOR, BACKLINE_VERSION_MINOR, BACKLINE_VERSION_MICRO);
+	CHECK(!strcmp(bl_version(), want));   /* the library and its header agree */
 	bl_load_options o = BL_LOAD_OPTIONS_INIT;
 	CHECK(o.autoconnect == -1 && o.restart == -1 && o.id == NULL);
 	CHECK(!strcmp(bl_client_error(NULL), ""));
