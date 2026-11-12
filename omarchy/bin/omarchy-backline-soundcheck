@@ -1,0 +1,81 @@
+#!/bin/bash
+
+# omarchy:summary=Play a take in place of its inputs (virtual soundcheck)
+# omarchy:args=<toggle|start [take]|stop|input <node> <live|playback|toggle>|all <live|playback>>
+
+# Backline's recorder plays a take back on one node, every track in
+# lockstep. Each of the take's inputs can then be switched between live and
+# playback: on playback, whatever listened to that input (a mixer, a DAW, an
+# effect chain) hears the take instead. All inputs start live, and stopping
+# puts every link back as it was; the recorder also restores them after a
+# crash. `toggle` starts the newest take, or stops the one playing.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+
+fail() {
+  bl_notify -g 󰐊 "$1" "${2:-}" -u critical
+  bl_push backline.record
+  exit 1
+}
+
+newest_take() {
+  bl_call Recorder Takes | jq -r '.data[0] | fromjson | .takes[0].take // empty'
+}
+
+start() {
+  local take=${1:-} result
+  [[ -n $take ]] || take=$(newest_take)
+  [[ -n $take ]] || fail "$(bl_t soundcheck.noTakes)"
+  if ! result=$(bl_call Recorder Soundcheck "sa{sv}" "$take" 0 2>&1); then
+    fail "$(bl_t soundcheck.failed)" "$(bl_error_text "$result")"
+  fi
+}
+
+set_input() {
+  local result
+  if ! result=$(bl_call Recorder SetInput ss "$1" "$2" 2>&1); then
+    fail "$(bl_t soundcheck.failed)" "$(bl_error_text "$result")"
+  fi
+}
+
+command=${1:-}
+shift || true
+
+case $command in
+  toggle)
+    if [[ $(bl_props Recorder | jq -r '.Soundcheck // ""') != "" ]]; then
+      bl_call Recorder StopSoundcheck >/dev/null
+    else
+      start
+    fi
+    ;;
+  start) start "${1:-}" ;;
+  stop) bl_call Recorder StopSoundcheck >/dev/null ;;
+  input)
+    node=${1:-}
+    mode=${2:-toggle}
+    if [[ $mode == "toggle" ]]; then
+      current=$(bl_props Recorder | jq -r --arg n "$node" '.SoundcheckInputs[$n] // "live"')
+      if [[ $current == "live" ]]; then
+        mode=playback
+      else
+        mode=live
+      fi
+    fi
+    set_input "$node" "$mode"
+    ;;
+  all)
+    mode=${1:-playback}
+    mapfile -t inputs < <(bl_props Recorder | jq -r '.SoundcheckInputs // {} | keys[]')
+    for node in "${inputs[@]}"; do
+      set_input "$node" "$mode"
+    done
+    ;;
+  *)
+    echo "Usage: omarchy-backline-soundcheck <toggle|start [take]|stop|input <node> <live|playback|toggle>|all <live|playback>>" >&2
+    exit 1
+    ;;
+esac
+
+bl_push backline.record

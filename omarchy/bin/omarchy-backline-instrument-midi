@@ -1,0 +1,68 @@
+#!/bin/bash
+
+# omarchy:summary=Choose which MIDI keyboard plays a Backline instrument
+# omarchy:args=<id> [match]
+
+# An instrument follows the MIDI sources its --midi-follow match names, which
+# the host fixes when it starts the worker. Changing it restarts the
+# instrument with the same id, node name and sound: the current plugin state
+# is copied aside first and handed to the new worker, since unloading drops
+# the instance's own state file. Without a match it offers "every keyboard"
+# and each connected MIDI source in the Omarchy menu.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+
+id=${1:-}
+match=${2:-}
+
+if [[ -z $id ]]; then
+  echo "Usage: omarchy-backline-instrument-midi <id> [match]" >&2
+  exit 1
+fi
+
+if ! info=$(bl_call Host Get s "$id" 2>&1); then
+  bl_notify -g 󰌌 "$(bl_t instrument.notFound "$id")" "$(bl_error_text "$info")" -u critical
+  exit 1
+fi
+info=$(jq -c '.data[0] | with_entries(.value = .value.data)' <<<"$info")
+
+if [[ -z $match ]]; then
+  inputs=$(bl_midi_inputs)
+  all_label=$(bl_t midi.all)
+  mapfile -t options < <(jq -r --arg all "$all_label" '.[] | "󰌌\t\(if .all then $all else .label end)"' <<<"$inputs")
+  choice=$(omarchy-menu-select "$(bl_t midi.pick)" "${options[@]}") || exit 1
+  match=$(jq -r --arg all "$all_label" --arg c "$choice" 'map(select((if .all then $all else .label end) == $c)) | .[0].match // empty' <<<"$inputs")
+  [[ -n $match ]] || exit 1
+fi
+
+if [[ $(jq -r '.["midi-follow"]' <<<"$info") == "$match" ]]; then
+  exit 0
+fi
+
+# The state the worker saved last; it saves within a second of any change.
+saved=""
+state_file=$(jq -r '.["state-file"]' <<<"$info")
+if [[ -s $state_file ]]; then
+  saved=$(mktemp --suffix=.clapstate)
+  cp -f -- "$state_file" "$saved"
+fi
+
+options=(id s "$id" midi-follow s "$match")
+plugin_id=$(jq -r '.["plugin-id"]' <<<"$info")
+target=$(jq -r '.target' <<<"$info")
+[[ -n $plugin_id ]] && options+=(plugin-id s "$plugin_id")
+[[ -n $target ]] && options+=(target s "$target")
+[[ -n $saved ]] && options+=(state s "$saved")
+
+plugin=$(jq -r '.["plugin-path"] // .plugin' <<<"$info")
+bl_call Host Unload s "$id" >/dev/null 2>&1
+if result=$(bl_call Host Load "sa{sv}" "$plugin" $((${#options[@]} / 3)) "${options[@]}" 2>&1); then
+  status=0
+else
+  bl_notify -g 󰌌 "$(bl_t instrument.loadFailed "$id")" "$(bl_error_text "$result")" -u critical
+  status=1
+fi
+[[ -n $saved ]] && rm -f -- "$saved"
+bl_push backline.instruments
+exit $status

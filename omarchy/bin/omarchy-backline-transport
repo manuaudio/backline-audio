@@ -1,0 +1,114 @@
+#!/bin/bash
+
+# omarchy:summary=Drive Backline's system transport, tempo and timecode sync
+# omarchy:args=<toggle|play|stop|locate <pos>|tempo <bpm>|sync <internal|link|ltc|mtc>|ltc-input <node>|mtc-input <node>|fps <fps>|status>
+# omarchy:examples=omarchy backline transport sync ltc | omarchy backline transport locate tc:01:00:00:00
+
+# A front for Backline's clock (Clock1), the owner of PipeWire's timeline that
+# JACK apps, Backline instruments and every other follower read. `sync` picks
+# what moves the transport. ltc and mtc chase the input last chosen (the first
+# audio source the first time) at the remembered frame rate, so locking to
+# timecode is one step after the first time. It never touches the default
+# devices; the clock links its own ports and those links die with it.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+
+fail() {
+  bl_notify -g 󰔛 "$1" "${2:-}" -u critical
+  bl_push backline.transport
+  exit 1
+}
+
+call() {
+  local result
+  if ! result=$(bl_call Clock "$@" 2>&1); then
+    fail "$(bl_t transport.failed)" "$(bl_error_text "$result")"
+  fi
+  printf '%s\n' "$result"
+}
+
+sync_settings() {
+  bl_recall sync '{}' | jq -c '{ltc: (.ltc // ""), mtc: (.mtc // ""), fps: (.fps // 25)}'
+}
+
+# Leave whichever timecode mode is on before switching to another source.
+leave_chase() {
+  local props
+  props=$(bl_props Clock)
+  [[ $(jq -r '.LtcMode // "off"' <<<"$props") == "chase" ]] && call Ltc "sa{sv}" off 0 >/dev/null
+  [[ $(jq -r '.MtcMode // "off"' <<<"$props") == "chase" ]] && call Mtc "sa{sv}" off 0 >/dev/null
+  [[ $(jq -r '.LinkEnabled // false' <<<"$props") == "true" ]] && call Link b false >/dev/null
+  return 0
+}
+
+chase() { # ltc|mtc
+  local kind=$1 settings source fps
+  settings=$(sync_settings)
+  source=$(jq -r --arg k "$kind" '.[$k]' <<<"$settings")
+  fps=$(jq -r '.fps' <<<"$settings")
+  if [[ -z $source ]]; then
+    # The first input of the kind (BACKLINE_NODE_FILTER narrows the choice,
+    # as it narrows the panels' lists).
+    local class=Audio/Source
+    [[ $kind == "mtc" ]] && class=Midi/Bridge
+    source=$(pw-dump 2>/dev/null | jq -r --arg c "$class" --arg f "${BACKLINE_NODE_FILTER:-}" '
+      [.[] | select(.type == "PipeWire:Interface:Node") | .info.props
+        | select(.["media.class"] == $c) | .["node.name"] | select($f == "" or test($f))][0] // empty')
+    [[ -n $source ]] || fail "$(bl_t transport.noInput)"
+    bl_remember sync "$(jq -c --arg k "$kind" --arg s "$source" '.[$k] = $s' <<<"$settings")"
+  fi
+  leave_chase
+  if [[ $kind == "ltc" ]]; then
+    call Ltc "sa{sv}" chase 2 source s "$source" fps d "$fps" >/dev/null
+  else
+    call Mtc "sa{sv}" chase 2 source s "$source" fps d "$fps" >/dev/null
+  fi
+}
+
+command=${1:-}
+shift || true
+
+case $command in
+  toggle)
+    if [[ $(bl_props Clock | jq -r '.Rolling // false') == "true" ]]; then
+      call Stop >/dev/null
+    else
+      call Play >/dev/null
+    fi
+    ;;
+  play) call Play >/dev/null ;;
+  stop) call Stop >/dev/null ;;
+  locate) call Locate s "${1:-0}" | jq -r '.data[0]' ;;
+  tempo) call SetTempo d "${1:?bpm}" >/dev/null ;;
+  meter) call SetMeter dd "${1:?beats per bar}" "${2:?beat type}" >/dev/null ;;
+  sync)
+    case ${1:-} in
+      internal) leave_chase ;;
+      link) leave_chase; call Link b true >/dev/null ;;
+      ltc) chase ltc ;;
+      mtc) chase mtc ;;
+      *) echo "Usage: omarchy-backline-transport sync <internal|link|ltc|mtc>" >&2; exit 1 ;;
+    esac
+    ;;
+  ltc-input | mtc-input)
+    kind=${command%-input}
+    bl_remember sync "$(sync_settings | jq -c --arg k "$kind" --arg s "${1:?node}" '.[$k] = $s')"
+    if [[ $(bl_props Clock | jq -r --arg k "$kind" 'if $k == "ltc" then .LtcMode else .MtcMode end // "off"') == "chase" ]]; then
+      chase "$kind"
+    fi
+    ;;
+  fps)
+    bl_remember sync "$(sync_settings | jq -c --argjson f "${1:?fps}" '.fps = $f')"
+    props=$(bl_props Clock)
+    [[ $(jq -r '.LtcMode // "off"' <<<"$props") == "chase" ]] && chase ltc
+    [[ $(jq -r '.MtcMode // "off"' <<<"$props") == "chase" ]] && chase mtc
+    ;;
+  status) bl_props Clock ;;
+  *)
+    echo "Usage: omarchy-backline-transport <toggle|play|stop|locate <pos>|tempo <bpm>|meter <n> <d>|sync <internal|link|ltc|mtc>|ltc-input <node>|mtc-input <node>|fps <fps>|status>" >&2
+    exit 1
+    ;;
+esac
+
+bl_push backline.transport

@@ -1,0 +1,35 @@
+#!/bin/bash
+
+# omarchy:summary=Remove a running Backline instrument
+# omarchy:args=[id]
+
+# Stops one instrument the Backline host is running: its process, its node
+# and its links go away, and the other instruments keep playing. Without an
+# id it offers the running instruments in the Omarchy menu.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+
+id=${1:-}
+
+if ! bl_running Host; then
+  bl_notify -g 󰌌 "$(bl_t host.notRunning)" -u critical
+  exit 1
+fi
+
+if [[ -z $id ]]; then
+  mapfile -t options < <(bl_call Host List | jq -r '.data[0][] | "󰌌\t\(.id.data)\t\(.plugin.data | split("/") | last)"')
+  if ((${#options[@]} == 0)); then
+    bl_notify -g 󰌌 "$(bl_t instrument.noneRunning)"
+    exit 1
+  fi
+  choice=$(omarchy-menu-select "$(bl_t instrument.pickRemove)" "${options[@]}") || exit 1
+  id=${choice%%$'\t'*}
+fi
+
+if result=$(bl_call Host Unload s "$id" 2>&1); then
+  bl_push backline.instruments backline.record
+else
+  bl_notify -g 󰌌 "$(bl_t instrument.removeFailed "$id")" "$(bl_error_text "$result")" -u critical
+  exit 1
+fi

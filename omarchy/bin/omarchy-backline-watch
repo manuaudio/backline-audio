@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# omarchy:summary=Print one JSON line per change in Backline's services
+# omarchy:hidden=true
+
+# A panel runs this only while it is open, and reads its state again on each
+# line, so it never polls. One line per D-Bus signal from the host, the
+# instances it runs, the recorder, the clock and the registry (their own
+# signals and PropertiesChanged): {"service", "member", "args"}. The clock's
+# Transport signal (every 250 ms while rolling) and the recorder's Level
+# (about 5 Hz) come through too, for the panels that show them.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+
+busctl --user monitor --json=short \
+  --match "type='signal',path_namespace='$BL_PATH'" 2>/dev/null |
+  jq --unbuffered -c '
+    select(.type == "signal")
+    | {service: (.path | ltrimstr("/io/github/manuaudio/Backline/") | ascii_downcase),
+       member, args: (.payload.data // [])}'

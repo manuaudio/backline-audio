@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# omarchy:summary=Open the Backline mixer window, or focus it if open
+
+# The mixer is the larger window: every channel strip with its meter, the
+# transport and the takes. The panels cover the everyday jobs; this is for
+# sitting down to work. Under Hyprland it goes through omarchy-launch-or-focus
+# so a second press focuses the open window instead of starting another.
+
+set -uo pipefail
+
+mixer=${BACKLINE_MIXER:-backline-mixer}
+
+if [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]] && command -v omarchy-launch-or-focus >/dev/null; then
+  exec omarchy-launch-or-focus backline-mixer "uwsm-app -- $mixer"
+else
+  exec setsid "$mixer" "$@" >/dev/null 2>&1 </dev/null
+fi

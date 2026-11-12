@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# omarchy:summary=Play a system instrument from any MIDI keyboard
+# omarchy:args=[plugin] [--midi <match>] [--target <node>] [--force]
+# omarchy:examples=omarchy backline instrument add "Surge XT"
+
+# Loads a CLAP instrument from Backline's plugin registry into the Backline
+# host, where it runs as its own process and PipeWire node. It follows every
+# hardware MIDI keyboard (or the source --midi names, a match from
+# `omarchy-backline-state instruments`) and plays to the default output.
+# Without a plugin it offers the registry's instruments in the Omarchy menu,
+# the last one used first. A plugin can be a registry name, a CLAP id or a
+# path. It does not install plugins, and it does not change the default output.
+# An instrument the registry grades fail is refused unless --force is given,
+# because the host would refuse it too.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+
+plugin=""
+midi=""
+target=${BACKLINE_INSTRUMENT_TARGET:-}
+force=false
+while (($# > 0)); do
+  case $1 in
+    --midi) midi=${2:-}; shift 2 ;;
+    --target) target=${2:-}; shift 2 ;;
+    --force) force=true; shift ;;
+    -h | --help) echo "Usage: omarchy-backline-instrument-add [plugin] [--midi <match>] [--target <node>] [--force]"; exit 0 ;;
+    *) plugin=$1; shift ;;
+  esac
+done
+
+instruments=$(bl_backline --json plugins list --kind instrument --format clap 2>/dev/null | jq -c '.plugins // []')
+if [[ -z $instruments || $instruments == "[]" ]]; then
+  bl_notify -g 󰌌 "$(bl_t instrument.noneTitle)" "$(bl_t instrument.noneBody)" -u critical
+  exit 1
+fi
+
+last=$(bl_recall last-instrument '{}' | jq -r '.plugin // ""')
+
+if [[ -z $plugin ]]; then
+  # The last one used first, then by grade, then by name; a failing plugin
+  # stays listed (it says why) but last.
+  mapfile -t options < <(jq -r --arg last "$last" '
+    sort_by([(if .path == $last or .name == $last then 0 else 1 end), ({"pass": 0, "warn": 1}[.grade] // 2), (.name | ascii_downcase)])
+    | .[] | "󰌌\t\(.name)\t\(.vendor // "") · \(.grade | ascii_upcase)"' <<<"$instruments")
+  choice=$(omarchy-menu-select "$(bl_t instrument.pick)" "${options[@]}") || exit 1
+  name=${choice%%$'\t'*}
+  vendor=${choice#*$'\t'}
+  vendor=${vendor% · *}
+  row=$(jq -c --arg n "$name" --arg v "$vendor" 'map(select(.name == $n and ((.vendor // "") == $v))) | .[0] // empty' <<<"$instruments")
+else
+  row=$(jq -c --arg p "$plugin" 'map(select(.name == $p or .id == $p or .path == $p)) | .[0] // empty' <<<"$instruments")
+  if [[ -z $row ]]; then
+    row=$(jq -c --arg p "$plugin" 'map(select(.name | ascii_downcase | contains($p | ascii_downcase))) | .[0] // empty' <<<"$instruments")
+  fi
+fi
+
+if [[ -z $row ]]; then
+  bl_notify -g 󰌌 "$(bl_t instrument.notFound "$plugin")" -u critical
+  exit 1
+fi
+
+name=$(jq -r .name <<<"$row")
+path=$(jq -r .path <<<"$row")
+clap_id=$(jq -r .id <<<"$row")
+grade=$(jq -r .grade <<<"$row")
+
+if [[ $grade == "fail" && $force != "true" ]]; then
+  bl_notify -g 󰌌 "$(bl_t instrument.failsTitle "$name")" "$(jq -r '(.reasons // []) | join(", ")' <<<"$row")" -u critical
+  exit 1
+fi
+
+if ! bl_ensure_host; then
+  bl_notify -g 󰌌 "$(bl_t host.notRunning)" -u critical
+  exit 1
+fi
+
+# The id is the plugin's name as a slug, numbered when it is already in use.
+existing=$(bl_call Host List 2>/dev/null | jq -r '.data[0][] | .id.data')
+base=$(tr '[:upper:]' '[:lower:]' <<<"$name" | sed -e 's/[^a-z0-9]\+/-/g' -e 's/^-//' -e 's/-$//')
+[[ -n $base ]] || base=instrument
+id=$base
+n=1
+while grep -qx -- "$id" <<<"$existing"; do
+  ((n++))
+  id="$base-$n"
+done
+
+[[ -n $midi ]] || midi=$(bl_midi_inputs | jq -r '.[0].match')
+options=(id s "$id" plugin-id s "$clap_id" midi-follow s "$midi")
+[[ -n $target ]] && options+=(target s "$target")
+[[ $force == "true" ]] && options+=(force b true)
+
+if result=$(bl_call Host Load "sa{sv}" "$path" $((${#options[@]} / 3)) "${options[@]}" 2>&1); then
+  bl_remember last-instrument "$(jq -nc --arg p "$path" --arg n "$name" '{plugin: $p, name: $n}')"
+  bl_push backline.instruments backline.record
+  if [[ $midi == "$(bl_midi_inputs | jq -r '.[0].match')" ]]; then
+    bl_notify -g 󰌌 "$(bl_t instrument.loaded "$name")" "$(bl_t instrument.followsAll)"
+  else
+    bl_notify -g 󰌌 "$(bl_t instrument.loaded "$name")"
+  fi
+  echo "$id"
+else
+  bl_notify -g 󰌌 "$(bl_t instrument.loadFailed "$name")" "$(bl_error_text "$result")" -u critical
+  bl_push backline.instruments
+  exit 1
+fi

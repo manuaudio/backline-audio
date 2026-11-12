@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# omarchy:summary=Rescan installed audio plugins and grade them
+
+# Runs Backline's registry scan: every CLAP, VST3 and LV2 plugin in the
+# standard paths is probed in its own sandboxed process, so a plugin that
+# crashes or hangs is graded fail instead of taking anything down. Unchanged
+# binaries come from the cache. The notification gives the counts.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+
+bl_notify -g 󰏗 "$(bl_t plugins.scanning)"
+if summary=$(bl_backline --json plugins scan 2>&1); then
+  counts=$(bl_backline --json plugins list 2>/dev/null | jq -r '.plugins | [length, (map(select(.grade == "warn")) | length), (map(select(.grade == "fail")) | length)] | @tsv')
+  read -r total warn failed <<<"$counts"
+  bl_notify -g 󰏗 "$(bl_t plugins.scanned "$total")" "$(bl_t plugins.scannedBody "$warn" "$failed")"
+else
+  bl_notify -g 󰏗 "$(bl_t plugins.scanFailed)" "$(head -n1 <<<"$summary")" -u critical
+fi
+bl_push backline.plugins backline.instruments

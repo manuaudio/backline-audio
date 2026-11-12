@@ -1,0 +1,166 @@
+#!/bin/bash
+
+# omarchy:summary=Record armed audio sources into one aligned multitrack take
+# omarchy:args=<toggle|arm|disarm|record|stop|marker|source|recording> [args]
+# omarchy:examples=omarchy backline record toggle | omarchy backline record source alsa_input.usb-mic on
+
+# A front for Backline's recorder (Recorder1). The armed set is remembered
+# between takes, so `toggle` records it in one step from a hotkey. Arming
+# arms the recorder at once with 5 s of pre-roll, so a take started late still
+# has the downbeat. Each track is a PipeWire node: a source's outputs, a
+# sink's monitor, or a Backline instrument. The command never changes the
+# default devices and never relinks anything the user made; the recorder
+# links itself, and those links die with it.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+
+PRE_ROLL=${BACKLINE_PRE_ROLL:-5}
+
+armed_set() {
+  bl_recall record-sources '[]' | jq -c 'if type == "array" then . else [] end'
+}
+
+recorder_state() {
+  bl_props Recorder | jq -r '.State // "idle"'
+}
+
+fail() {
+  bl_notify -g 󰻃 "$1" "${2:-}" -u critical
+  bl_push backline.record
+  exit 1
+}
+
+arm() {
+  local sources result
+  sources=$(armed_set)
+  if [[ $sources == "[]" ]]; then
+    fail "$(bl_t record.nothingArmed)" "$(bl_t record.nothingArmedBody)"
+  fi
+  mapfile -t list < <(jq -r '.[]' <<<"$sources")
+  if ! result=$(bl_call Recorder Arm "asa{sv}" "${#list[@]}" "${list[@]}" 1 pre-roll d "$PRE_ROLL" 2>&1); then
+    fail "$(bl_t record.armFailed)" "$(bl_error_text "$result")"
+  fi
+}
+
+# Re-arm with the current set: a change to the set takes effect at once.
+rearm() {
+  local state
+  state=$(recorder_state)
+  if [[ $state == "recording" ]]; then
+    fail "$(bl_t record.busy)"
+  fi
+  [[ $state == "armed" ]] && bl_call Recorder Stop >/dev/null 2>&1
+  if [[ $(armed_set) != "[]" ]]; then
+    arm
+  fi
+}
+
+record() {
+  local state result tracks
+  state=$(recorder_state)
+  [[ $state == "recording" ]] && return 0
+  [[ $state == "idle" ]] && arm
+  if ! result=$(bl_call Recorder Record 2>&1); then
+    fail "$(bl_t record.recordFailed)" "$(bl_error_text "$result")"
+  fi
+  tracks=$(armed_set | jq length)
+  if ((tracks == 1)); then
+    bl_notify -g 󰻃 "$(bl_t record.startedOne)"
+  else
+    bl_notify -g 󰻃 "$(bl_t record.started "$tracks")"
+  fi
+}
+
+stop() {
+  local result take seconds
+  if ! result=$(bl_call Recorder Stop 2>&1); then
+    fail "$(bl_t record.stopFailed)" "$(bl_error_text "$result")"
+  fi
+  if [[ $(jq -r '.data[0]' <<<"$result") != "" ]]; then
+    take=$(bl_call Recorder Takes | jq -c '.data[0] | fromjson | .takes[0] // {}')
+    seconds=$(jq -r '(.seconds // 0) | floor' <<<"$take")
+    bl_notify -g 󰻃 "$(bl_t record.saved "$(jq -r '.take // ""' <<<"$take")" "$(printf '%d:%02d' $((seconds / 60)) $((seconds % 60)))")"
+  fi
+  # Stand by again, so the next take has its pre-roll too.
+  if [[ ${1:-} != "--disarm" && $(armed_set) != "[]" ]]; then
+    arm
+  fi
+}
+
+command=${1:-}
+shift || true
+
+# `recording` is the menu's guard: one property read, never starting the
+# recorder, exit 0 while a take runs.
+if [[ $command == "recording" ]]; then
+  if bl_running Recorder &&
+    [[ $(busctl --user --json=short get-property "$BL_BUS.Recorder" "$BL_PATH/Recorder" "$BL_BUS.Recorder1" State 2>/dev/null | jq -r .data) == "recording" ]]; then
+    exit 0
+  else
+    exit 1
+  fi
+fi
+
+case $command in
+  toggle)
+    if [[ $(recorder_state) == "recording" ]]; then
+      stop
+    else
+      record
+    fi
+    ;;
+  arm)
+    if (($# > 0)); then
+      bl_remember record-sources "$(printf '%s\n' "$@" | jq -R . | jq -sc .)"
+    fi
+    rearm
+    ;;
+  disarm)
+    if [[ $(recorder_state) != "idle" ]]; then
+      stop --disarm
+    fi
+    ;;
+  record) record ;;
+  stop) stop ;;
+  marker)
+    if result=$(bl_call Recorder AddMarker s "${1:-}" 2>&1); then
+      jq -r '.data[0]' <<<"$result"
+    else
+      fail "$(bl_t record.markerFailed)" "$(bl_error_text "$result")"
+    fi
+    ;;
+  source)
+    # source NODE on|off|toggle: arm or disarm one source.
+    node=${1:-}
+    mode=${2:-toggle}
+    if [[ -z $node ]]; then
+      echo "Usage: omarchy-backline-record source <node> [on|off|toggle]" >&2
+      exit 1
+    fi
+    sources=$(armed_set)
+    if [[ $mode == "toggle" ]]; then
+      if jq -e --arg n "$node" 'index($n) != null' <<<"$sources" >/dev/null; then
+        mode=off
+      else
+        mode=on
+      fi
+    fi
+    if [[ $mode == "on" ]]; then
+      sources=$(jq -c --arg n "$node" 'if index($n) == null then . + [$n] else . end' <<<"$sources")
+    else
+      sources=$(jq -c --arg n "$node" 'map(select(. != $n))' <<<"$sources")
+    fi
+    if [[ $(recorder_state) == "recording" ]]; then
+      fail "$(bl_t record.busy)"
+    fi
+    bl_remember record-sources "$sources"
+    rearm
+    ;;
+  *)
+    echo "Usage: omarchy-backline-record <toggle|arm [node...]|disarm|record|stop|marker [name]|source <node> [on|off|toggle]>" >&2
+    exit 1
+    ;;
+esac
+
+bl_push backline.record

@@ -1,0 +1,124 @@
+#!/bin/bash
+
+# omarchy:summary=Print the Backline state a panel shows, as JSON
+# omarchy:args=<instruments|record|plugins|transport|bar>
+# omarchy:hidden=true
+
+# One read per panel open (and per change the watcher reports), so a panel
+# runs one process instead of one per service. It never starts a service:
+# one that isn't running is reported with "running": false. `bar` is the
+# smallest read, for the bar icons.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+
+plugins_index() {
+  bl_backline --json plugins list 2>/dev/null | jq -c '.plugins // []' || echo '[]'
+}
+
+host_instances() {
+  if bl_running Host; then
+    bl_call Host List 2>/dev/null | jq -c '[.data[0][] | with_entries(.value = .value.data)]'
+  else
+    echo '[]'
+  fi
+}
+
+instruments() {
+  jq -nc --argjson running "$(bl_running Host && echo true || echo false)" \
+    --argjson instances "$(host_instances)" --slurpfile indexes <(plugins_index) \
+    --argjson midi "$(bl_midi_inputs || echo '[]')" \
+    --argjson last "$(bl_recall last-instrument '{}')" '
+    ($indexes[0] | map(select(.format == "clap"))) as $clap
+    | {
+        running: $running,
+        instances: [$instances[] | . as $i
+          | ($clap | map(select(.path == $i["plugin-path"] and (($i["plugin-id"] // "") == "" or .id == $i["plugin-id"]))) | .[0]) as $p
+          | {id, node, state, restarts, pid,
+             name: ($p.name // ($i["plugin-path"] // $i.plugin | split("/") | last | sub("\\.clap$"; ""))),
+             midi: $i["midi-follow"], failReason: ($i["fail-reason"] // "")}],
+        midi: $midi,
+        last: ($last.plugin // ""),
+        choices: [$clap[] | select(.kinds | index("instrument"))
+          | {name, vendor: (.vendor // ""), path, id, grade, reasons: (.reasons // [])}]
+      }'
+}
+
+plugins() {
+  plugins_index | jq -c '
+    {
+      total: length,
+      pass: map(select(.grade == "pass")) | length,
+      warn: map(select(.grade == "warn")) | length,
+      fail: map(select(.grade == "fail")) | length,
+      products: (group_by(.product // (.format + ":" + .id))
+        | map(sort_by(if .preferred then 0 else 1 end) as $f
+          | {name: $f[0].name, vendor: ($f[0].vendor // ""), kinds: ($f[0].kinds // []),
+             grade: $f[0].grade,
+             worst: ([$f[].grade] | if index("fail") then "fail" elif index("warn") then "warn" else "pass" end),
+             hostable: ($f | any(.format == "clap" and (.kinds | index("instrument")))),
+             formats: [$f[] | {format, grade, checked: (.checked // ""), reasons: (.reasons // []), path}]})
+        | sort_by(.name | ascii_downcase))
+    }'
+}
+
+record() {
+  local props takes
+  props=$(bl_props Recorder)
+  if bl_running Recorder; then
+    takes=$(bl_call Recorder Takes 2>/dev/null | jq -c '.data[0] | fromjson | .takes[0:8]' 2>/dev/null)
+  fi
+  jq -nc --argjson running "$(bl_running Recorder && echo true || echo false)" \
+    --argjson p "$props" --argjson takes "${takes:-[]}" \
+    --argjson armed "$(bl_recall record-sources '[]')" '
+    {
+      running: $running,
+      state: ($p.State // "idle"),
+      take: ($p.Take // ""),
+      sources: ($p.Sources // []),
+      rate: ($p.Rate // 0),
+      overruns: ($p.Overruns // 0),
+      lastTake: ($p.LastTake // ""),
+      soundcheck: ($p.Soundcheck // ""),
+      inputs: ($p.SoundcheckInputs // {}),
+      armed: $armed,
+      takes: $takes
+    }'
+}
+
+transport() {
+  local clock="{}"
+  if bl_running Clock; then
+    clock=$(bl_call Clock Get 2>/dev/null | jq -c '.data[0] | with_entries(.value = .value.data)' || echo '{}')
+  fi
+  jq -nc --argjson running "$(bl_running Clock && echo true || echo false)" \
+    --argjson c "$clock" --argjson sync "$(bl_recall sync '{}')" \
+    '{running: $running, clock: $c, sync: {ltc: ($sync.ltc // ""), mtc: ($sync.mtc // ""), fps: ($sync.fps // 25)}}'
+}
+
+# The bar icons need only what they show: running instruments (and whether any
+# failed), the recorder state, and the clock's rolling, source and lock.
+bar() {
+  jq -nc --argjson instances "$(host_instances)" --argjson r "$(bl_props Recorder)" --argjson c "$(bl_props Clock)" '
+    {
+      instruments: ($instances | length),
+      failed: ($instances | map(select(.state == "failed")) | length),
+      record: ($r.State // "idle"),
+      soundcheck: (($r.Soundcheck // "") != ""),
+      rolling: ($c.Rolling // false),
+      source: ($c.Source // "internal"),
+      locked: ($c.Locked // false)
+    }'
+}
+
+case ${1:-} in
+  instruments) instruments ;;
+  plugins) plugins ;;
+  record) record ;;
+  transport) transport ;;
+  bar) bar ;;
+  *)
+    echo "Usage: omarchy-backline-state <instruments|record|plugins|transport|bar>" >&2
+    exit 1
+    ;;
+esac
