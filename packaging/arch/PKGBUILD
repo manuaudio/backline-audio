@@ -14,6 +14,7 @@ url='https://github.com/manuaudio/backline-audio'
 # that one binary GPL-2.0-or-later (docs/DECISIONS.md D3)
 license=('MIT' 'GPL-2.0-or-later')
 depends=(
+  bash
   glibc
   json-c
   libgcc
@@ -34,7 +35,7 @@ install=backline-audio.install
 _link=4.1.1
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "ableton-link-$_link.tar.gz::https://github.com/Ableton/link/archive/refs/tags/Link-$_link.tar.gz")
-sha256sums=('SKIP'
+sha256sums=('c7f023b68f472bd9bbf8ad7b5d4dfdf328c6ca295897a0884ef53fc3be02bd7d'
             '23983a87eecc550be849598acb5219fbf1a16a5b4266a50ba4471b4f6c34f4a4')
 
 build() {
