@@ -123,6 +123,7 @@ struct rec_session {
 	atomic_uint_fast64_t overruns, discarded;
 	uint64_t next_position;            /* data: the graph position the next cycle should have */
 	uint64_t gap_frames, gaps;         /* data: cycles this node was not run for (graph xruns) */
+	uint32_t gap_driver;
 	struct start_info start;
 	struct rec_align_track align[REC_MAX_TRACKS];
 	atomic_uint rate_seen, quantum_seen;
@@ -222,11 +223,14 @@ static void on_process(void *data, struct spa_io_position *pos)
 
 	/* a cycle the graph didn't run this node for: its input is gone before
 	 * the recorder could see it (a scheduling xrun, not the disk) */
-	if (atomic_load(&s->started) && s->next_position && pos->clock.position > s->next_position) {
+	/* (only under the same driver: a new driver brings its own position) */
+	if (atomic_load(&s->started) && s->next_position && pos->clock.id == s->gap_driver &&
+	    pos->clock.position > s->next_position) {
 		s->gap_frames += pos->clock.position - s->next_position;
 		s->gaps++;
 	}
 	s->next_position = pos->clock.position + pos->clock.duration;
+	s->gap_driver = pos->clock.id;
 
 	float *cur[REC_MAX_TRACKS][REC_MAX_CH];
 	for (int t = 0; t < s->n_tracks; t++)

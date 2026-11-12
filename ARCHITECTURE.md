@@ -747,8 +747,10 @@ the runs so far, made while three other agents' benchmarks loaded the
 machine and without realtime priority, the sine breaks in a few thousand
 samples and the two recorders diverge, which is what missed graph cycles do
 (the first runs also fed the sines through a pipe that could underrun). The
-recorder now logs missed cycles in the sidecar; see the report for the
-latest run.
+recorder now logs missed cycles in the sidecar: in the latest run the
+take and the reference logged 61 and 48 missed cycles, which accounts for
+the breaks. A continuity run on a quiet machine with realtime priority is
+still to do.
 
 ### 4.8 Clock (`tests/clockd-proof`)
 
