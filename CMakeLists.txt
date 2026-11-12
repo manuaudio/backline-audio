@@ -251,6 +251,12 @@ if(BACKLINE_REGISTRY)
   add_subdirectory(registry)
 endif()
 
+# The user units land where systemd reads user units, for this prefix.
+if(BUILD_TESTING)
+  add_test(NAME install-layout COMMAND ${PROJECT_SOURCE_DIR}/tests/install-layout-test ${CMAKE_BINARY_DIR})
+  set_tests_properties(install-layout PROPERTIES TIMEOUT 60)
+endif()
+
 # The session manager's own policy, on a private PipeWire and WirePlumber
 # (tests/autolink-proof; skipped when they aren't installed): an instrument
 # with no target plays to the default output and follows it when it changes.
@@ -288,11 +294,27 @@ foreach(svc ${_svcs})
 endforeach()
 
 # Registry auto-rescan: a user .path unit, and a pacman hook for packagers.
+# User units go where systemd looks for them: lib/systemd/user under a system
+# prefix (/usr, /usr/local), and $XDG_DATA_HOME/systemd/user for a prefix in
+# the home directory (~/.local/share/systemd/user; systemd never reads
+# ~/.local/lib/systemd/user). The pacman hook needs root and pacman's own
+# directory, so only a /usr install has it.
+set(_unitdir lib/systemd/user)
+if(DEFINED ENV{HOME} AND NOT "$ENV{HOME}" STREQUAL "" AND CMAKE_INSTALL_PREFIX MATCHES "^$ENV{HOME}/")
+  set(_xdg_data $ENV{XDG_DATA_HOME})
+  if(NOT _xdg_data)
+    set(_xdg_data $ENV{HOME}/.local/share)
+  endif()
+  set(_unitdir ${_xdg_data}/systemd/user)
+endif()
+set(BACKLINE_SYSTEMD_USER_UNIT_DIR ${_unitdir} CACHE STRING "Where the systemd user units go (relative to the prefix, or absolute)")
 foreach(u backline-registry-rescan.path backline-registry-rescan.service)
   configure_file(data/systemd/${u}.in ${CMAKE_BINARY_DIR}/systemd/${u} @ONLY)
-  install(FILES ${CMAKE_BINARY_DIR}/systemd/${u} DESTINATION lib/systemd/user)
+  install(FILES ${CMAKE_BINARY_DIR}/systemd/${u} DESTINATION ${BACKLINE_SYSTEMD_USER_UNIT_DIR})
 endforeach()
-install(FILES data/pacman/backline-plugins.hook DESTINATION ${CMAKE_INSTALL_DATADIR}/libalpm/hooks)
+if(CMAKE_INSTALL_PREFIX STREQUAL "/usr")
+  install(FILES data/pacman/backline-plugins.hook DESTINATION ${CMAKE_INSTALL_DATADIR}/libalpm/hooks)
+endif()
 install(DIRECTORY DESTINATION ${CMAKE_INSTALL_FULL_LOCALSTATEDIR}/lib/backline)
 
 # Omarchy commands (omarchy-backline-*): the scripts, their lib, catalogs, menu

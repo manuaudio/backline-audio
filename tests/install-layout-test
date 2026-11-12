@@ -1,0 +1,31 @@
+#!/bin/bash
+# The user units are installed where systemd looks for user units, whatever
+# the prefix (a package's /usr, or a user's ~/.local), and the pacman hook
+# only under /usr. Installs the build into a scratch DESTDIR.
+#   install-layout-test BUILD-DIR
+set -uo pipefail
+build=$1
+dest=$(mktemp -d)
+trap 'rm -rf -- "$dest"' EXIT
+DESTDIR=$dest cmake --install "$build" >/dev/null || { echo "not ok - cmake --install"; exit 1; }
+prefix=$(sed -n 's/^CMAKE_INSTALL_PREFIX:PATH=//p' "$build/CMakeCache.txt")
+unit=$(find "$dest" -name backline-registry-rescan.path -print -quit)
+[[ -n $unit ]] || { echo "not ok - the .path unit is installed"; exit 1; }
+dir=$(dirname "${unit#"$dest"}")
+# systemd's user unit search path; without systemd-analyze, the documented one
+if command -v systemd-analyze >/dev/null && paths=$(systemd-analyze --user unit-paths 2>/dev/null) && [[ -n $paths ]]; then
+  :
+else
+  paths=$(printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user" /etc/systemd/user \
+    "${XDG_DATA_HOME:-$HOME/.local/share}/systemd/user" /usr/local/share/systemd/user /usr/share/systemd/user \
+    /usr/local/lib/systemd/user /usr/lib/systemd/user)
+fi
+grep -qxF "$dir" <<<"$paths" || { echo "not ok - prefix $prefix: units in $dir, which systemd doesn't read"; echo "$paths"; exit 1; }
+echo "ok - prefix $prefix: user units in $dir, on systemd's user unit path"
+hook=$(find "$dest" -name backline-plugins.hook -print -quit)
+if [[ $prefix == /usr ]]; then
+  [[ -n $hook ]] || { echo "not ok - a /usr install has the pacman hook"; exit 1; }
+else
+  [[ -z $hook ]] || { echo "not ok - no pacman hook outside /usr (${hook#"$dest"})"; exit 1; }
+fi
+echo "ok - the pacman hook only under /usr"
