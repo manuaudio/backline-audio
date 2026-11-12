@@ -125,3 +125,7 @@ clip never touches another's node.
 **Revisit when** sessions need hundreds of clips at once (one node each has
 a cost per cycle), or a clip needs to be mixed inside the player before it
 reaches the graph.
+
+## Open infrastructure for a proprietary-friendly console (2026-11-12)
+Manu: "I just don't want any of this to be proprietary except the actual PROGRAM that is the mixer, the infrastructure below should be all free, open source, OMARCHY."
+Backline is the open infrastructure layer. Control-surface drivers and profiles (MCU, HUI, FIT, generic MIDI learn) and the network DSP offload (server node, transport, clocking, failover) belong in Backline, MIT-licensed. Mixer programs, open or proprietary, sit on top and use only Backline's public APIs.
