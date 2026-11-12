@@ -1,0 +1,26 @@
+== rescan-proof 2026-11-11T23:09:18-08:00
+-- shipped units
+  backline-registry-rescan.path: verified
+  backline-registry-rescan.service: backline-registry-rescan.service: Command /usr/local/bin/backline is not executable: No such file or directory
+  PathChanged=%h/.clap
+  PathChanged=%h/.vst3
+  PathChanged=%h/.lv2
+  PathChanged=/usr/lib/clap
+  PathChanged=/usr/lib/vst3
+  PathChanged=/usr/lib/lv2
+  PathChanged=/usr/local/lib/vst3
+  PathChanged=/usr/local/lib/lv2
+  PathChanged=/var/lib/backline/plugins.stamp
+  Unit=backline-registry-rescan.service
+  ExecStartPre=/usr/bin/sleep 2
+  ExecStart=/usr/local/bin/backline plugins scan
+  pacman hook targets: 3, action: Exec = /usr/bin/touch /var/lib/backline/plugins.stamp
+
+-- live, as a transient user path unit
+  active: backline-test-rescan-777961.path
+  install: copied backline-test-ok.clap -> the index lists it after 2.14 s (2 CLAP plugins in the bundle)
+  stamp touched (what the pacman hook does after a transaction): rescanned after 2.08 s
+  remove: the index is empty again after 2.08 s
+  scans run: 3 (one per change)
+  transient units left: 0
+RESULT: PASS (install, a pacman-style stamp and removal each rescan once, by themselves)

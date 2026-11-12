@@ -57,3 +57,55 @@ dynamically.
 **Note.** This boundary is a design choice made to keep licensing simple. It
 is not legal advice, and whether a process boundary is sufficient in a
 particular product is a question for that product's own legal review.
+
+## D4. The clock is a JACK client of pipewire-jack (2026-11-11)
+
+**Decision.** `backline-clockd` owns PipeWire's transport and musical
+position by being the JACK timebase master through pipewire-jack, and moves
+the transport with `jack_transport_*`. Its LTC and MTC ports are JACK ports.
+
+**Why.** The transport and the bar live in the driver's `spa_io_position`
+(`state`, `segments[0]`, `segments[0].bar`). A client takes the segment and
+moves the transport through its node *activation* (`segment_owner`,
+`reposition`, `command`), and the one public implementation of that is
+pipewire-jack. `pw_filter` and `pw_stream` don't expose it. Going through
+pipewire-jack means no private protocol and no second clock: native PipeWire
+nodes read the result from `spa_io_position` (§4.8 measures this with a
+native node), JACK clients read it as the JACK transport, and pipewire-jack
+is MIT and part of every PipeWire install that runs JACK apps.
+
+**Measured consequences.** What the timebase callback writes is published
+with the next cycle, and a locate lands two cycles after it is asked for;
+clockd writes the bar for the next cycle and aims chase locates two cycles
+ahead (§4.8). The bar's beat has tick resolution (1/1920 beat).
+
+**Revisit when** PipeWire offers a native API for the segment owner (a
+`pw_filter` flag, or a metadata-based transport); clockd's D-Bus interface
+would not change.
+
+## D5. PipeWire's latency directions (2026-11-11, a correction)
+
+**Decision.** `SPA_PARAM_Latency` in the OUTPUT direction is capture latency
+(from the sources up to the port) and the INPUT direction is playback latency
+(from the port to the sinks). A device reports its own delay in the
+direction of its ports: an ALSA capture port reports its converter delay in
+OUTPUT. This is the convention pipewire-jack maps to `JackCaptureLatency` and
+`JackPlaybackLatency`.
+
+**Why it is recorded.** The first recorder read the two the other way round
+(its comment said INPUT was capture), so the "playback latency" it logged for
+sinks was the capture latency arriving at them. Input-latency compensation
+(§2.3) found it: a fake capture device's declared delay never showed up. The
+recorder's alignment never used these numbers, so no measured alignment
+changes; the sidecar field now reads the right direction.
+
+## D6. Link tests run in their own network namespace (2026-11-11)
+
+**Decision.** The clock proof runs inside `unshare -rn` (an unprivileged user
+and network namespace with only loopback, multicast on).
+
+**Why.** Ableton Link joins every session it can reach on the LAN. A test that
+sets the tempo must not change the tempo of somebody's Live set on the same
+network. In the namespace, the second Link peer is the only one there is. The
+PipeWire and D-Bus sockets are filesystem sockets, so the test still talks to
+the real (throwaway) graph.

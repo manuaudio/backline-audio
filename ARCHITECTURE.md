@@ -67,9 +67,9 @@ effect-insert component.
 |---|---|---|---|
 | `backline-registry` + `backline-probe` | The system plugin index (CLAP, VST3, LV2), with crash-proof scanning and validation on install | C | **Built and measured** (§4.4): sandboxed probes, grades, cache, `Registry1` |
 | `backline-hostd` + `backline-plugin-worker` | Out-of-process plugin host: each instance one process and one PipeWire node, with MIDI in, params and presets over D-Bus and OSC | C (hostd), C++ (worker) | **Built and measured** (§4.1, §4.3, §4.5): CLAP, VST3 and LV2; presets; supervisor with restart-with-state |
-| `backline-recorderd` | Records any set of nodes to sample-aligned, timestamped multitrack WAV/BWF or FLAC | C | **Recorder built and measured** (§4.2), with signal alignment and pre-roll; the D-Bus daemon is next |
+| `backline-recorderd` | Records any set of nodes to sample-aligned, timestamped multitrack WAV/BWF (RF64 past 4 GB) or FLAC; virtual soundcheck | C | **Built and measured** (§4.2, §4.6, §4.7): `Recorder1`, markers, takes, input-latency compensation, stall-proof disk thread, soundcheck |
 | `backline-playerd` | Plays files into the graph, locked to the shared timeline | C | Design |
-| `backline-clockd` | Transport, tempo and timecode: the PipeWire timeline owner, Ableton Link, LTC/MTC generation and chase | C++ (Link is C++) | Design |
+| `backline-clockd` | Transport, tempo and timecode: the PipeWire timeline owner, Ableton Link, LTC/MTC generation and chase | C++ (Link is C++) | **Built and measured** (§4.8): `Clock1`, LTC/MTC to the sample, Link |
 | `backline-controld` | Maps OSC and MIDI to any parameter in the system: Backline instances, filter-chain/clap-pipewire controls, volumes, transport | C | Design (the worker already speaks OSC) |
 | `libbackline` + `backline` CLI + `Backline` QML module | The client surface for apps and Omarchy panels | C (lib), C (CLI), C++/QML (module) | Library skeleton and CLI built (host, instance, plugins, rec); QML is design |
 | clap-pipewire (separate project) | CLAP effects inside filter-chain: device effects and virtual sinks, in-graph | C | v0.1, separate project |
@@ -106,9 +106,15 @@ effect-insert component.
     the working directory). VST3 is still graded on load only (`"checked":
     "load"`): the worker hosts VST3 now (§4.5); a run check in the probe
     is still open.
-- **Triggers.** A pacman hook for `/usr/lib/{clap,vst3,lv2}` (root,
-  Omarchy-side), and a user `.path` unit on `~/.clap`, `~/.vst3` and
-  `~/.lv2`.
+- **Triggers** (built). A user `.path` unit
+  (`backline-registry-rescan.path`) on `~/.clap`, `~/.vst3`, `~/.lv2`, the
+  system plugin directories and `/var/lib/backline/plugins.stamp`; its
+  service runs `backline plugins scan` after a 2 s debounce at idle I/O
+  priority. A pacman hook for packagers (`data/pacman/backline-plugins.hook`)
+  touches the stamp after any transaction that installs, upgrades or removes
+  files under `/usr/lib/{clap,vst3,lv2}`, which also catches upgrades deep
+  inside an existing bundle. The scan always runs as the user, never as
+  root.
 - **Interfaces.**
   - `backline plugins list|show|scan [--json]` (through D-Bus, or straight
     from the index when the service isn't running).
@@ -340,16 +346,40 @@ effect-insert component.
     to 2048 when a player joins) and through driver changes. A first
     version that shifted by the quantum at take start broke on exactly
     those two cases.
-  - The ports' reported `SPA_PARAM_Latency` can't drive the fix. A null
-    sink reports 1 quantum of playback latency whether it drives or
-    follows, and 0 until something feeds it. The recorder logs it in the
-    sidecar.
-  - Compensating capture latency of hardware sources (for "as heard in the
-    room" alignment) is a separate, later mode.
-- **Interfaces (next).**
-  - D-Bus `Recorder1`: `Arm(sources, options)`, `Record`, `Stop`, `Takes`,
-    and signals `Level`/`Overrun`.
-  - `backline rec` runs the recorder today with its own flags.
+  - The ports' reported `SPA_PARAM_Latency` can't drive the fix: a null
+    sink reports 0 frames of playback latency whether it drives or
+    follows. (The first version read the capture direction by mistake and
+    saw 1 quantum; D5.) The recorder logs it in the sidecar.
+- **Input-latency compensation** (built). A capture port reports its
+  converter delay as capture latency (`SPA_PARAM_Latency`, output
+  direction, D5). Track *i* with latency L*i* is written from ring frame
+  `begin + Li`, so frame *j* of every track is the same moment at the inputs;
+  the take runs `max L` frames past the stop so all tracks end together.
+  `latency`: `hardware` (physical ports only, the default), `reported`
+  (every source), `off`, plus per-source manual frames. The applied values
+  are in the sidecar and `CaptureLatency`.
+- **Disk thread and rings.** One ring per track, 30 s by default
+  (`ring-seconds` 2-120), mapped and pre-faulted at arm time, so the data
+  thread never page-faults. The disk may stall for the ring's length without
+  losing a frame (§4.6); past it, whole cycles are dropped from every track
+  together and counted (`Overrun`), so tracks stay aligned.
+- **RF64.** WAV takes are written as RF64 with automatic downgrade: a plain
+  (extensible) WAV with a reserved `JUNK` chunk, which becomes RF64 with a
+  `ds64` chunk only if a file passes 4 GB (EBU 3306). Markers are appended
+  as a `cue ` chunk and `LIST/adtl` labels after the take, also to RF64.
+- **Virtual soundcheck.** `Soundcheck(take)` plays a take on one node,
+  `backline.soundcheck` (one port per track channel, all tracks in the same
+  cycle; a disk thread reads ahead, the data thread only copies).
+  `SetInput(node, "playback")` moves every link from that input to a
+  consumer that isn't Backline's onto the matching soundcheck port, and
+  `live` puts them back. Moves are written to
+  `$XDG_RUNTIME_DIR/backline/soundcheck.json` first, so a crash doesn't
+  strand a consumer: the next start puts the links back (§4.6).
+- **Interfaces** (built). D-Bus `Recorder1` ([docs/api/Recorder1.md](docs/api/Recorder1.md)):
+  `Arm`, `Record`, `Stop`, `AddMarker`, `Takes`, `GetTake`, `Soundcheck`,
+  `SetInput`, `StopSoundcheck`; signals `Level`, `Overrun`, `Marker`,
+  `TakeFinished`, `SoundcheckInput`. `backline rec arm|record|stop|...`
+  speaks it; `backline rec -s ...` still runs the one-shot recorder.
 - **Reuse.**
   - `pw-record` (one stream, no timestamps, so not alignable: −384 to −512
     frames apart in the control runs).
@@ -379,7 +409,10 @@ effect-insert component.
 - **Job.** One system transport (rolling, position, tempo, meter) that
   every app can follow. Also LTC and MTC generation and chase, and Ableton
   Link.
-- **Mechanism.**
+- **Mechanism** (built; D4).
+  - clockd is a JACK client of pipewire-jack: that is how a client owns
+    the segment and moves the transport (node activation), and the result is
+    in every node's `spa_io_position`.
   - **Use PipeWire's own timeline.** `spa_io_position` carries a `segment`
     with an `owner` and a `bar` (bpm, signature, beat) to every node, every
     cycle. pipewire-jack maps that to the JACK transport and timebase
@@ -668,6 +701,80 @@ The same worker hosting VST3 and LV2, on throwaway sinks. Full report in
 - The other nodes, the PipeWire/WirePlumber pids and the default sink were
   unchanged; no node, process or scope of the proof was left.
 
+### 4.6 Recorder daemon (`tests/recorderd-proof`)
+
+On a private D-Bus, against throwaway nodes.
+
+- **API.** Arm returns in 28 ms with the links up; the errors are typed
+  (`State`, `NotFound`, `Busy`, `InvalidArgs`). Two markers land in the
+  sidecar and as WAV cue points with labels at the same frames; `Level`,
+  `Marker`, `TakeFinished` and `PropertiesChanged` arrive.
+- **Input latency.** Three fake capture devices (`backline-test-source`,
+  one process, one start cycle) declare and apply 0, 480 (physical) and 256
+  frames. Measured lag of b and c against a: `off` 480/256, `hardware`
+  0/256 (c isn't physical), `reported` 0/0, `hardware` + manual 256 for c
+  0/0; bit-identical at those lags, equal lengths. In 2 of about 50 such
+  takes during development one fake source arrived one quantum late for a
+  whole take, a different source each time (PipeWire ran the recorder
+  before that node; to investigate, reported here rather than hidden).
+- **Slow disk.** An `LD_PRELOAD` shim blocks every write to the take
+  directory for 12 s from 3 s and 8 s from 20 s into a 40 s take, in the
+  disk thread. **0 frames lost**: all 1 920 000 frames of both tracks equal
+  an unstalled reference recorded at the same time. Control: the same stalls
+  with a 4 s ring lose 9.1 s, say so (`overrun_frames`), and keep the
+  tracks aligned at lag 0.
+- **Virtual soundcheck.** Two virtual mics feed a FOH sink through links
+  someone else made. Switching each mic to playback and back, the FOH gets
+  the take bit-exact where it got that mic, the other mic stays live, both
+  tracks play in lockstep (same take frame), and the links after `live` are
+  identical to before. SIGKILL with a mic switched leaves the consumer
+  without that link; the next start puts it back. (One development run had
+  a single 128-frame silent cycle on both FOH channels at once: a graph
+  xrun, with other benchmarks loading the machine and no realtime priority.)
+- **Missed cycles.** The sidecar now counts the cycles the graph didn't run
+  the recorder for (`graph_gaps`, `graph_gap_frames`), separately from ring
+  overruns, so a scheduling xrun can't pass for a disk problem or hide.
+
+### 4.7 RF64 (`tests/rf64-proof`)
+
+A node generates 16 sines from the graph position in its realtime callback;
+the recorder writes one 16-channel float track for 1460 s, 4 485 120 942
+bytes in one file, while a second, independent recorder records the same
+node. Measured: the file is RF64 with `ds64` sizes equal to the file and the
+data, 70 080 000 frames read back (as asked), `bext` present, and both
+markers (one past 4 GB) in the cue chunk; 0 ring overruns. Continuity: in
+the runs so far, made while three other agents' benchmarks loaded the
+machine and without realtime priority, the sine breaks in a few thousand
+samples and the two recorders diverge, which is what missed graph cycles do
+(the first runs also fed the sines through a pipe that could underrun). The
+recorder now logs missed cycles in the sidecar; see the report for the
+latest run.
+
+### 4.8 Clock (`tests/clockd-proof`)
+
+In its own network namespace (D6), on a private bus, with clockd and every
+test node in one `node.group` driven by a test sink.
+
+- **Transport.** A native PipeWire node logging `spa_io_position` every
+  cycle sees the frame advance by exactly the quantum while rolling, locates
+  by frames, timecode and bar/beat land exactly, and the bar follows tempo
+  and meter changes to the tick (worst 0.76 tick of step error, from tick
+  quantisation). pipewire-jack publishes the timebase one cycle late and
+  lands a locate two cycles after it's asked: clockd compensates both (D4).
+- **LTC generate**, decoded by libltc in the test node: frame starts on the
+  transport within 0 samples at 25 and 30 fps, 1 at 29.97 DF, 2 at 24 (the
+  decoder's own precision there), through a locate.
+- **LTC chase** (25 and 29.97 DF, and through a sink's monitor): locked
+  37-45 ms after the timecode starts or jumps, then 0 samples of error for
+  every cycle; the transport stops when the timecode stops.
+- **MTC** generate: every quarter frame on its exact transport sample.
+  Chase: locked in 61-75 ms, then 0 samples of error, through a jump.
+- **Link.** With a second peer (`backline-test-linkpeer`), peers = 1 on both
+  sides, a tempo proposed by either side becomes the session's and the
+  transport's, and the beat phase between PipeWire's bar and the peer's own
+  Link timeline stays within 0.63 ms (two ticks) while rolling, excluding the one cycle in
+  which a tempo change was still crossing the network.
+
 ## 5. Build order
 
 1. **Host supervisor and client skeleton.** *Done (§4.3).*
@@ -681,16 +788,20 @@ The same worker hosting VST3 and LV2, on throwaway sinks. Full report in
    - `backline-probe` (from the prototype's `plugprobe`), scope-isolated
      probing and grading, the cache, `backline plugins --json` and the
      D-Bus query service. hostd refuses `fail` grades unless forced.
-   - Still open: the pacman hook and the `.path` unit, the optional
-     clap-validator pass, VST3 run checks, caching `lv2-list`.
-3. **Recorder.** *Alignment and pre-roll done (§4.2).*
-   - Still open: `recorderd` with `Recorder1`, RF64 for takes over 4 GB,
-     and hardware capture-latency compensation.
-4. **Clock and transport.**
-   - clockd as segment owner and JACK timebase master. Fill CLAP
-     `transport` in the worker. Then Link, then LTC, then MTC, each with a
-     measured proof (Link phase versus `link-hut`; LTC round trip through a
-     loopback; MTC chase against a generator).
+   - Auto-rescan *done*: a user `.path` unit on the plugin directories and a
+     stamp the packagers' pacman hook touches (`tests/rescan-proof`: an
+     install, a pacman-style stamp and a removal each rescan once, ≈ 2.1 s
+     after the change, the 2 s debounce included).
+   - Still open: the optional clap-validator pass, VST3 run checks, caching `lv2-list`.
+3. **Recorder.** *Done (§4.2, §4.6, §4.7)*: alignment, pre-roll,
+   `recorderd` with `Recorder1`, RF64, input-latency compensation, the
+   stall-proof disk thread, virtual soundcheck.
+   - Still open: latency compensation checked against a real converter's
+     measured round trip; resampling in soundcheck.
+4. **Clock and transport.** *Done (§4.8)*: clockd as segment owner, LTC
+   and MTC generate and chase, Link.
+   - Still open: fill CLAP `transport` in the worker from the segment; Link
+     phase against an output-latency-compensated timeline.
 5. **Host formats.** *VST3, LV2 and presets done (§4.5).*
    - Still open: moving the CLAP adapter onto the shared core (`cph_*`, §6),
      a VST3 run check in the registry, LV2 `patch:Parameter` parameters

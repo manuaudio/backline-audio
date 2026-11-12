@@ -121,6 +121,8 @@ struct rec_session {
 	uint64_t prev_position, prev_nsec;
 	uint32_t last_driver, quantum_changes, driver_changes, q_min, q_max;
 	atomic_uint_fast64_t overruns, discarded;
+	uint64_t next_position;            /* data: the graph position the next cycle should have */
+	uint64_t gap_frames, gaps;         /* data: cycles this node was not run for (graph xruns) */
 	struct start_info start;
 	struct rec_align_track align[REC_MAX_TRACKS];
 	atomic_uint rate_seen, quantum_seen;
@@ -217,6 +219,14 @@ static void on_process(void *data, struct spa_io_position *pos)
 	atomic_store_explicit(&s->quantum_seen, n, memory_order_relaxed);
 	if (!atomic_load(&s->armed) || atomic_load(&s->finished))
 		return;
+
+	/* a cycle the graph didn't run this node for: its input is gone before
+	 * the recorder could see it (a scheduling xrun, not the disk) */
+	if (atomic_load(&s->started) && s->next_position && pos->clock.position > s->next_position) {
+		s->gap_frames += pos->clock.position - s->next_position;
+		s->gaps++;
+	}
+	s->next_position = pos->clock.position + pos->clock.duration;
 
 	float *cur[REC_MAX_TRACKS][REC_MAX_CH];
 	for (int t = 0; t < s->n_tracks; t++)
@@ -769,8 +779,9 @@ static void write_sidecar(struct rec_session *s)
 		",\n    \"pre_roll_frames\": %" PRIu64 ",\n    \"pre_roll_requested_frames\": %" PRIu64 "\n  },\n",
 		trig, s->start.trigger_nsec, s->start.trigger_position, s->start.pre_roll_frames, s->pre_roll_frames);
 	fprintf(f, "  \"rate\": %u,\n  \"quantum_at_start\": %u,\n  \"quantum_range\": [%u, %u],\n  \"frames\": %" PRIu64
-		",\n  \"overrun_frames\": %" PRIu64 ",\n  \"format\": \"%s\",\n  \"ring_seconds\": %.1f,\n",
-		s->start.rate, s->start.quantum, s->q_min, s->q_max, frames, (uint64_t)atomic_load(&s->overruns),
+		",\n  \"overrun_frames\": %" PRIu64 ",\n  \"graph_gap_frames\": %" PRIu64 ",\n  \"graph_gaps\": %" PRIu64
+		",\n  \"format\": \"%s\",\n  \"ring_seconds\": %.1f,\n",
+		s->start.rate, s->start.quantum, s->q_min, s->q_max, frames, (uint64_t)atomic_load(&s->overruns), s->gap_frames, s->gaps,
 		s->o.format, s->o.ring_seconds);
 	fprintf(f, "  \"alignment\": {\n    \"mode\": \"%s\",\n    \"one_cycle_pairing\": %s,\n    \"driver_at_start\": %u,\n"
 		"    \"driver_changes\": %u,\n    \"quantum_changes\": %u\n  },\n",

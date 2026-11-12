@@ -1,0 +1,89 @@
+== clockd-proof 2026-11-11T23:46:47-08:00
+network: lo               UNKNOWN        127.0.0.1/8 ::1/128  (own namespace)
+default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
+clockd: backline-clockd: backline.clock at 48000 Hz, OSC 127.0.0.1:55174, Link available
+  node backline-test.clk in the test group, driver self
+  node backline-test.ltcbus in the test group, driver 194
+  node backline.clock in the test group, driver 194
+
+-- 1. transport and tempo, as a native PipeWire node sees them
+  Locate tc:00:00:10:00 (25 fps) while rolling -> frame 480000
+  SetTempo 90 while rolling
+  SetMeter 7/8
+  Locate bbt:9|1|0 -> frame 1615996
+  Locate 96000 while stopped
+  Play while chasing LTC: Call failed: the transport is chasing ltc
+  bad locate: Call failed: position "tc:99:99": frames, tc:HH:MM:SS:FF or bbt:BAR|BEAT|TICK
+  bad tempo: Call failed: tempo must be 20 to 999 BPM
+  CLI, backline transport status: stopped  00:00:02:00  2|2|960  90.00 BPM 7/8  source internal  link off (0 peers)
+  observer: 2642 cycles; rolling cycles where the frame advanced by exactly the graph's: 2064; jumps: [(71936, 480000), (624384, 1615996), (1663868, 1663868), (1663868, 96000)]
+  bar: 120 BPM 4/4: 940 cycles, beat step error worst 0.76 ticks (1 tick = 1/1920 beat)
+  bar: 90 BPM 4/4: 376 cycles, beat step error worst 0.68 ticks (1 tick = 1/1920 beat)
+  bar: 90 BPM 7/8: 751 cycles, beat step error worst 0.68 ticks (1 tick = 1/1920 beat)
+  tempo/meter segments seen: [(120.0, '4/4'), (90.0, '4/4'), (90.0, '7/8')]
+  RESULT: PASS (rolling, locates and the bar arrive in spa_io_position exactly, to the tick)
+
+-- 2. LTC generate, decoded by an independent libltc reader
+  LTC 25 fps: 124 frames decoded by libltc in the test node; frame start vs transport: error min 0 max 0 samples over 124 frames (0 across the locate)
+  RESULT: PASS (clockd's LTC is locked to the transport frame, through a locate)
+  LTC 29.97 fps: 147 frames decoded by libltc in the test node; frame start vs transport: error min -1 max 0 samples over 147 frames (0 across the locate)
+  RESULT: PASS (clockd's LTC is locked to the transport frame, through a locate)
+  LTC 24 fps: 120 frames decoded by libltc in the test node; frame start vs transport: error min -2 max -2 samples over 119 frames (1 across the locate)
+  RESULT: PASS (clockd's LTC is locked to the transport frame, through a locate)
+  LTC 30 fps: 148 frames decoded by libltc in the test node; frame start vs transport: error min 0 max 0 samples over 148 frames (0 across the locate)
+  RESULT: PASS (clockd's LTC is locked to the transport frame, through a locate)
+
+-- 3. LTC chase
+  [ltc 25] after 4 s: Locked true, Source "ltc", Timecode "01:00:04:00", ChaseError 0
+  [ltc 25] after the jump: Locked true, Timecode "02:00:03:00"
+  [ltc 25] generator stopped: Rolling false
+  LTC chase 25 fps, start: locked 45 ms after the timecode started; then 1488 cycles, transport - incoming: min 0 max 0 samples
+  LTC chase 25 fps, jump: locked 45 ms after the timecode jumped; then 1171 cycles, transport - incoming: min 0 max 0 samples
+  RESULT: PASS (the transport follows LTC to within 2 samples, through a jump)
+  [ltc 29.97] after 4 s: Locked true, Source "ltc", Timecode "01:00:04;00", ChaseError -1
+  [ltc 29.97] after the jump: Locked true, Timecode "02:00:02;29"
+  [ltc 29.97] generator stopped: Rolling false
+  LTC chase 29.97 fps, start: locked 37 ms after the timecode started; then 1492 cycles, transport - incoming: min 0 max 0 samples
+  LTC chase 29.97 fps, jump: locked 37 ms after the timecode jumped; then 1175 cycles, transport - incoming: min 0 max 0 samples
+  RESULT: PASS (the transport follows LTC to within 2 samples, through a jump)
+  [ltc 25] chasing the monitor of sink backline-test.ltcbus
+  [ltc 25] after 4 s: Locked true, Source "ltc", Timecode "01:00:04:00", ChaseError 0
+  [ltc 25] after the jump: Locked true, Timecode "02:00:03:00"
+  [ltc 25] generator stopped: Rolling false
+  LTC chase 25 fps, start: locked 45 ms after the timecode started; then 1490 cycles, transport - incoming: min 0 max 0 samples
+  LTC chase 25 fps, jump: locked 45 ms after the timecode jumped; then 1171 cycles, transport - incoming: min 0 max 0 samples
+  RESULT: PASS (the transport follows LTC to within 2 samples, through a jump)
+
+-- 4. MTC generate, read by the test node
+  MTC 25 fps: 293 quarter frames decoded; quarter-frame time vs transport: min 0 max 0 samples
+  RESULT: PASS (MTC quarter frames sit on the transport's samples)
+  MTC 29.97 fps: 353 quarter frames decoded; quarter-frame time vs transport: min 0 max 0 samples
+  RESULT: PASS (MTC quarter frames sit on the transport's samples)
+
+-- 5. MTC chase
+  [mtc 25] after 4 s: Locked true, Source "mtc", Timecode "01:00:04:00", ChaseError 0
+  [mtc 25] after the jump: Locked true, Timecode "02:00:03:00"
+  [mtc 25] generator stopped: Rolling false
+  MTC chase 25 fps, start: locked 75 ms after the timecode started; then 1477 cycles, transport - incoming: min 0 max 0 samples
+  MTC chase 25 fps, jump: locked 75 ms after the timecode jumped; then 1160 cycles, transport - incoming: min 0 max 0 samples
+  RESULT: PASS (the transport follows MTC to within 2 samples, through a jump)
+  [mtc 29.97] after 4 s: Locked true, Source "mtc", Timecode "01:00:04;00", ChaseError 0
+  [mtc 29.97] after the jump: Locked true, Timecode "02:00:02;29"
+  [mtc 29.97] generator stopped: Rolling false
+  MTC chase 29.97 fps, start: locked 61 ms after the timecode started; then 1483 cycles, transport - incoming: min 0 max 0 samples
+  MTC chase 29.97 fps, jump: locked 61 ms after the timecode jumped; then 1166 cycles, transport - incoming: min 0 max 0 samples
+  RESULT: PASS (the transport follows MTC to within 2 samples, through a jump)
+
+-- 6. Ableton Link with a second peer (loopback only)
+  LinkPeers on clockd: 1, Source "link"
+  peer proposed 133 BPM -> clockd Tempo 133
+  samples while a tempo change was in flight (the two tempos differ, excluded): 1
+  peer saw: peers 1, Link tempo 97.499939, transport tempo 97.500000
+  beat phase, PipeWire transport vs the peer's Link timeline, 109 samples while rolling: min -0.625 ms, max -0.031 ms (1 tick = 0.321 ms)
+  RESULT: PASS (one Link session: tempo both ways, phase within a millisecond)
+
+-- clean up
+nodes from outside the test group that ran under its driver: 124 backline.recorder;145 backline-test.rf64;303 backline.recorder;54 bluez_midi.server;
+test-group nodes left: 0
+other nodes same as at start: yes (6 nodes)
+default sink after: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} (unchanged); default source unchanged; moved during the run: never

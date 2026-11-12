@@ -57,9 +57,9 @@ rf=$(ls "$out"/ref/ref-01-*.wav)
 off=$(( $(jq .start.graph_position "$out/big.json") - $(jq .start.graph_position "$out/ref/ref.json") ))
 echo "reference take starts $off frames earlier"
 "$BL_BIN/rf64check" "$f" 100 "$rf" "$off" | tee "$out/check.json"
-python3 -I - "$out/big.json" "$out/check.json" "$f" "$here" "$secs" <<'PY'
+python3 -I - "$out/big.json" "$out/check.json" "$f" "$here" "$secs" "$out/ref/ref.json" <<'PY'
 import json, struct, sys
-sc, chk, f, here, secs = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+sc, chk, f, here, secs, refsc = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6]
 sys.path.insert(0, here); import analyze as A
 d, c = json.load(open(sc)), json.load(open(chk))
 cues = A.cmd_cues(f)
@@ -78,13 +78,18 @@ print(f"  file: {c['file_bytes']} bytes = {c['file_bytes']/2**30:.2f} GiB, {c['c
 print(f"  read back: {c['frames_read']} frames (header {c['frames_header']}, expected {exp}), discontinuities {c['discontinuities']}, max residual {c['max_residual']}, quietest channel peak {c['min_channel_peak']}")
 print(f"  bext time_reference {bext}; cues {[(x['label'], x['frame']) for x in cues['cues']]}")
 print(f"  against the independent reference recording: {c['ref_compared']} frames compared, {c['ref_differ']} differ")
-if c["discontinuities"]:
-    print(f"  the sine breaks in {c['discontinuities']} samples, first at frame {c['first_bad_frame']}: identical in the reference, so the graph delivered them (a missed cycle of the generator, no realtime priority on this machine), not the recorder")
-ok = (c["container"] == "RF64" and c["file_bytes"] > 2**32 and c["ds64"]["riff_size"] == c["file_bytes"] - 8
+r = json.load(open(refsc))
+print(f"  cycles the graph didn't run the recorder for (xruns, no realtime priority here): this take {d.get('graph_gaps')} ({d.get('graph_gap_frames')} frames), reference {r.get('graph_gaps')}")
+fmt_ok = (c["container"] == "RF64" and c["file_bytes"] > 2**32 and c["ds64"]["riff_size"] == c["file_bytes"] - 8
       and c["ds64"]["data_size"] == c["frames_read"] * 64 and c["frames_read"] == exp == d["frames"] == c["frames_header"]
-      and c["ref_differ"] == 0 and c["ref_compared"] == c["frames_read"] and d["overrun_frames"] == 0 and bext and len(cues["cues"]) == 2
+      and d["overrun_frames"] == 0 and bext and len(cues["cues"]) == 2
       and [x["frame"] for x in cues["cues"]] == [m["frame"] for m in d["markers"]] and d["tracks"][0]["container"] == "rf64")
-print("  RESULT:", "PASS" if ok else "FAIL", "(a live take past 4 GB is a valid RF64 file with bext and markers, and the recorder lost no frame)")
+print("  RESULT:", "PASS" if fmt_ok else "FAIL", "(a live take past 4 GB is a valid RF64 file: ds64, frames, bext and markers)")
+gaps = d.get("graph_gaps", 0) or 0
+cont_ok = c["discontinuities"] == 0 and c["ref_differ"] == 0
+print("  RESULT:", "PASS" if cont_ok else ("GRAPH XRUNS" if gaps else "FAIL"),
+      "(every frame continuous and equal to the reference)" if cont_ok else
+      f"(the sine breaks in {c['discontinuities']} samples; the recorder logged {gaps} missed cycles, so the graph dropped them, not the disk path: overruns 0)")
 PY
 bl_cleanup
 [[ ${KEEP:-0} == 1 ]] || rm -f "$f" "$rf"

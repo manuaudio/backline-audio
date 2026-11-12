@@ -1,0 +1,86 @@
+== recorderd-proof 2026-11-11T23:43:37-08:00
+default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
+bus: private (unix:path=/tmp/dbus-ZmtvUhzZs5,guid=6a3f47dcdc35c797ba0eaa8f6af56e29)
+signals written
+
+-- 1. the API on a private bus
+  Record while idle: Call failed: not armed (state idle)
+  Arm a missing node: Call failed: no node named "no.such.node"
+  Arm a bad option: Call failed: unknown option "colour"
+  Arm: s "api" in 28 ms
+  State "armed", Take "api", Sources 2 "backline-test.rec-a" "backline-test.rec-b"
+  Arm again: Call failed: already armed (take api)
+  AddMarker while armed: Call failed: not recording
+  Record -> State "armed"
+  markers at frames 38912 and 67584; Frames now 96256
+  Stop -> ~/Developer-lab/backline/tests/out/recorderd/takes/api.json; State "idle"; LastTake "~/Developer-lab/backline/tests/out/recorderd/takes/api.json"
+  sidecar: backline.take/2, 96256 frames at 48000, overruns 0, markers [('verse one', 38912), ('chorus', 67584)]
+  api-01-backline-test.rec-a.wav: 96256 frames, container wav, cues [('verse one', 38912), ('chorus', 67584)]
+  api-02-backline-test.rec-b.wav: 96256 frames, container wav, cues [('verse one', 38912), ('chorus', 67584)]
+  tracks: lag 0, max diff 0.0
+  signals seen: {'Level': 11, 'Marker': 2, 'PropertiesChanged': 3, 'TakeFinished': 1}
+  RESULT: PASS (markers in sidecar and cue chunks, tracks aligned, signals)
+  Takes: [('api', 96256, 2)]
+  GetTake api: backline.take/2 2
+  GetTake missing: Call failed: no take "nope" in ~/Developer-lab/backline/tests/out/recorderd/takes
+  CLI, backline rec takes: api                                   2.0 s  2026-11-12T07:43:40.985326497Z  2 track(s)
+  CLI, backline rec status --json: {"state": "idle", "take": "", "rate": 0, "frames": 0, "overruns": 0, "soundcheck": "", "last_take": "~/Developer-lab/backline/tests/out/recorderd/takes/api.json"}
+
+-- 2. input-latency compensation (fake capture devices with known latency)
+  reported: backline-test.src-a:capture_0 physical=false capture latency 0 frames
+  reported: backline-test.src-b:capture_0 physical=true capture latency 480 frames
+  reported: backline-test.src-c:capture_0 physical=false capture latency 256 frames
+  [lat-off] latency=off : CaptureLatency 3 "backline-test.src-a" 0 "backline-test.src-b" 0 "backline-test.src-c" 0
+  [lat-hardware] latency=hardware : CaptureLatency 3 "backline-test.src-a" 0 "backline-test.src-b" 480 "backline-test.src-c" 0
+  [lat-reported] latency=reported : CaptureLatency 3 "backline-test.src-a" 0 "backline-test.src-b" 480 "backline-test.src-c" 256
+  [lat-manual] latency=hardware latency-frames a{su} 1 backline-test.src-c 256: CaptureLatency 3 "backline-test.src-a" 0 "backline-test.src-b" 480 "backline-test.src-c" 256
+  take           compensation a/b/c   lag b-a  lag c-a  diff b  diff c  frames
+  lat-off        [0, 0, 0]                480      256     0.0     0.0  76928 ok
+  lat-hardware   [0, 480, 0]                0      256     0.0     0.0  77056 ok
+  lat-reported   [0, 480, 256]              0        0     0.0     0.0  77056 ok
+  lat-manual     [0, 480, 256]              0        0     0.0     0.0  77056 ok
+  (expected lags b,c: off 480,256; hardware 0,256 since c is not physical; reported 0,0; hardware + manual c=256: 0,0)
+  RESULT: PASS (each track lines up by exactly its capture latency, bit-identical, equal lengths)
+
+-- 3. slow disk: 12 s and 8 s write stalls during a 40 s take
+  ring per track: 30 s (default); stalls: 12 s from 3 s, 8 s from 20 s
+  shim: stall 1: at 3.037 s for 11.963 s (until 15.000 s), thread 1938393
+  shim: stall 2: at 20.017 s for 7.983 s (until 28.000 s), thread 1938393
+  stalled take: 1920000 frames (40.00 s), overrun frames 0
+  track 1: inside the reference at frame 52736, 1920000 frames compared, 0 differ (R channel: 0 differ at offset 52736)
+  track 2: inside the reference at frame 52736, 1920000 frames compared, 0 differ (R channel: 0 differ at offset 52736)
+  tracks of the stalled take: lag 0, max diff 0.0
+  RESULT: PASS (0 frames lost: every frame of the 40 s take equals the unstalled reference)
+  [control: the same stalls, 4 s ring]
+  4 s ring: overrun frames 436224 (9.09 s lost, reported), tracks lag 0 max diff 0.0, lengths [1440000, 1440000]
+  frames that differ between the tracks: 0, in 0 place(s); driver changes during the take: 0
+  RESULT: PASS (the stall is real: a small ring loses audio, says so, and the tracks stay aligned)
+
+-- 4. virtual soundcheck
+  FOH inputs before: backline-test.mic-a:capture_FL -> backline-test.foh:playback_FL; backline-test.mic-b:capture_FR -> backline-test.foh:playback_FR
+  recorded the mics: ~/Developer-lab/backline/tests/out/recorderd/takes/sc.json
+  Soundcheck sc: Soundcheck "sc", inputs 2 "backline-test.mic-a" "live" "backline-test.mic-b" "live"
+  mic-a -> playback: backline-test.mic-b:capture_FR -> backline-test.foh:playback_FR; backline.soundcheck:t1_1 -> backline-test.foh:playback_FL
+  mic-b -> playback: backline.soundcheck:t1_1 -> backline-test.foh:playback_FL; backline.soundcheck:t2_2 -> backline-test.foh:playback_FR
+  SetInput unknown: Call failed: "backline-test.foh" is not an input of take sc
+  both live: backline-test.mic-a:capture_FL -> backline-test.foh:playback_FL; backline-test.mic-b:capture_FR -> backline-test.foh:playback_FR
+  FOH live1        : L live  R live   ok
+  FOH loaded       : L live  R live   ok
+  FOH a_playback   : L take  R live   ok
+  FOH both_playback: L take  R take ; L at take frame 193920, R at take frame 193920: lockstep  ok
+  FOH b_playback   : L live  R take   ok
+  FOH live2        : L live  R live   ok
+  (live = the 1000/1500 Hz tones now on the mics; take = bit-exact samples of the recorded take)
+  RESULT: PASS (each input switches alone, playback is bit-exact and in lockstep)
+  links after live == before: yes
+  [crash with mic-a switched]
+  moves file: 1 link(s)
+  after SIGKILL: backline-test.mic-b:capture_FR -> backline-test.foh:playback_FR
+  after restart: backline-test.mic-a:capture_FL -> backline-test.foh:playback_FL; backline-test.mic-b:capture_FR -> backline-test.foh:playback_FR
+  recorderd: backline-recorderd: putting back 1 soundcheck link(s) left by a previous run
+  RESULT: PASS (a crash in playback loses the consumer's link; the next start puts it back)
+
+-- clean up
+test nodes left: 0; processes of this proof left: 0
+other nodes same as at start: yes (6 nodes)
+default sink after: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} (unchanged); default source unchanged; moved during the run: 23:44:46 sink={"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} source={"name":"alsa_input.pci-0000_00_1f.3.analog-stereo"}

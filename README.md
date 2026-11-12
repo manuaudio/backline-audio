@@ -34,7 +34,14 @@ The choices that shape the project are in [docs/DECISIONS.md](docs/DECISIONS.md)
 - **Record several nodes in one take, sample-aligned.** Output is WAV/BWF or
   FLAC, with a BWF time reference and a JSON sidecar. Tracks stay aligned
   even when one of the recorded sinks drives the graph, and there is a
-  pre-roll so a take never misses its first notes.
+  pre-roll so a take never misses its first notes. As a D-Bus service it arms,
+  records, stops, lists takes and sets markers; takes past 4 GB become RF64;
+  hardware input latency is compensated; a stalled disk loses nothing within
+  the ring (30 s by default); and a take plays back in place of its inputs
+  for a virtual soundcheck, input by input.
+- **One transport for the whole system.** The clock service owns PipeWire's
+  transport and bar (JACK apps see it as the JACK transport), generates and
+  chases LTC and MTC to the sample, and joins an Ableton Link session.
 
 ## On the desktop: Omarchy panels and a mixer
 
@@ -69,10 +76,12 @@ See [omarchy/README.md](omarchy/README.md) (panels, commands, menu, hotkeys, ins
 | `backline-plugin-worker` | One CLAP, VST3 or LV2 plugin as one PipeWire node, in its own process. MIDI in (follows hotplugged keyboards, releases stuck notes on unplug), audio in/out, params, notes, state and presets over D-Bus ([`Instance1`](docs/api/Instance1.md)) and localhost OSC | Built, measured |
 | `backline-hostd` | The supervisor (D-Bus `Host1`). It runs one worker per instance in a transient systemd user scope with resource limits. After a crash it restarts the worker with the saved plugin state (CLAP, VST3 or LV2), with backoff and a give-up limit. It refuses plugins the registry grades `fail` unless forced | Built, measured |
 | `backline-registry` + `backline-probe` | The plugin index (D-Bus `Registry1`, JSON `backline.plugins/1`). Each plugin is probed in its own process, sandboxed with timeouts, then graded and cached | Built, measured |
-| `backline-recorder` | N nodes into one take: WAV float/24-bit or FLAC, BWF `bext`, a sidecar with UTC, monotonic and graph timestamps. Signal alignment across driver and follower sinks, and pre-roll | Built, measured |
-| `libbackline` | The MIT C client library (sd-bus only, no PipeWire dependency): `Host1`, `Instance1`, `Registry1` calls and a signal watcher | Skeleton, used by the CLI |
+| `backline-recorder` | N nodes into one take: WAV float/24-bit (RF64 past 4 GB) or FLAC, BWF `bext`, markers as cue points, a sidecar with UTC, monotonic and graph timestamps. Signal alignment across driver and follower sinks, input-latency compensation, pre-roll | Built, measured |
+| `backline-recorderd` | The recorder as a D-Bus service ([`Recorder1`](docs/api/Recorder1.md)): arm, record, stop, markers, takes, a disk thread behind large rings, and virtual soundcheck (a take played back as its inputs, switched per input) | Built, measured |
+| `backline-clockd` | Transport, tempo and meter as PipeWire's position segment ([`Clock1`](docs/api/Clock1.md)), LTC and MTC generate and chase, Ableton Link (in its own process: Link is GPL) | Built, measured |
+| `libbackline` | The MIT C client library (sd-bus only, no PipeWire dependency): `Host1`, `Instance1`, `Registry1`, `Recorder1` and `Clock1` calls and a signal watcher | Skeleton, used by the CLI |
 | `backline` | The command line over `libbackline`; `--json` on every command | Built |
-| Clock/transport, player, control mapping, QML module | Ableton Link, LTC/MTC, playing files on the timeline, OSC/MIDI mapping | Design only ([ARCHITECTURE.md](ARCHITECTURE.md)) |
+| Player, control mapping, QML module | Playing files on the timeline, OSC/MIDI mapping | Design only ([ARCHITECTURE.md](ARCHITECTURE.md)) |
 
 In-graph CLAP effects (a plugin inside PipeWire's filter-chain, for device
 effects) are a separate project,
@@ -145,9 +154,14 @@ in [`docs/proofs/`](docs/proofs/).
 | [`formats-proof`](docs/proofs/formats-proof.txt) | VST3 (Surge XT, Dexed, Dragonfly) and LV2 (Odin2, CHOW Tape Model) in the worker: keyboard notes, OSC/D-Bus parameters, effects on a test signal, presets in all three formats, SIGKILL under hostd | Pitch within 0.12 cent in both formats. Reverb tail and tape harmonics measured. 2 986 CLAP, 32 VST3 and 94 LV2 presets listed; a load changes the sound in each format. After SIGKILL, every parameter value back (VST3 at 32-bit float precision, LV2 exact) and the same level and pitch |
 | [`registry-proof`](docs/proofs/registry-proof.txt) | Full scan of `~/.clap`, `~/.vst3` and `~/.lv2`, plus crash and hang test plugins | 645 plugins in 13.4 s cold (10 s of that is the hang plugin's timeout) and 1.6 s warm. The crash (SIGSEGV) and the hang were graded fail, and their helper processes were killed |
 | [`recorder-proof`](docs/proofs/recorder-proof.txt) | One signal into two sinks, one of them the graph driver, at quantum 2048 and 256; pre-roll | Bit-identical tracks at lag 0, where raw graph alignment is off by exactly one quantum. The pre-roll take is identical to the matching stretch of a reference take |
+| [`recorderd-proof`](docs/proofs/recorderd-proof.txt) | The D-Bus recorder: API and markers; input-latency compensation with fake devices of known latency; 12 s and 8 s disk stalls during a 40 s take; virtual soundcheck and a crash while switched | Each track lines up by exactly its latency. 0 frames lost to the stalls (every frame equals an unstalled reference). Playback bit-exact and in lockstep; links restored, even after SIGKILL |
+| [`rf64-proof`](docs/proofs/rf64-proof.txt) | A live 16-channel take of 1460 s (4.2 GiB in one file), with an independent second recorder | A valid RF64 file (ds64 sizes match), every frame there, bext and cue markers intact, 0 ring overruns; continuity is only as good as the graph's scheduling (see the report) |
+| [`rescan-proof`](docs/proofs/rescan-proof.txt) | The shipped rescan units verified; the same watch as a transient unit over throwaway plugin directories | An install, a pacman-style stamp and a removal each rescan once, ≈ 2.1 s after the change |
+| [`clockd-proof`](docs/proofs/clockd-proof.txt) | Transport and bar seen by a native PipeWire node; LTC/MTC generate and chase (25, 29.97 DF, 24, 30 fps), through a sink monitor and a jump; Link with a second peer | Frames and bar exact to the tick. LTC/MTC frame starts within 2 samples (0 at 25/30 fps); chase locked in 37-75 ms with 0 samples of error. Link: tempo both ways, beat phase within 0.63 ms |
 
 ```sh
 tests/host-proof; tests/hostd-proof; tests/formats-proof; tests/registry-proof; tests/recorder-proof
+tests/recorderd-proof; tests/rf64-proof; tests/clockd-proof; tests/rescan-proof
 ```
 
 The proofs need a running PipeWire (≥ 1.4) with WirePlumber, a systemd user
@@ -163,16 +177,24 @@ Dexed, Dragonfly Hall Reverb (VST3), Odin2, CHOW Tape Model and Cardinal
   grades VST3 on loading only. LV2 parameters are control ports only, not
   `patch:Parameter` (so Surge XT's LV2 shows two). Presets are saved only
   for VST3 (`.vstpreset`).
-- **No plugin GUIs, no transport** (`clap_process.transport` is null; VST3
-  gets a fixed 120 BPM context). The clock service is still design.
+- **No plugin GUIs.** The worker doesn't take the clock's transport yet
+  (`clap_process.transport` is null; VST3 gets a fixed 120 BPM context).
+- **The clock follows PipeWire's driver.** Its transport is the driver's: run
+  clockd in the graph whose transport you want. Two clockds under one driver
+  fight over it. The bar has tick resolution (1/1920 beat).
 - **State is whatever the plugin saves.** hostd restores the plugin's state;
   a plugin that leaves something out of its state loses it on a restart. A
   note held at the moment of a crash is cut, and the next note-on sounds.
 - **Recorder alignment** follows PipeWire's scheduling, as measured: a sink
   that drives the graph is one cycle late on its monitor. It holds through
   quantum and driver changes, but the cycle where the driver changes can
-  glitch on that track. PipeWire's reported port latencies are logged, not
-  applied, and hardware capture latency isn't compensated yet.
+  glitch on that track. Hardware capture latency is compensated from what the
+  device reports (measured with fake devices, not yet against a real
+  converter's measured round trip).
+- **Virtual soundcheck moves links.** A consumer's links from an input are
+  moved to the playback node and put back on live (also after a crash, on the
+  next start). A session manager that re-links a stream while the input is in
+  playback is undone each time; no resampling if the take's rate differs.
 - **Realtime scheduling was off** in the proofs (no rtkit on the test machine).
   They pass at quantum 128 anyway, but this is not a latency benchmark.
 - **Probes run with your real `$HOME`.** A plugin can write its own settings
@@ -185,8 +207,8 @@ MIT; see [LICENSE](LICENSE). The vendored `third_party/clap` is free-audio/clap
 (MIT).
 
 Everything Backline exposes stays MIT: the C library, the CLI and the D-Bus
-API. GPL components that Backline will use (Ableton Link in the clock
-service, Carla's bridges for odd plugin formats) run in their own processes
+API. GPL components that Backline uses (Ableton Link, compiled into
+`backline-clockd`, which makes that one binary GPL-2.0-or-later; Carla's bridges for odd plugin formats) run in their own processes
 and are reached over IPC only. **That boundary is a design choice to keep the
 licensing simple, not legal advice**; see
 [docs/DECISIONS.md](docs/DECISIONS.md) (D3).
