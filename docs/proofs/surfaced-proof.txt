@@ -1,0 +1,127 @@
+== surfaced-proof 2026-11-12T12:44:12-08:00
+pipewire 1.6.8, kernel 7.2.5-3-omarchy, load 2.35 2.03 1.96
+the user's graph: 15 nodes (left alone)
+
+-- A. a private PipeWire instance
+  PASS  private PipeWire is up, with only its dummy driver
+
+-- B. Params1 over D-Bus
+  PASS  the mixer registered /mix (24 channels and 64 extra: 285 parameters)
+  PASS  List /mix/in.1/* returns its 9 parameters and the meter ids
+  PASS  Get /mix/in.3/fader: -6 dB, text '-6.0 dB'
+  PASS  Set reaches the mixer as a Set signal (role all) and it confirms with Update
+  PASS  a Set in a role the program never defined is refused (read only)
+  PASS  a Gesture on a parameter that isn't automatable is refused
+  PASS  a Set of a string to a float is refused
+  PASS  a second program can't take /mix
+
+-- C. Params1 over OSC
+        listeners: udp:127.0.0.1:35515 (role all), udp:127.0.0.1:47254 (read-only); a third without params serves Control1 only
+  PASS  get: /mix/in.1/fader replies 'f -2.0 s "-2.0 dB"'
+  PASS  /backline/get /mix/in.2/* replies with its 9 parameters
+  PASS  sub: the current value at once, then the echo of each set once the mixer confirms
+  PASS  the sets reached the mixer as osc:udp:127.0.0.1:* in role all
+        OSC set -> mixer -> Update -> echo to the subscriber: 5.677333 ms
+  PASS  /touch 1 and 0 reach the mixer as Gesture begin and end
+  PASS  a read-only listener: the set is refused with /backline/error, a get still works
+  PASS  an unknown path under a registered root gets /backline/error
+  PASS  over UDP one request answers at most 256 values, then /backline/error (no amplification)
+  PASS  a listener without a params role answers nothing (Control1 rule 7 holds)
+        200 changes in ~1.3 s: 36 replies at a 30/s cap, the last 100.0
+  PASS  the burst is rate-limited (<= 30/s + the first) and ends on the final value 100
+  PASS  meter stream: /mix/meter/in.1 at ~15/s with -6 dB, in.2 with clip
+        meter frames for in.1 in 1 s: 15
+
+-- D. Control1 MIDI additions, against a software generic controller
+  PASS  four mappings with the new options are accepted
+  PASS  a relative encoder with takeover is refused (it never jumps)
+        cc14 7/39 = 64/0 -> in.1 fader -9.998779 dB
+  PASS  14-bit CC (MSB 64, LSB 0) sets the fader to the middle of the law: -10 dB
+  PASS  gesture: auto opens before the value and ends 300 ms after the burst
+  PASS  feedback: the confirmed value goes back on the same 14-bit CC (b0 07 40, b0 27 00)
+  PASS  NRPN 291 (0x0123), data 127/127: in.2 fader to the top, +10 dB
+  PASS  NRPN feedback: 4 CCs (99, 98, 6, 38) back to the controller
+        relative encoder (two's complement): +3 then -1 ticks of 1 % -> pan 6.000000 4.000000 
+  PASS  relative encoder: +3 then -1 ticks of 1% move the pan 6 then 4 (of -100..100)
+        soft takeover (pickup): in.8 at -16 dB (0.425 of travel); CC 10 and 50 ignored (0 sets), CC 60 crosses it (1)
+  PASS  pickup: no set until the control crosses the parameter, then it follows
+  PASS  a change on the mixer's side is fed back to the encoder's LED ring (CC 16 = 95)
+
+-- E. backline-surfaced and two software devices (X-Touch Extender, X-Touch)
+  PASS  both devices detected by port name, handshake answered (device query, serial)
+  PASS  unit ids from profile and serial: behringer-xtouch-ext@EXT0001, behringer-xtouch@XT00002
+  PASS  automatic grouping: the extender and the X-Touch in one group (g1)
+  PASS  the group is 16 wide, extender on the left
+        extender LCD: "KickIn KickOt SnarTp SnarBt HiHat  Tom 1  Tom 2  FlorTm "
+        X-Touch   LCD: "OH L   OH R   BassDI BassMc Gtr L  Gtr R  Keys L Keys R "
+  PASS  scribble strips: inputs 1-8 on the extender, 9-16 on the X-Touch
+  PASS  X-Touch colours from the mixer's #rrggbb: red, (orange->)yellow, green, blue, ...
+  PASS  line 2: the pan value (pot mode pan)
+  PASS  faders where the mixer's values are (in.6 -12 dB = 0.475 of travel, main 0 dB = 0.75)
+  PASS  assignment display shows the view code (In)
+  PASS  meters reach the device (in.1 at -6 dB, in.2 clipping)
+
+-- F. faders both ways, touch, motor feedback
+  PASS  an untouched fader move is never applied (motor overshoot rule)
+  PASS  touch -> Gesture begin on /mix/in.11/fader (from surface:behringer-xtouch@XT00002)
+  PASS  moves while touched set the parameter (12000/16383 = 0.7325 of travel -> -0.701337 dB)
+        surface move -> the mixer's Set: 5232 us (sim -> PipeWire -> surfaced -> controld -> mixer)
+  PASS  the position is echoed while held (the servo holds)
+  PASS  release -> Gesture end
+  PASS  after release the motor holds the confirmed value
+  PASS  the mixer moves in.5 to 0 dB: the extender's motor follows (0.75 of travel)
+  PASS  a renamed channel shows on the scribble strip
+
+-- G. banking across both units
+  PASS  Bank > moves the 16-wide window to the last bank (offset 8 of 24)
+  PASS  the assignment display shows the bank (I2) for a second
+  PASS  Channel < moves by one (offset 7)
+  PASS  Shift + Bank < goes to the first bank
+
+-- H. buttons and LEDs
+  PASS  Mute 2 on the extender toggles /mix/in.2/mute; its LED lights
+  PASS  and off again
+  PASS  Solo 1 on the X-Touch is in.9's solo
+  PASS  an unbound global button reaches the program as an Action (f1)
+
+-- I/J. the 8 view layers and flip
+  PASS  the layer-5 button (AUX) shows the aux view; its LED is lit, INPUTS' is not
+  PASS  INPUTS (layer 2) brings the inputs back at the same window
+  PASS  Flip: the faders take the pots' function (pan; in.1 centre = half travel), Flip LED on
+  PASS  Flip again: the faders are faders
+
+-- K/L. pots, selection, a strip pot mode
+  PASS  V-Pot 1 +5 ticks: in.1 pan +5 (of -100..100, 1 % a tick), a gesture around it
+  PASS  the ring follows (dot mode, position 6-7 of 11)
+  PASS  Select 3 -> Action select:in.3 -> the mixer's SetSelected -> its LED
+  PASS  EQ (a strip mode on the selected channel): strip 1 'LF G', strip 2 'Pan'
+  PASS  its pot 1 moves in.3's EQ low gain
+  PASS  Assign: Pan returns to the pan mode
+
+-- M. displays
+  PASS  Text: a message across both units' displays
+  PASS  and it goes after its time
+  PASS  the timecode display bound to a string parameter
+  PASS  F2 bound to an action: the mixer's talkback goes on while held
+
+-- N. hot-plug: the X-Touch unplugged while a fader is held
+  PASS  the held fader's gesture ends
+        unplug -> Gesture end at the mixer: 1139 us (node gone -> surfaced -> controld -> mixer)
+  PASS  within 50 ms of the unplug
+  PASS  the unit is gone, its place kept; the window is dealt again over the extender (width 8)
+        plug -> redrawn (names on the strips): 1068 ms (handshake + the 1 s greeting)
+  PASS  plugged back: online in the same group, same place, fully redrawn
+
+-- O/P. two groups, a locked view; a restart restores them
+  PASS  the extender alone in 'mon', locked to the aux view; the X-Touch alone in g1
+  PASS  banking on the X-Touch doesn't move the locked extender
+  PASS  the extender's sets go out in the 'mon' group's role 'monitor': refused, the mixer defined no such role
+  PASS  clean shutdown: both devices dark, faders down, offline (a 112-character LCD write through PipeWire)
+  PASS  the groups were saved
+  PASS  after a restart the units come back into their saved groups
+  PASS  and the locked extender shows aux again
+
+  PASS  the user's graph has no node of this proof, before or after
+the user's graph: 15 nodes after (was 15)
+
+RESULT: 82 passed, 0 failed

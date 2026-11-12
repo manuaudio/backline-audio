@@ -129,3 +129,39 @@ reaches the graph.
 ## Open infrastructure for a proprietary-friendly console (2026-11-12)
 Manu: "I just don't want any of this to be proprietary except the actual PROGRAM that is the mixer, the infrastructure below should be all free, open source, OMARCHY."
 Backline is the open infrastructure layer. Control-surface drivers and profiles (MCU, HUI, FIT, generic MIDI learn) and the network DSP offload (server node, transport, clocking, failover) belong in Backline, MIT-licensed. Mixer programs, open or proprietary, sit on top and use only Backline's public APIs.
+
+## D8. Params1 lives in controld; surfaces are their own daemon (2026-11-12)
+
+**Decision.** The parameter tree a program publishes (`Params1`) is served by
+`backline-controld`, on its bus name, next to `Control1`. Control surfaces
+are a separate process, `backline-surfaced` (`Surface1`), a client of
+`Params1` like any other.
+
+**Why.** controld already owns everything that reaches parameters from the
+room (OSC listeners and their security rules, MIDI mapping), so a tree there
+is reachable from OSC, from generic MIDI mappings (`param:` targets) and from
+surfaces with one set of rules, roles and rate limits. Surfaces parse input
+from USB devices of every quality and pace output to slow ones; a buggy
+device or driver must not stall OSC control or the program, so they get
+their own process (§0.2, "one process per risk"). The program stays the
+source of truth: neither process ever changes a published value itself.
+
+**Revisit when** a surface needs a round trip to the program faster than the
+bus allows (it doesn't today: a fader move reaches the program in about a
+millisecond), or the surface code moves to a control head machine of its own
+(then `Params1` needs an authenticated network transport; see the spec's
+redundancy note).
+
+## D9. Surface proofs run on a private PipeWire instance (2026-11-12)
+
+**Decision.** `tests/surfaced-proof` starts its own PipeWire daemon (its own
+socket, a dummy driver, no devices or session manager) and runs every node of
+the proof there, instead of on the user's graph with throwaway nodes.
+
+**Why.** A software control surface is a MIDI source, and other programs on
+the machine may follow every MIDI source (an instrument host set to "any
+keyboard" would play the surface's button presses as notes). On a private
+instance nothing outside the proof can see its devices, and the proof can't
+touch anything outside it. The user's graph is listed before and after to
+show it is untouched. Real-hardware checks run on the real graph, by hand
+(docs/HARDWARE-TEST.md).

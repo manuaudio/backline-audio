@@ -55,10 +55,10 @@ effect-insert component.
  (plugin index,      (supervisor)                ├ PipeWire node: midi_in, in_*, out_*  │
   validation)              │                     ├ D-Bus Instance1 · OSC 127.0.0.1      │
                            │                     └ CLAP, VST3, LV2 behind one interface  │
- backline-recorderd   backline-playerd     backline-clockd                backline-controld
- (N nodes → aligned   (files → nodes,      (transport + tempo = the       (OSC/MIDI → any
-  BWF/FLAC takes)      on the timeline)     PipeWire segment owner;         parameter, volume,
-                                             Link, LTC/MTC gen + chase)     transport)
+ backline-recorderd   backline-playerd     backline-clockd                backline-controld ◄── backline-surfaced
+ (N nodes → aligned   (files → nodes,      (transport + tempo = the       (OSC/MIDI → any    (MCU-family
+  BWF/FLAC takes)      on the timeline)     PipeWire segment owner;         parameter; Params1: surfaces → Params1
+                                             Link, LTC/MTC gen + chase)     programs' trees)   via Surface1 views)
         └──────────────────────── PipeWire graph (one clock) ───────────────────────────┘
                  clap-pipewire: CLAP as filter-chain "type = clap" (device effects, in-graph)
 ```
@@ -70,7 +70,8 @@ effect-insert component.
 | `backline-recorderd` | Records any set of nodes to sample-aligned, timestamped multitrack WAV/BWF (RF64 past 4 GB) or FLAC; virtual soundcheck | C | **Built and measured** (§4.2, §4.6, §4.7): `Recorder1`, markers, takes, input-latency compensation, stall-proof disk thread, soundcheck |
 | `backline-playerd` | Plays files into the graph on the shared timeline: each file a node, starting on an exact transport frame, with its own gain | C | **Built and measured** (§4.9): `Player1`, sample-exact starts, streaming past an in-memory head |
 | `backline-clockd` | Transport, tempo and timecode: the PipeWire timeline owner, Ableton Link, LTC/MTC generation and chase | C++ (Link is C++) | **Built and measured** (§4.8): `Clock1`, LTC/MTC to the sample, Link |
-| `backline-controld` | Maps OSC and MIDI to any parameter in the system: Backline instances, filter-chain/clap-pipewire controls, volumes, transport, recorder | C | **Built and measured** (§4.11): `Control1`, MIDI and OSC learn, no socket unless asked, allow-lists and TCP secrets |
+| `backline-controld` | Maps OSC and MIDI to any parameter in the system: Backline instances, filter-chain/clap-pipewire controls, volumes, transport, recorder; serves the parameter trees programs publish (`Params1`) | C | **Built and measured** (§4.11, §4.12): `Control1`, MIDI and OSC learn, no socket unless asked, allow-lists and TCP secrets; `Params1` with OSC get/set/subscribe and meters; 14-bit CC, NRPN, relative encoders, takeover, MIDI feedback |
+| `backline-surfaced` | Control surfaces (Mackie Control family: MCU Pro/XT, X-Touch/Extender) for any program: detection, handshake, groups of units, views, banking, layers, flip, motor faders, scribble strips, meters, hot-plug | C | **Built; measured against software devices only** (§4.12): `Surface1`; a real-hardware pass is pending ([HARDWARE-TEST.md](docs/HARDWARE-TEST.md)) |
 | `libbackline` + `backline` CLI + `Backline` QML module | The client surface for apps and Omarchy panels | C (lib), C (CLI), C++/QML (module) | Library skeleton and CLI built (host, instance, plugins, rec); QML is design |
 | clap-pipewire (separate project) | CLAP effects inside filter-chain: device effects and virtual sinks, in-graph | C | v0.1, separate project |
 
@@ -534,6 +535,29 @@ effect-insert component.
     liblo would have been a new dependency, and owning the sockets keeps the
     security rules in one small file.
   - mididings (GPL) only as a design reference for mapping rules.
+- **Params1: a program publishes its parameter tree** (built, §4.12,
+  [Params1.md](docs/api/Params1.md)). A program (a mixer, open or
+  proprietary, a DAW, a script) registers a root (`/console`) with typed
+  parameters (ranges, units, tapers including a console fader law, value
+  text, `automatable`/`read-only`), pushes confirmed values with `Update`, and
+  hands over a sealed memfd meter table (a seqlock; no bus traffic per meter
+  value). Clients ask (`Set`, `Gesture`); the owner gets a unicast signal,
+  applies the change its own way and confirms. The open layer never owns the
+  program's state. Roles name the path patterns a client may write. A client
+  that leaves the bus has its gestures ended for it; an owner that leaves has
+  its root removed.
+- **OSC replies and subscriptions** (built): a listener given a `params`
+  role serves the tree to its peers: get, set, `/norm`, `/touch`,
+  subscriptions with a rate cap per path, meter streams, `/backline/error`
+  answers. UDP subscriptions expire without a renewal; TCP ones live with the
+  connection. Without that option a listener is exactly what it was
+  (security rule 7 holds).
+- **MIDI additions** (built): `midi:cc14`, `midi:nrpn`, `midi:rpn` sources;
+  relative encodings (two's complement, sign-magnitude, binary offset,
+  increment/decrement) with step and acceleration; soft takeover (pickup,
+  scale); `param:` targets with automatic gestures; and a MIDI **output**
+  port (`SetMidiOut`) for feedback to motor faders and LED rings. The pure
+  parts (decoders, takeover, feedback bytes) are in `mapping.c`, unit-tested.
 - **Omarchy.** Nothing directly.
 
 ### 2.7 Client surface: `libbackline`, `backline`, QML module
@@ -574,6 +598,45 @@ effect-insert component.
     controld maps to them.
   - Its host core, `cph_*`, as the worker's CLAP engine, once that's
     agreed (§6).
+
+### 2.9 Surfaces: `backline-surfaced`
+
+- **Job.** Hardware control surfaces for any program
+  ([Surface1.md](docs/api/Surface1.md)). The program pushes **views**
+  (ordered slots whose fader, pots, buttons, name, colour and meter are bound
+  to `Params1` paths) and pot modes; surfaced puts them on whatever is
+  plugged in. It knows devices, views, slots and paths, never what an aux or
+  a DCA is: spill, "mix on faders" and follow-selection are a program's
+  policy, built from `PushView`/`PopView`, `SetPotMode`, `SetSelected`,
+  `SetFlip` in answer to `Action` signals.
+- **Process model.** Its own process, next to controld (§0.2: a surface
+  driver parses device input, and a misbehaving device must not stall OSC
+  control or the mixer). All on the main loop. Devices are found as PipeWire
+  MIDI ports (the MIDI bridge's, or any node's), matched against profiles
+  (`*.surface.json`, data, user-overridable), paired by node and alias. Each
+  unit gets a small node with a MIDI port each way, linked to the device
+  (links die with surfaced); its process callback only moves bytes between
+  the ports and two wait-free rings. A byte-stream parser reassembles SysEx.
+- **The engine** (`surface/engine.c`, pure, unit-tested in CI against the
+  software device model). Feedback is computed, not queued: every 5 ms it
+  works out what each device should show and sends the differences in
+  priority order (motors, LEDs, rings, meters, text) within the unit's byte
+  budget and per-element rate caps. A value that changed ten times since the
+  last send is sent once; a replugged device is redrawn by forgetting what
+  it was sent. Safety: an untouched fader never moves a parameter (motor
+  overshoot); touch is a `Params1` gesture; an unplug ends every gesture of
+  that unit at once; a touch held 60 s without motion ends its gesture.
+- **Groups.** Units of one group (an X-Touch and its Extender) are one wide
+  window; a unit's id is its profile and serial (from the MCU handshake), so
+  a replugged unit returns to its group and place. Groups, roles and locked
+  views are kept in `$XDG_STATE_HOME/backline/surfaces.json`.
+- **Drivers.** MCU now (Mackie and Logic Control handshakes, faders, touch,
+  V-Pots and rings, 2×56 LCD, X-Touch colours, meters, 7-segment displays,
+  every button id). HUI, the Waves FIT's native mode and others are next
+  (§5). Written from the Logic Control MIDI implementation and the console
+  spec's tables; Ardour's GPL surface code was read for facts only.
+- **Omarchy.** A panel row listing surfaces is plausible once a mixer uses
+  them.
 
 ## 3. What exists and is reused (not rebuilt)
 
@@ -970,6 +1033,54 @@ non-Backline node. Full report in `docs/proofs/controld-proof.txt`.
   address still gets in. `Save` writes mode 0600; a restart restores the same
   mappings and listeners; no socket is left after exit.
 
+### 4.12 Surfaces and Params1 (`tests/surfaced-proof`)
+
+On a **private PipeWire instance** (its own socket and a dummy driver, no
+devices) in its own network namespace, on a private bus, with the user's
+graph checked before and after (nothing of the proof ever appears in it).
+A stub mixer (`tools/test-mixer.c`, public APIs only) registers 24 channels
+(285 parameters, 64 of them bulk, and a meter table) and pushes views; two software devices
+(`tools/mcu-sim.c`: an X-Touch Extender and an X-Touch, the device side of
+the protocol with motor faders, touch and displays) stand in for hardware,
+and a third plays a generic CC/NRPN controller. 82 checks; full report in
+`docs/proofs/surfaced-proof.txt`.
+
+- **Params1 over D-Bus and OSC.** A Set reaches the mixer as a unicast
+  signal and comes back as an `Update`; an undefined role, a read-only
+  listener, a non-automatable gesture, a wrong type and a second owner are
+  refused. OSC set → mixer → echo to the subscriber ≈ 5 ms. 200 changes in
+  1.3 s against a 30/s subscription: 35 replies, ending on the final value.
+  Meter stream 15 frames a second.
+- **MIDI additions.** A 14-bit CC (64/0) sets the middle of the fader law
+  (-10.0 dB) with an automatic gesture; NRPN 291 at 127/127 sets +10 dB; both
+  are fed back on the same CCs once the mixer confirms; a two's-complement
+  encoder moves pan +3 and -1 ticks; pickup ignores the control until it
+  crosses the parameter; a change from the mixer reaches the encoder's ring.
+- **Surfaces.** Detection by port name and the MCU handshake (unit ids
+  `behringer-xtouch-ext@EXT0001`, `behringer-xtouch@XT00002`), one 16-wide
+  group; names, colours, faders, meters and the assignment display as the
+  mixer has them. A touched fader move reaches the mixer in 0.7-5.3 ms
+  (within one graph cycle: 5.3 ms at quantum 256); an untouched one never does; the position is
+  echoed while held and the motor keeps the confirmed value after release; a
+  change in the mixer moves the motor. Banking, channel and first-bank;
+  Mute/Solo with their LEDs; the layer buttons (Aux, Inputs) with LEDs; flip;
+  pots with rings and gestures; Select → the mixer's `SetSelected` → an EQ
+  strip mode on that channel; a message across both displays; the timecode
+  display bound to a string parameter; F2 bound to the mixer's talkback.
+- **Hot-plug.** The X-Touch unplugged while a fader is held: the gesture
+  ends well inside 50 ms; the window is dealt again over the extender (8
+  wide); plugged back, it returns to its place and is redrawn (about 1 s,
+  the greeting included).
+- **Groups and restarts.** The extender alone in a group locked to the aux
+  view, not following the other's banking; its sets go out in its group's
+  role (refused: the mixer defined none). A clean stop leaves both devices
+  dark and offline (a 112-character LCD write through PipeWire); a restart
+  restores the saved groups.
+- **In CI** (`tests/unit/test_surface.c`): the same engine against two
+  device models in simulated time, 233 checks, including a DIN-paced full
+  redraw (577 bytes, complete in 190 ms, at most 315 bytes in any 100 ms).
+- **Not measured: real hardware.** Pending; [HARDWARE-TEST.md](docs/HARDWARE-TEST.md).
+
 ## 5. Build order
 
 1. **Host supervisor and client skeleton.** *Done (§4.3).*
@@ -1008,10 +1119,23 @@ non-Backline node. Full report in `docs/proofs/controld-proof.txt`.
    per-file gain. Still open: resampling, loops and cue lists, OSC.
 7. **Control service.** *Done (§4.11)*: OSC and MIDI mapping across
    Backline, filter-chain controls and volumes, with MIDI and OSC learn.
-   - Still open: OSC replies (a surface reading values back), relative
-     encoders and 14-bit CC pairs, and `Clock1.Tempo` reading the anchor
-     while the transport is stopped (today it shows the last rolled tempo).
-8. **Omarchy PRs**, each one problem with measured evidence, in this order:
+   - *Done (§4.12)*: OSC replies and subscriptions (through `Params1`),
+     relative encoders, 14-bit CC pairs, NRPN/RPN, soft takeover, MIDI
+     feedback out.
+   - Still open: `slot:` targets (a generic box banking with a surface
+     group's views) and `Clock1.Tempo` reading the anchor while the transport
+     is stopped (today it shows the last rolled tempo).
+8. **Surfaces.** *Built (§4.12)*: `Params1` in controld, `backline-surfaced`
+   with `Surface1`, the MCU driver and profiles for the MCU Pro/XT and the
+   X-Touch/Extender, tested against software devices.
+   - Pending: the bench pass on real devices ([HARDWARE-TEST.md](docs/HARDWARE-TEST.md)).
+   - Next: the HUI driver (keepalive, zones, 4-character text, stereo
+     meters); the Waves FIT in MCU mode (two units, one profile) and then its
+     native LV1-mode driver after a bench capture; more MCU profiles (X-Touch
+     One, iCON, FaderPort in MCU mode, …); `Instance1` additions surfaces want
+     (value text, gesture passthrough, `ParamsChanged`, latency); a user unit
+     to start surfaced at login.
+9. **Omarchy PRs**, each one problem with measured evidence, in this order:
    - "Record this app or device" (a panel action over `backline rec`);
    - "Play a system instrument from any MIDI keyboard" (an instrument
      picker from the registry);

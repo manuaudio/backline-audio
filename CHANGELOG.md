@@ -38,6 +38,41 @@ WirePlumber 0.5.17).
 - **Registry**: a crash reason quotes the plugin's own error (Cardinal Synth
   aborts on a corrupt settings file and is graded fail, correctly).
 
+### New
+
+The surface layer below is tested against software devices only; a pass on
+real hardware comes first ([docs/HARDWARE-TEST.md](docs/HARDWARE-TEST.md)).
+
+- **`Params1`: a program publishes its parameter tree**
+  ([Params1](docs/api/Params1.md)), served by controld. Typed parameters
+  (ranges, units, linear/log/console-fader tapers, value text, automatable,
+  read-only), confirmed values with `Update`, a sealed shared-memory meter
+  table, roles; clients ask with `Set` and `Gesture` and the program decides.
+  Over OSC (opt-in per listener, `params` role): get, set, `/norm`, `/touch`,
+  rate-limited subscriptions with echo, meter streams, error replies.
+- **Control service additions** ([Control1](docs/api/Control1.md)):
+  `midi:cc14`, `midi:nrpn` and `midi:rpn` sources; relative encoders
+  (`rel-2c`, `rel-sm`, `rel-offset`, `rel-inc-dec`, with step and
+  acceleration); soft takeover (`pickup`, `scale`); `param:` targets with
+  automatic gestures; a MIDI output port (`SetMidiOut`) with feedback to
+  motor faders and LED rings. `backline map out`, `backline map listen
+  --params`, new `backline map add` options; libbackline
+  `bl_control_set_midi_out`, `bl_control_listen_params`.
+- **Surface service, `backline-surfaced`** ([Surface1](docs/api/Surface1.md)).
+  Mackie Control surfaces for any program: detection by port and handshake,
+  profiles as data (`*.surface.json`: MCU Pro, MCU XT, X-Touch, X-Touch
+  Extender), groups of units as one wide surface, views of slots bound to
+  `Params1` paths, banking, the 8 view layers, flip, push/pop (spill), pot
+  modes across and per channel strip, motor faders with touch and gestures,
+  scribble strips with X-Touch colours, meters, paced output, hot-plug that
+  ends a held fader's gesture and puts a replugged unit back in its place.
+- **Test tools**: `backline-test-mcu-sim` (a software X-Touch/MCU on
+  PipeWire, also a generic CC/NRPN controller) and `backline-test-mixer` (a
+  stub program on the public APIs). Proof: `tests/surfaced-proof`, 82 checks
+  on a private PipeWire instance (`docs/proofs/surfaced-proof.txt`); in CI
+  the engine against two device models, 233 checks.
+
+
 ## 0.4.0 (2026-11-12)
 
 Mac-style pro audio for Omarchy Linux: files on the shared timeline,

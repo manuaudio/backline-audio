@@ -72,6 +72,13 @@ The choices that shape the project are in [docs/DECISIONS.md](docs/DECISIONS.md)
   parameters, volumes, the transport and the recorder, with MIDI and OSC
   learn. No network socket unless you ask for one; beyond localhost only with
   an allow-list, and TCP only with a shared secret.
+- **Motor faders for any program** (new, not yet tested on real hardware).
+  A program publishes its parameters (`Params1`) and pushes views of channel
+  strips; Mackie Control surfaces (X-Touch and Extender, MCU Pro and XT) bank,
+  flip, show names, colours and meters, and follow touch, through
+  `backline-surfaced` (`Surface1`). OSC tablets subscribe to the same tree;
+  generic MIDI boxes get 14-bit CC, NRPN, relative encoders, soft takeover
+  and feedback.
 
 ## On the desktop: Omarchy panels and a mixer
 
@@ -109,6 +116,7 @@ See [omarchy/README.md](omarchy/README.md) (panels, commands, menu, hotkeys, ins
 | `backline-recorderd` | The recorder as a D-Bus service ([`Recorder1`](docs/api/Recorder1.md)): arm, record, stop, markers, takes, a disk thread behind large rings, and virtual soundcheck (a take played back as its inputs, switched per input) | Built, measured |
 | `backline-clockd` | Transport, tempo and meter as PipeWire's position segment ([`Clock1`](docs/api/Clock1.md)), LTC and MTC generate and chase, Ableton Link (in its own process: Link is GPL) | Built, measured |
 | `backline-controld` | OSC and MIDI mapped to any parameter ([`Control1`](docs/api/Control1.md)): plugin parameters, volumes and mutes, filter-chain controls, transport and recorder; MIDI and OSC learn. Opens no network socket unless asked; beyond localhost it needs an allow-list, and TCP a shared secret | Built, measured |
+| `backline-surfaced` | Control surfaces for any program ([`Surface1`](docs/api/Surface1.md)) over the parameter trees programs publish ([`Params1`](docs/api/Params1.md), served by controld): MCU-family detection and handshake, groups of units, views, banking, layers, flip, motor faders, scribble strips, meters, hot-plug | Built, tested against software devices; real hardware pending ([checklist](docs/HARDWARE-TEST.md)) |
 | `libbackline` | The MIT C client library (sd-bus only, no PipeWire dependency): `Host1`, `Instance1`, `Registry1`, `Recorder1`, `Clock1`, `Player1` and `Control1` calls and a signal watcher | Skeleton, used by the CLI |
 | `backline` | The command line over `libbackline`; `--json` on every command | Built |
 | `backline-playerd` | Files played into the graph on the shared timeline ([`Player1`](docs/api/Player1.md)): one node per file, a start on an exact transport frame (frames, `tc:`, `bbt:`), per-file gain, streaming past an in-memory head | Built, measured |
@@ -196,6 +204,7 @@ in [`docs/proofs/`](docs/proofs/).
 | [`rf64-proof`](docs/proofs/rf64-proof.txt) | A live 16-channel take of 1460 s (4.2 GiB in one file), with an independent second recorder | A valid RF64 file (ds64 sizes match), bext and cue markers intact, 0 ring overruns. All 70 080 000 frames continuous and identical to the reference, 0 missed cycles (quantum 1024, own driver, other agents' work at load ≈ 2; see the report) |
 | [`rescan-proof`](docs/proofs/rescan-proof.txt) | The shipped rescan units verified; the same watch as a transient unit over throwaway plugin directories | An install, a pacman-style stamp and a removal each rescan once, ≈ 2.1 s after the change |
 | [`controld-proof`](docs/proofs/controld-proof.txt) | MIDI CC and OSC to a plugin parameter, the transport, the recorder, a sink's volume and mute; MIDI and OSC learn; the network rules, in its own network namespace | No socket by default; 8 unsafe listeners refused. A CC lands on exactly the value D-Bus would set (0.00 dB apart), 5-7 ms from keyboard to sound. Volume exact to 0.001 dB. Wrong secrets, peers off the allow-list, malformed packets and floods change nothing |
+| [`surfaced-proof`](docs/proofs/surfaced-proof.txt) | Params1 over D-Bus and OSC with a stub mixer; Control1's 14-bit CC, NRPN, relative encoder, takeover and feedback with a software controller; surfaced with a software X-Touch and Extender as one 16-strip group, on a private PipeWire instance | 82 checks. A touched fader reaches the program within one graph cycle (0.7-5.3 ms), untouched moves never; motors follow the program; banking, layers, flip, pots, meters, displays; an unplug while a fader is held ends its gesture within 50 ms and a replug returns the unit to its place |
 | [`player-proof`](docs/proofs/player-proof.txt) | Two files on clockd's timeline (one at a frame, one at `bbt:3\|1\|0`, −6 dB) into native capture nodes; play, locates while rolling and stopped, a gain change; at quantum 128 and 1000 | Every received sample bit-identical to the file at (transport − start) × gain (1.8 M samples per run; only the one gain-ramp cycle differs). Each start on its exact frame, on a cycle boundary or inside a cycle. 0 underruns |
 | [`transport-proof`](docs/proofs/transport-proof.txt) | Beat-click test plugins (CLAP, VST3, LV2) and Odin2's arpeggiator in the worker while clockd changes tempo and meter, locates and stops | Every click on the sample PipeWire's transport gives (0 samples off clockd's tempo map for CLAP and VST3, 0–1 for LV2). Odin2's steps on clockd's grid at 120 and 90 BPM in all three formats, with Odin2's own constant lead |
 | [`clockd-proof`](docs/proofs/clockd-proof.txt) | Transport and bar seen by a native PipeWire node; LTC/MTC generate and chase (25, 29.97 DF, 24, 30 fps), through a sink monitor and a jump; Link with a second peer | Frames and bar exact to the tick. LTC/MTC frame starts within 2 samples (0 at 25/30 fps); chase locked in 37-75 ms with 0 samples of error. Link: tempo both ways, beat phase within 0.63 ms |
@@ -203,14 +212,14 @@ in [`docs/proofs/`](docs/proofs/).
 ```sh
 tests/host-proof; tests/hostd-proof; tests/formats-proof; tests/registry-proof; tests/recorder-proof
 tests/recorderd-proof; tests/rf64-proof; tests/clockd-proof; tests/rescan-proof; tests/controld-proof
-tests/player-proof; tests/transport-proof
+tests/player-proof; tests/transport-proof; tests/surfaced-proof
 ```
 
 The proofs need a running PipeWire (≥ 1.4) with WirePlumber, a systemd user
 session, `pw-cli`, `pw-play`, `pw-record`, `jq`, `busctl`, `python3` and
 `metaflac`. `host-proof`, `hostd-proof` and `controld-proof` also need Surge
-XT (CLAP) in `~/.clap` or `/usr/lib/clap`; `controld-proof` and
-`clockd-proof` run in their own user and network namespace (`unshare -rn`,
+XT (CLAP) in `~/.clap` or `/usr/lib/clap`; `controld-proof`,
+`clockd-proof` and `surfaced-proof` run in their own user and network namespace (`unshare -rn`,
 `ip`, `ss`). `formats-proof` needs Surge XT (CLAP, VST3),
 Dexed, Dragonfly Hall Reverb (VST3), Odin2, CHOW Tape Model and Cardinal
 (LV2) in the user plugin directories.
