@@ -67,11 +67,47 @@ enum Mode { MODE_OFF, MODE_GENERATE, MODE_CHASE };
 const char *source_name(int s) { return s == SRC_LINK ? "link" : s == SRC_LTC ? "ltc" : s == SRC_MTC ? "mtc" : "internal"; }
 const char *mode_name(int m) { return m == MODE_GENERATE ? "generate" : m == MODE_CHASE ? "chase" : "off"; }
 
-// The tempo map of the internal source: beat = beat0 + (frame - frame0) x bpm / 60 / rate.
+// One stretch of the internal source's tempo map: from frame0 on,
+// beat = beat0 + (frame - frame0) x bpm / 60 / rate.
 struct TempoAnchor {
 	double bpm = 120, bpb = 4, beat_type = 4;
 	int64_t frame0 = 0;
 	double beat0 = 0;
+};
+
+// The tempo map: frame 0 is always beat 0 (bar 1, beat 1). A tempo or meter
+// change while stopped sets the song's tempo from the start (one stretch); a
+// change while rolling adds a stretch at the transport's frame, so the beat
+// doesn't jump, and the map keeps it: locating back before it plays the
+// earlier tempo, as heard. A change replaces every stretch after its frame.
+constexpr int kMaxStretches = 64;
+struct TempoMap {
+	int n = 1;
+	TempoAnchor seg[kMaxStretches];
+	const TempoAnchor &at_frame(int64_t f) const
+	{
+		int i = n - 1;
+		while (i > 0 && seg[i].frame0 > f)
+			i--;
+		return seg[i];
+	}
+	const TempoAnchor &at_beat(double b) const
+	{
+		int i = n - 1;
+		while (i > 0 && seg[i].beat0 > b)
+			i--;
+		return seg[i];
+	}
+	double beat(int64_t f, uint32_t rate) const
+	{
+		const TempoAnchor &a = at_frame(f);
+		return a.beat0 + (double)(f - a.frame0) * a.bpm / 60.0 / rate;
+	}
+	int64_t frame(double b, uint32_t rate) const
+	{
+		const TempoAnchor &a = at_beat(b);
+		return a.frame0 + (int64_t)std::llround((b - a.beat0) * 60.0 / a.bpm * rate);
+	}
 };
 
 struct Chase {
@@ -88,8 +124,8 @@ struct Clock {
 	uint32_t rate = 48000;
 
 	// published by main, read by process (double-buffered)
-	TempoAnchor anchors[2];
-	std::atomic<int> anchor_idx{0};
+	TempoMap maps[2];
+	std::atomic<int> map_idx{0};
 	struct tc_rate fps_slots[2];
 	std::atomic<int> fps_idx{0};
 	std::atomic<int> ltc_mode{MODE_OFF}, mtc_mode{MODE_OFF}, source{SRC_INTERNAL};
@@ -149,15 +185,27 @@ uint64_t now_ns()
 	return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
-const TempoAnchor &anchor() { return C.anchors[C.anchor_idx.load(std::memory_order_acquire)]; }
+const TempoMap &tempo_map() { return C.maps[C.map_idx.load(std::memory_order_acquire)]; }
+// The latest stretch: the tempo and meter clockd is set to.
+const TempoAnchor &anchor() { const TempoMap &m = tempo_map(); return m.seg[m.n - 1]; }
 const tc_rate &fps() { return C.fps_slots[C.fps_idx.load(std::memory_order_acquire)]; }
 
+void set_map(const TempoMap &m)
+{
+	int next = C.map_idx.load() ^ 1;
+	C.maps[next] = m;
+	C.map_idx.store(next, std::memory_order_release);
+}
+
+#ifdef BL_HAVE_LINK
+// Change the latest stretch in place (Link's tempo: the beat comes from Link).
 void set_anchor(const TempoAnchor &a)
 {
-	int next = C.anchor_idx.load() ^ 1;
-	C.anchors[next] = a;
-	C.anchor_idx.store(next, std::memory_order_release);
+	TempoMap m = tempo_map();
+	m.seg[m.n - 1] = a;
+	set_map(m);
 }
+#endif
 
 void set_fps(const tc_rate &r)
 {
@@ -328,8 +376,6 @@ int on_process(jack_nframes_t n, void *)
 // BBT for the PipeWire segment (bar.bpm, signature, beat).
 void on_timebase(jack_transport_state_t st, jack_nframes_t n, jack_position_t *pos, int new_pos, void *)
 {
-	const TempoAnchor &a = anchor();
-	double bpm = a.bpm, bpb = a.bpb, beat;
 	// pipewire-jack publishes what this callback writes with the *next*
 	// cycle (measured: the bar lagged the frame by one cycle), so describe
 	// the frame and time that cycle will have. A new position is exact.
@@ -339,6 +385,8 @@ void on_timebase(jack_transport_state_t st, jack_nframes_t n, jack_position_t *p
 		at_frame += n;
 		at_usecs += (uint64_t)n * 1000000ull / C.rate;
 	}
+	const TempoAnchor &a = tempo_map().at_frame(at_frame);
+	double bpm = a.bpm, bpb = a.bpb, beat;
 #ifdef BL_HAVE_LINK
 	if (C.link_on.load(std::memory_order_relaxed) && C.link) {
 		auto s = C.link->captureAudioSessionState();
@@ -351,8 +399,6 @@ void on_timebase(jack_transport_state_t st, jack_nframes_t n, jack_position_t *p
 #endif
 	{
 		beat = a.beat0 + (double)(at_frame - a.frame0) * bpm / 60.0 / C.rate;
-		if (beat < 0)
-			beat = 0;
 	}
 	double bar0 = std::floor(beat / bpb);
 	double in_bar = beat - bar0 * bpb;
@@ -365,6 +411,15 @@ void on_timebase(jack_transport_state_t st, jack_nframes_t n, jack_position_t *p
 	pos->beat_type = (float)a.beat_type;
 	pos->ticks_per_beat = kTicksPerBeat;
 	pos->beats_per_minute = bpm;
+	// The ticks are the beat floored to 1/1920 (12.5 frames at 120 BPM and
+	// 48 kHz). bbt_offset says how many frames before the cycle that tick
+	// boundary was, so a reader gets the beat at the cycle's first frame to
+	// within one frame: beat + offset x bpm / 60 / rate. pipewire-jack
+	// carries it as the segment bar's offset.
+	double tick_beat = bar0 * bpb + std::floor(in_bar) + pos->tick / kTicksPerBeat;
+	double off = (beat - tick_beat) * 60.0 / bpm * C.rate;
+	pos->valid = (jack_position_bits_t)(pos->valid | JackBBTFrameOffset);
+	pos->bbt_offset = off > 0 ? (jack_nframes_t)off : 0;
 }
 
 // ---------------------------------------------------------------- main thread
@@ -419,15 +474,29 @@ int set_source(int s)
 // tempo while rolling doesn't jump the beat).
 void reanchor(double bpm, double bpb, double bt)
 {
-	TempoAnchor a = anchor();
-	int64_t f = jack_get_current_transport_frame(C.client);
-	double beat = a.beat0 + (double)(f - a.frame0) * a.bpm / 60.0 / C.rate;
-	a.frame0 = f;
-	a.beat0 = std::max(0.0, beat);
+	TempoMap m = tempo_map();
+	TempoAnchor a;
 	a.bpm = bpm;
 	a.bpb = bpb;
 	a.beat_type = bt;
-	set_anchor(a);
+	jack_position_t pos;
+	if (jack_transport_query(C.client, &pos) != JackTransportRolling || pos.frame == 0) {
+		m.n = 1;            // stopped: the song's tempo, from frame 0
+		m.seg[0] = a;
+	} else {
+		int64_t f = pos.frame;
+		a.frame0 = f;
+		a.beat0 = m.beat(f, C.rate);
+		while (m.n > 1 && m.seg[m.n - 1].frame0 >= f)
+			m.n--;
+		if (m.n == 1 && m.seg[0].frame0 >= f)
+			m.seg[0] = a;
+		else if (m.n < kMaxStretches)
+			m.seg[m.n++] = a;
+		else
+			m.seg[m.n - 1] = a;
+	}
+	set_map(m);
 }
 
 bool chasing() { return C.source.load() == SRC_LTC || C.source.load() == SRC_MTC; }
@@ -474,7 +543,7 @@ bool parse_position(const char *p, int64_t *frame)
 			return false;
 		const TempoAnchor &a = anchor();
 		double b = (bar - 1) * a.bpb + (beat - 1) + tick / kTicksPerBeat;
-		*frame = a.frame0 + (int64_t)std::llround((b - a.beat0) * 60.0 / a.bpm * C.rate);
+		*frame = tempo_map().frame(b, C.rate);
 		return *frame >= 0;
 	}
 	char *end;
@@ -970,7 +1039,7 @@ int main(int argc, char **argv)
 		setenv("PIPEWIRE_PROPS", props.c_str(), 1);
 	}
 
-	set_anchor(TempoAnchor{});
+	set_map(TempoMap{});
 	tc_rate r25;
 	tc_rate_from_fps(25, &r25);
 	set_fps(r25);

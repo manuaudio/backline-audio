@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# transport-proof: the shared transport (backline-clockd) inside hosted
+# plugins, measured, in all three formats.
+#
+#  1. Beat-click test plugins (tests/plugins/beatclick*): CLAP, VST3 and LV2
+#     builds of one plugin that clicks on the first sample at or after every
+#     beat its host's transport reports. Each is hosted by
+#     backline-plugin-worker while clockd plays, changes tempo (120 -> 90)
+#     and meter (4/4 -> 7/8), locates by bar/beat while rolling, stops,
+#     locates by frames while stopped and plays again. An independent native
+#     node (backline-test-timecode --observe --tap) records the plugin's
+#     output together with spa_io_position of the same cycle, so every
+#     output sample has its exact transport frame. Checked: every click where
+#     PipeWire's segment puts the beat, sample for sample, and against
+#     clockd's tempo map, per stretch of constant tempo.
+#  2. A real tempo-synced plugin: Odin2's arpeggiator (CLAP, VST3, LV2) with
+#     one held note, 120 then 90 BPM. Its note onsets against clockd's
+#     eighth-note grid.
+#
+# Throwaway, as clockd-proof: its own network namespace (no Link session can
+# be reached), a private D-Bus, every node in one node.group driven by a
+# test null sink; the plugins' outputs link only to the tap; the default
+# devices and every other node are checked before and after.
+set -euo pipefail
+if [[ -z ${BL_TRANSPORT_NS:-} ]]; then
+  BL_TRANSPORT_NS=1 exec unshare -rn bash -c 'ip link set lo up && ip link set lo multicast on && exec dbus-run-session -- "$0" "$@"' "$0" "$@"
+fi
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+out=$here/out/transport
+rm -rf "$out"; mkdir -p "$out"
+exec > >(tee "$out/report.txt") 2>&1
+CK=; WK=; TP=
+trap 'set +e; bl_cleanup; for p in $CK $WK $TP; do kill $p 2>/dev/null; done; kill ${BL_WATCH:-} ${INTR:-} ${LEAK:-} 2>/dev/null; true' EXIT
+trap 'exit 130' INT TERM
+GROUP=backline-test.transport
+G="node.group = $GROUP"
+export PIPEWIRE_PROPS="{ $G }"
+P=$BL_BIN/transport-plugins
+export LV2_PATH=$P/lv2:${LV2_PATH:-$HOME/.lv2:/usr/lib/lv2}
+C=(io.github.manuaudio.Backline.Clock /io/github/manuaudio/Backline/Clock io.github.manuaudio.Backline.Clock1)
+call() { busctl --user call "${C[@]}" "$@"; }
+TT=$BL_BIN/clock/backline-test-timecode
+want() { [[ " ${SECTIONS:-1 2} " == *" $1 "* ]]; }
+fails=0
+
+echo "== transport-proof $(date -Is)"
+# Other proofs on the same PipeWire (Backline test nodes, another clockd) can
+# end up under this proof's driver and move its transport or its quantum.
+# Wait for a graph without them (up to 10 minutes).
+others() { pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // ""' | grep -E '^backline' | sort -u | tr '\n' ' ' || true; }
+for i in $(seq 120); do o=$(others); [[ -z $o ]] && break; ((i == 1)) && echo "waiting for other Backline test nodes to go: $o"; sleep 5; done
+[[ -n $(others) ]] && echo "still there after 10 min, running anyway: $(others)"
+echo "machine: $(uname -r), PipeWire $(pw-cli --version 2>/dev/null | sed -n 's/.*libpipewire \([0-9.]*\).*/\1/p'), load $(cut -d' ' -f1-3 /proc/loadavg)"
+default_before=$(bl_default_sink); source_before=$(bl_default_source); bl_foreign_nodes >"$out/nodes-before.txt"
+bl_watch_defaults "$default_before" "$source_before" "$out/defaults-moved.txt"
+echo "default sink: $default_before"
+{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.tr-clk media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true node.force-quantum = 128 node.force-rate = 48000 %s }\n' "$G"; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+BL_PIDS+=($!)
+bl_wait_node backline-test.tr-clk
+# Nodes from outside the test group running under its driver (another clock
+# on this machine would move this transport).
+( while sleep 0.5; do
+    pw-dump 2>/dev/null | jq -r --arg g "$GROUP" '([.[] | select(.type=="PipeWire:Interface:Node" and .info.props["node.name"]=="backline-test.tr-clk") | .id][0]) as $d
+      | .[] | select(.type=="PipeWire:Interface:Node") | select($d != null and .id != $d)
+      | select((.info.props["node.driver-id"] // -1) == $d and (.info.props["node.group"] // "") != $g)
+      | "\(.id) \(.info.props["node.name"]) \(.info.props["client.api"] // "-")"' 2>/dev/null >>"$out/intruders.txt"
+  done ) &
+INTR=$!
+# A leak is a link between a node of this proof and anything that isn't.
+( while sleep 0.5; do
+    pw-dump 2>/dev/null | jq -r '([.[] | select(.type=="PipeWire:Interface:Node") | {key: (.id|tostring), value: (.info.props["node.name"] // "")}] | from_entries) as $n
+      | .[] | select(.type=="PipeWire:Interface:Link")
+      | [$n[(.info["output-node-id"]|tostring)] // "?", $n[(.info["input-node-id"]|tostring)] // "?"]
+      | select((.[0] | test("^backline-test\\.tr-")) != (.[1] | test("^backline-test\\.tr-")))
+      | join(" -> ")' 2>/dev/null >>"$out/leaks.txt"
+  done ) &
+LEAK=$!
+"$BL_BIN/clock/backline-clockd" 2>"$out/clockd.log" & CK=$!
+for _ in $(seq 100); do busctl --user status io.github.manuaudio.Backline.Clock >/dev/null 2>&1 && break; sleep 0.05; done
+sleep 0.3
+echo "clockd: $(head -1 "$out/clockd.log")"
+
+# start_take NAME PLUGIN FORMAT: the tap (observer + recorder) and the plugin,
+# its output linked only to the tap.
+start_take() {
+  local name=$1 plugin=$2 fmt=$3 outs i
+  "$TT" -n backline-test.tr-tap -o "$out/$name.log" --observe --tap "$out/$name.f32" & TP=$!
+  "$BL_BIN/backline-plugin-worker" -p "$plugin" -f "$fmt" -n backline-test.tr-plug -A 2>"$out/$name-worker.log" >/dev/null & WK=$!
+  INST=
+  for _ in $(seq 300); do
+    INST=$(busctl --user list 2>/dev/null | awk '/Backline\.Instance\./{print $1}' | head -1)
+    [[ -n $INST ]] && pw-link -o 2>/dev/null | grep -q '^backline-test.tr-plug:' && break
+    sleep 0.05
+  done
+  mapfile -t outs < <(pw-link -o | grep '^backline-test.tr-plug:' | head -2)
+  pw-link "${outs[0]}" backline-test.tr-tap:tap_1; pw-link "${outs[1]}" backline-test.tr-tap:tap_2
+  echo "  [$name] $(grep -m1 'loaded' "$out/$name-worker.log" | sed 's/^backline-plugin-worker: //' | cut -c1-110)"
+}
+stop_take() {
+  kill $WK $TP; wait $WK $TP 2>/dev/null || true; WK=; TP=
+}
+inst() { busctl --user call "$INST" /io/github/manuaudio/Backline/Instance io.github.manuaudio.Backline.Instance1 "$@"; }
+
+########################################################################## 1
+if want 1; then
+echo; echo "-- 1. beat-click test plugins: clicks against PipeWire's segment and clockd's tempo map"
+echo "   sequence: 120 BPM 4/4 from frame 0, play 2 s; tempo 90, 1.5 s; meter 7/8, 1.5 s; locate bbt:9|1|0 rolling, 1.5 s;"
+echo "   stop; locate 96000 stopped; play 1 s; stop"
+for f in clap vst3 lv2; do
+  case $f in
+    clap) plug=$P/backline-test-beatclick.clap units=qn ;;
+    vst3) plug=$P/backline-test-beatclick.vst3 units=qn ;;
+    lv2) plug=https://github.com/manuaudio/backline-audio/test/beatclick units=beat ;;
+  esac
+  if [[ $f == vst3 && ! -d $plug ]] || [[ $f == lv2 && ! -d $P/lv2 ]]; then echo "  [$f] not built (no VST3 SDK / lilv): skipped"; continue; fi
+  start_take beat-$f "$plug" $f
+  call Stop; call SetTempo d 120; call SetMeter dd 4 4; call Locate s 0 >/dev/null; sleep 0.4
+  call Play; sleep 2
+  call SetTempo d 90; sleep 1.5
+  call SetMeter dd 7 8; sleep 1.5
+  bbt=$(call Locate s 'bbt:9|1|0' | cut -d' ' -f2); sleep 1.5
+  call Stop; sleep 0.3
+  call Locate s 96000 >/dev/null; sleep 0.3
+  call Play; sleep 1; call Stop; sleep 0.3
+  stop_take
+  echo "  [beat-$f] located bbt:9|1|0 -> frame $bbt"
+  python3 -I "$here/transport-analyze.py" "$out/beat-$f.log" "$out/beat-$f.f32" $units $f "0,$bbt,96000" || fails=$((fails + 1))
+done
+fi
+
+########################################################################## 2
+if want 2; then
+echo; echo "-- 2. a real tempo-synced plugin: Odin2's arpeggiator, one held note (A3), 120 then 90 BPM"
+for f in clap vst3 lv2; do
+  case $f in
+    clap) plug=$HOME/.clap/Odin2.clap ;;
+    vst3) plug=$HOME/.vst3/Odin2.vst3 ;;
+    lv2) plug=$HOME/.lv2/Odin2.lv2 ;;
+  esac
+  [[ -e $plug ]] || { echo "  [odin2-$f] not installed: skipped"; continue; }
+  start_take odin2-$f "$plug" $f
+  inst SetParam sd "Arpeggiator On" 1 >/dev/null
+  call Stop; call SetTempo d 120; call SetMeter dd 4 4; call Locate s 0 >/dev/null; sleep 0.3
+  inst NoteOn yyy 0 57 100 >/dev/null; sleep 0.5
+  call Play; sleep 3
+  call SetTempo d 90; sleep 3
+  call Stop; sleep 0.3
+  inst NoteOff yy 0 57 >/dev/null || true
+  stop_take
+  python3 -I "$here/transport-onsets.py" "$out/odin2-$f.log" "$out/odin2-$f.f32" 0.5 odin2-$f 0.01 "0" || fails=$((fails + 1))
+done
+echo "  (Odin2 also plays the first step at note-on while the transport is stopped, then waits for it to roll)"
+fi
+
+echo; echo "-- clean up"
+kill $INTR $LEAK 2>/dev/null || true; sleep 0.2
+# A JACK client from outside the group under its driver could own the
+# transport (another clockd): that would void the run. Other nodes (a MIDI
+# bridge that runs under whichever driver is active) are listed only.
+echo "JACK clients from outside the test group under its driver: $(grep ' jack$' "$out/intruders.txt" 2>/dev/null | sort -u | tr '\n' ';' || true)"
+echo "other nodes from outside the group that ran under its driver (not transport owners): $(grep -v ' jack$' "$out/intruders.txt" 2>/dev/null | awk '{print $2}' | sort -u | tr '\n' ' ' || true)"
+echo "links between this proof's nodes and any other node: $( [[ -s $out/leaks.txt ]] && sort -u "$out/leaks.txt" | tr '\n' ';' || echo none)"
+grep -q ' jack$' "$out/intruders.txt" 2>/dev/null && fails=$((fails + 1))
+[[ -s $out/leaks.txt ]] && fails=$((fails + 1))
+kill $CK; wait $CK 2>/dev/null || true; CK=
+bl_cleanup
+sleep 0.5
+left=$(pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.group"] // empty' | grep -c "^$GROUP" || true)
+echo "test-group nodes left: $left"
+bl_foreign_nodes >"$out/nodes-after.txt"
+echo "other nodes same as at start: $(bl_same_nodes "$out/nodes-before.txt" "$out/nodes-after.txt")"
+echo "default sink after: $(bl_default_sink) ($( [[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED)); default source $( [[ $(bl_default_source) == "$source_before" ]] && echo unchanged || echo CHANGED); moved during the run: $( [[ -s $out/defaults-moved.txt ]] && head -3 "$out/defaults-moved.txt" || echo never)"
+kill $BL_WATCH 2>/dev/null || true
+echo; echo "== $( ((fails == 0)) && echo "ALL PASS" || echo "$fails FAILED")"
+exit $((fails > 0))

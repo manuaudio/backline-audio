@@ -59,6 +59,7 @@
 #include "osc.h"
 #include "plugin.h"
 #include "spsc.h"
+#include "transport.h"
 
 using bl::kMaxEvents;
 using bl::kMaxFrames;
@@ -207,6 +208,8 @@ struct Worker {
     bool processing = false;               // audio thread only
     uint32_t active_rate = 0;
     uint64_t steady = 0;                   // audio thread only
+    bl::Transport transport;               // audio thread only: this cycle's
+    uint32_t transport_frames = 0;         // audio thread only: last cycle's length
     std::atomic<uint64_t> last_process_ns{0};
     std::atomic<uint32_t> graph_rate{0};
     std::atomic<bool> want_reactivate{false}, want_callback{false};
@@ -461,9 +464,14 @@ void on_process(void *, spa_io_position *pos)
             g.ptrs[c] = b ? b : w->trash.data();
         }
 
+    bl::Transport prev = w->transport;
+    bl::transport_from_position(pos, prev, w->transport_frames, w->transport);
+    w->transport_frames = n;
+
     bl::ProcessArgs a{};
     a.frames = n;
     a.steady = (int64_t)w->steady;
+    a.transport = &w->transport;
     a.ins = w->in_ptrs.data();
     a.outs = w->out_ptrs.data();
     a.params = w->pevs.data();

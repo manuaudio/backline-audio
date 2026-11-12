@@ -16,9 +16,21 @@ D3). Its D-Bus interface is the only way in, so clients stay MIT.
 clockd owns PipeWire's position segment for the graph its node runs in
 (`spa_io_position.segment`, the `bar` with bpm and signature): JACK clients
 see it as the JACK transport and timebase master, and Backline's plugin
-worker fills CLAP `transport` from it. The transport position is in frames
-at the graph rate (`Rate`). Timecode is that position at `Fps`, plus
-`TimecodeOffset`.
+worker gives it to every hosted plugin (CLAP `transport`, VST3
+`ProcessContext`, LV2 `time:Position`; [Instance1](Instance1.md#transport)).
+The transport position is in frames at the graph rate (`Rate`). Timecode is
+that position at `Fps`, plus `TimecodeOffset`.
+
+The bar's beat is exact to the frame: clockd sets JACK's `bbt_offset` (the
+frames since the tick the BBT is floored to), which pipewire-jack carries as
+the segment bar's `offset`. A native reader gets the song's beat at the
+cycle's first frame as `bar.beat − bar.signature_num + bar.offset × bpm / 60
+/ rate` (pipewire-jack writes `bar.beat` with JACK's 1-based bar).
+
+**Tempo map.** Frame 0 is bar 1, beat 1. `SetTempo` and `SetMeter` while
+stopped set the song's tempo and meter from the start; while rolling they
+take effect at the transport's frame without moving the beat, and that
+change is kept: locating back before it plays the earlier tempo.
 
 **Sources.** The transport follows one source at a time (`Source`):
 
@@ -50,7 +62,9 @@ Returns the frame it located to. Errors: `InvalidArgs`, `State` (chasing).
 
 ### `SetTempo(d bpm) → ()`
 
-20 to 999 BPM. With Link on, it proposes the tempo to the Link session.
+20 to 999 BPM. Stopped: the song's tempo from frame 0; rolling: from the
+transport's frame on (see *Tempo map*). With Link on, it proposes the tempo
+to the Link session.
 
 ### `SetMeter(d beats_per_bar, d beat_type) → ()`
 
