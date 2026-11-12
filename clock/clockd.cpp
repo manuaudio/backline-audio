@@ -485,6 +485,20 @@ bool parse_position(const char *p, int64_t *frame)
 	return true;
 }
 
+// The frame a position names, with the current tempo map and frame rate,
+// without moving the transport (the player places clips with it).
+int m_resolve(sd_bus_message *m, void *, sd_bus_error *e)
+{
+	const char *p;
+	int r = sd_bus_message_read(m, "s", &p);
+	if (r < 0)
+		return r;
+	int64_t f;
+	if (!parse_position(p, &f) || f > UINT32_MAX)
+		return sd_bus_error_setf(e, SD_BUS_ERROR_INVALID_ARGS, "position \"%s\": frames, tc:HH:MM:SS:FF or bbt:BAR|BEAT|TICK", p);
+	return sd_bus_reply_method_return(m, "t", (uint64_t)f);
+}
+
 int m_locate(sd_bus_message *m, void *, sd_bus_error *e)
 {
 	const char *p;
@@ -793,6 +807,7 @@ const sd_bus_vtable vtable[] = {
 	SD_BUS_METHOD("Play", "", "", m_play, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD("Stop", "", "", m_stop, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Locate", SD_BUS_ARGS("s", position), SD_BUS_RESULT("t", frame), m_locate, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("Resolve", SD_BUS_ARGS("s", position), SD_BUS_RESULT("t", frame), m_resolve, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("SetTempo", SD_BUS_ARGS("d", bpm), SD_BUS_NO_RESULT, m_set_tempo, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("SetMeter", SD_BUS_ARGS("d", beats_per_bar, "d", beat_type), SD_BUS_NO_RESULT, m_set_meter, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Link", SD_BUS_ARGS("b", enable), SD_BUS_NO_RESULT, m_link, SD_BUS_VTABLE_UNPRIVILEGED),

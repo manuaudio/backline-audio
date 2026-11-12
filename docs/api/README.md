@@ -9,6 +9,7 @@ all of them:
 | One hosted plugin | `io.github.manuaudio.Backline.Instance.<node>` | `/io/github/manuaudio/Backline/Instance` | `io.github.manuaudio.Backline.Instance1` ([Instance1.md](Instance1.md)) |
 | Plugin index | `io.github.manuaudio.Backline.Registry` | `/io/github/manuaudio/Backline/Registry` | `io.github.manuaudio.Backline.Registry1` |
 | Recorder | `io.github.manuaudio.Backline.Recorder` | `/io/github/manuaudio/Backline/Recorder` | `io.github.manuaudio.Backline.Recorder1` ([Recorder1.md](Recorder1.md)) |
+| Player | `io.github.manuaudio.Backline.Player` | `/io/github/manuaudio/Backline/Player` | `io.github.manuaudio.Backline.Player1` ([Player1.md](Player1.md)) |
 | Clock and transport | `io.github.manuaudio.Backline.Clock` | `/io/github/manuaudio/Backline/Clock` | `io.github.manuaudio.Backline.Clock1` ([Clock1.md](Clock1.md)) |
 
 The **bus name has no version number; the interface does.** A later,

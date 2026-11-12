@@ -249,7 +249,9 @@ leaks() {
 # Stop the whole bench the moment anything of it links to a real device.
 watchdog() {
   local found
-  while sleep 1; do
+  # Ends with its bench: a watchdog whose bench was stopped (or whose stop
+  # missed it) must not poll the graph forever.
+  while sleep 1 && [[ -S $bench/bus ]]; do
     found=$(leaks)
     if [[ -n $found ]]; then
       echo "bench: leak, stopping: $found" >>"$bench/../backline-ui-bench-leaks.log"

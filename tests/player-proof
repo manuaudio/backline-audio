@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# player-proof: the player service (docs/api/Player1.md), measured.
+#
+# clockd owns the transport of a test group of nodes (node.group, driven by a
+# test null sink). playerd places two files on that timeline: a stereo file at
+# frame 96000 (0 dB) and a mono file at bbt:3|1|0 (-6 dB, resolved by clockd).
+# Each plays into its own capture node (backline-test-tap), a native node that
+# keeps every sample it gets together with the transport frame of the cycle,
+# as it sees it in spa_io_position. Every received sample is then compared
+# with what the timeline says must be there: file frame (transport - start) x
+# gain, or silence. Exact float comparison, no tolerance.
+#
+# Moves: play from 0 across both starts and into the streamed part of the
+# file (past the in-memory head), a locate while rolling into the middle of a
+# file, a stop + locate before the starts + play, a stop + locate into the
+# middle + play, a gain change while rolling, a file at another rate, errors.
+#
+# Throwaway: own network namespace, private D-Bus, throwaway nodes in their
+# own group; a watchdog stops the run if any test node links to anything that
+# isn't a test node.
+set -euo pipefail
+if [[ -z ${BL_PLAYER_NS:-} ]]; then
+  BL_PLAYER_NS=1 exec unshare -rn bash -c 'ip link set lo up && exec dbus-run-session -- "$0" "$@"' "$0" "$@"
+fi
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+out=$here/out/player
+rm -rf "$out"; mkdir -p "$out"
+exec > >(tee "$out/report.txt") 2>&1
+CK=; PD=; WD=
+trap 'kill ${TAPS:-} 2>/dev/null; bl_cleanup; [[ -n $PD ]] && kill $PD 2>/dev/null; [[ -n $CK ]] && kill $CK 2>/dev/null; kill ${BL_WATCH:-} ${WD:-} 2>/dev/null; true' EXIT
+trap 'exit 130' INT TERM
+G='node.group = backline-test.player'
+export PIPEWIRE_PROPS="{ $G }"
+C=(io.github.manuaudio.Backline.Clock /io/github/manuaudio/Backline/Clock io.github.manuaudio.Backline.Clock1)
+P=(io.github.manuaudio.Backline.Player /io/github/manuaudio/Backline/Player io.github.manuaudio.Backline.Player1)
+clk() { busctl --user call -- "${C[@]}" "$@"; }
+ply() { busctl --user call -- "${P[@]}" "$@"; }
+
+echo "== player-proof $(date -Is)"
+echo "quantum: ${QUANTUM:-graph default} (forced on the test driver only)"
+echo "load: $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) cpus"
+default_before=$(bl_default_sink); source_before=$(bl_default_source); bl_foreign_nodes >"$out/nodes-before.txt"
+bl_watch_defaults "$default_before" "$source_before" "$out/defaults-moved.txt"
+echo "default sink: $default_before"
+
+# test files: deterministic noise, float WAV, first sample nonzero
+python3 -I - "$out" <<'EOF'
+import random, struct, sys
+def wav(path, rate, ch, frames, seed):
+    random.seed(seed)
+    data = bytearray()
+    for i in range(frames):
+        for c in range(ch):
+            v = 0.5 if i == 0 else random.uniform(-0.4, 0.4) * (1 if c == 0 else -0.7)
+            data += struct.pack("<f", v)
+    hdr = b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE" + b"fmt " + struct.pack("<IHHIIHH", 16, 3, ch, rate, rate * ch * 4, ch * 4, 32) + b"data" + struct.pack("<I", len(data))
+    open(path, "wb").write(hdr + data)
+d = sys.argv[1]
+wav(f"{d}/a-stereo.wav", 48000, 2, 20 * 48000, 1)
+wav(f"{d}/b-mono.wav", 48000, 1, 12 * 48000, 2)
+wav(f"{d}/c-44k.wav", 44100, 2, 44100, 3)
+EOF
+
+{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.pdrv media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true node.force-quantum = %s %s }\n' "${QUANTUM:-0}" "$G"; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+BL_PIDS+=($!)
+bl_wait_node backline-test.pdrv
+
+# leak guard: a link between a test node and anything else ends the run
+( while sleep 0.3; do
+    pw-dump 2>/dev/null | jq -r '
+      ([.[] | select(.type=="PipeWire:Interface:Node") | {key: (.id|tostring), value: (.info.props["node.name"] // "")}] | from_entries) as $n
+      | .[] | select(.type=="PipeWire:Interface:Link")
+      | [$n[(.info["output-node-id"]|tostring)] // "?", $n[(.info["input-node-id"]|tostring)] // "?"]
+      | select((.[0] | test("^backline")) or (.[1] | test("^backline")))
+      | select(((.[0] | test("^backline")) and (.[1] | test("^backline"))) | not) | join(" -> ")' 2>/dev/null >"$out/leak.now"
+    if [[ -s $out/leak.now ]]; then cat "$out/leak.now" >>"$out/leaks.txt"; kill -TERM $$; fi
+  done ) &
+WD=$!
+
+"$BL_BIN/clock/backline-clockd" 2>"$out/clockd.log" & CK=$!
+for _ in $(seq 100); do busctl --user status io.github.manuaudio.Backline.Clock >/dev/null 2>&1 && break; sleep 0.05; done
+"$BL_BIN/player/backline-playerd" --idle-exit 0 2>"$out/playerd.log" & PD=$!
+for _ in $(seq 100); do busctl --user status io.github.manuaudio.Backline.Player >/dev/null 2>&1 && break; sleep 0.05; done
+"$BL_BIN/player/backline-test-tap" -n backline-test.tapa -c 2 -o "$out/tapa.bin" -s 60 2>"$out/tapa.log" & TA=$!
+"$BL_BIN/player/backline-test-tap" -n backline-test.tapb -c 1 -o "$out/tapb.bin" -s 60 2>"$out/tapb.log" & TB=$!
+TAPS="$TA $TB"
+bl_wait_node backline-test.tapa; bl_wait_node backline-test.tapb
+sleep 0.3
+clk SetTempo d 120; clk SetMeter dd 4 4; clk Stop; clk Locate s 0 >/dev/null
+
+echo; echo "-- 1. load"
+t0=$(date +%s%N)
+ida=$(ply Load 'sa{sv}' "$out/a-stereo.wav" 3 at s 96000 target s backline-test.tapa id s a | cut -d'"' -f2)
+t1=$(date +%s%N)
+idb=$(ply Load 'sa{sv}' "$out/b-mono.wav" 4 at s 'bbt:3|1|0' gain d -6 target s backline-test.tapb id s b | cut -d'"' -f2)
+echo "  Load a-stereo.wav at 96000 -> $ida ($(( (t1 - t0) / 1000000 )) ms, reply after its links are up)"
+getj() { busctl --user --json=short call "${P[@]}" Get s "$1" | jq -r '.data[0] | fromjson'; }
+echo "  Load b-mono.wav at bbt:3|1|0 (120 BPM 4/4), -6 dB -> $idb; resolved by clockd to frame $(getj b | jq -r .start)"
+echo "  links: $(pw-link -lo 2>/dev/null | awk '/^backline.player/{p=$1} /->/{if(p) print p" "$0}' | tr -s ' ' | tr '\n' ';')"
+echo "  nodes: $(pw-dump | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | select(.info.props["node.name"]|test("^backline.player")) | "\(.info.props["node.name"]) [\(.info.props["media.class"]), \(.info.props["audio.channels"]) ch \(.info.props["audio.position"])]"' | tr '\n' ' ')"
+idc=$(ply Load 'sa{sv}' "$out/c-44k.wav" 2 target s backline-test.tapa id s c | cut -d'"' -f2)
+echo "  errors: missing file: $(ply Load 'sa{sv}' /nonexistent.wav 0 2>&1 | head -1)"
+echo "          unknown option: $(ply Load 'sa{sv}' "$out/a-stereo.wav" 1 bogus s x 2>&1 | head -1)"
+echo "          duplicate id: $(ply Load 'sa{sv}' "$out/a-stereo.wav" 1 id s a 2>&1 | head -1)"
+echo "          bad position: $(ply Load 'sa{sv}' "$out/a-stereo.wav" 1 at s 'bbt:0|0' 2>&1 | head -1)"
+echo "          missing target: $(ply Load 'sa{sv}' "$out/a-stereo.wav" 2 target s backline-test.nonode id s z 2>&1 | head -1)"
+
+echo; echo "-- 2. moves"
+clk Play; sleep 9
+echo "  rolled 0 -> ~9 s"
+sleep 0.2; ply SetGain sd a -12; echo "  SetGain a -12 dB while rolling"; sleep 1
+echo "  Locate tc:00:00:18:00 while rolling -> $(clk Locate s tc:00:00:18:00 | cut -d' ' -f2)"; sleep 2
+clk Stop; clk Locate s 71999 >/dev/null; sleep 0.5; echo "  Stop, Locate 71999 (before both starts; their starts fall inside a cycle), Play"; clk Play; sleep 3.5
+clk Stop; clk Locate s 480000 >/dev/null; sleep 0.5; echo "  Stop, Locate 480000 (a at file frame 384000, past its head), Play"; clk Play; sleep 1.5
+clk Stop; sleep 0.3
+c_json=$(getj c)
+echo "  44.1 kHz file on the 48 kHz graph: rate_ok $(jq -r .rate_ok <<<"$c_json"), played_frames $(jq -r .played_frames <<<"$c_json") (silent: no resampling yet)"
+getj a | jq -r '"  a: cycles \(.cycles), played \(.played_frames) frames, underruns \(.underruns) (\(.underrun_frames) frames), ring seeks \(.seeks)"'
+getj b | jq -r '"  b: cycles \(.cycles), played \(.played_frames) frames, underruns \(.underruns) (\(.underrun_frames) frames), ring seeks \(.seeks)"'
+echo "  CLI: $("$BL_BIN/backline" play list 2>&1 | head -3 | tr '\n' ';')"
+kill -TERM $TA $TB; wait $TA $TB 2>/dev/null || true; TAPS=
+ply Unload s a; ply Unload s b; ply Unload s c
+echo "  unloaded; Clips now: $(busctl --user get-property "${P[@]}" Clips)"
+echo "  player nodes left: $(pw-dump | jq '[.[] | select(.type=="PipeWire:Interface:Node") | select(.info.props["node.name"]|test("^backline.player"))] | length')"
+
+echo; echo "-- 3. every received sample against the timeline"
+python3 -I - "$out" <<'EOF'
+import struct, sys
+from array import array
+d = sys.argv[1]
+def wavdata(p):
+    b = open(p, "rb").read()
+    ch = struct.unpack("<H", b[22:24])[0]
+    a = array("f"); a.frombytes(b[44:])
+    return ch, a
+def cycles(p, ch):
+    b = open(p, "rb").read(); i = 0; out = []
+    while i < len(b):
+        gp, tf, roll, n = struct.unpack("<qqiI", b[i:i + 24]); i += 24
+        a = array("f"); a.frombytes(b[i:i + n * ch * 4]); i += n * ch * 4
+        out.append((gp, tf, roll, n, a))
+    return out
+f32 = lambda x: struct.unpack("<f", struct.pack("<f", x))[0]
+def check(name, tap, wav, start, gains, ch_map):
+    fch, fa = wavdata(wav); frames = len(fa) // fch
+    cyc = cycles(tap, len(ch_map))
+    roll_cycles = sum(1 for c in cyc if c[2]); total = exact = bad = silent_bad = gap = 0
+    starts = []; ramp = 0; prev_tail = None; firsts = []
+    for gp, tf, roll, n, a in cyc:
+        # which gain applied in this cycle: the gain log is by transport frame ranges (set below)
+        g, is_ramp = gains(gp)
+        for k, src in enumerate(ch_map):
+            for i in range(n):
+                v = a[k * n + i]
+                o = tf + i - start
+                if roll and 0 <= o < frames:
+                    total += 1
+                    want = f32(fa[o * fch + src] * g) if g is not None else None
+                    if is_ramp:
+                        ramp += 1
+                    elif v == want:
+                        exact += 1
+                    elif v == 0.0:
+                        gap += 1
+                    else:
+                        bad += 1
+                elif v != 0.0:
+                    silent_bad += 1
+        # the clip's first sample: transport frame of the first nonzero sample in a cycle that contains `start`
+        if roll and tf <= start < tf + n:
+            nz = next((i for i in range(n) if a[i] != 0.0), None)
+            firsts.append((tf, None if nz is None else tf + nz))
+    print(f"  {name}: {len(cyc)} cycles received ({roll_cycles} rolling); {total} samples inside the clip while rolling:")
+    print(f"     {exact} exact (bit-identical to file x gain), {bad} wrong, {gap} silent where the file has audio (underrun), {ramp} in the one gain-ramp cycle")
+    print(f"     samples outside the clip or while stopped that were not silence: {silent_bad}")
+    for tf, first in firsts:
+        print(f"     a cycle starting at transport {tf} contains the start {start}: first audio sample at transport {first} -> error {None if first is None else first - start} samples")
+    return bad == 0 and silent_bad == 0 and firsts and all(f is not None and f == start for _, f in firsts), gap
+# a's gain: 0 dB until the SetGain cycle (one ramp cycle), then -12 dB. Find it from the data:
+# the first rolling cycle whose ratio to the file isn't 1.
+def gains_for_a(tap, wav, start):
+    fch, fa = wavdata(wav); frames = len(fa) // fch
+    cyc = cycles(tap, 2); g12 = f32(10 ** (-12 / 20)); ramp_gp = None
+    for gp, tf, roll, n, a in cyc:
+        if not roll: continue
+        o = tf - start
+        if 0 <= o and o + n < frames:
+            if any(a[i] != fa[(o + i) * fch] for i in range(n)):
+                ramp_gp = gp; break
+    def g(gp):
+        if ramp_gp is None or gp < ramp_gp: return (1.0, False)
+        if gp == ramp_gp: return (None, True)
+        return (g12, False)
+    return g, ramp_gp
+ga, ramp_gp = gains_for_a(f"{d}/tapa.bin", f"{d}/a-stereo.wav", 96000)
+ok_a, gap_a = check("a (stereo, start 96000, 0 dB then -12 dB)", f"{d}/tapa.bin", f"{d}/a-stereo.wav", 96000, ga, [0, 1])
+gb = f32(10 ** (-6 / 20))
+ok_b, gap_b = check("b (mono, start bbt:3|1|0 = 192000, -6 dB)", f"{d}/tapb.bin", f"{d}/b-mono.wav", 192000, lambda gp: (gb, False), [0])
+print(f"  gain change: one ramp cycle at graph position {ramp_gp}, then exactly x{f32(10 ** (-12 / 20)):.9f} (-12 dB)")
+print("  RESULT:", "PASS" if ok_a and ok_b else "FAIL",
+      "(every sample is the file's frame at (transport - start) x gain, bit-exact; each start lands on its exact transport frame)")
+print(f"  underrun samples (a locate into a file's streamed part while rolling): a {gap_a // 2} frames ({gap_a / 2 / 48:.1f} ms), b {gap_b} frames")
+EOF
+
+echo; echo "-- clean up"
+kill $PD; wait $PD 2>/dev/null || true; PD=
+kill $CK; wait $CK 2>/dev/null || true; CK=
+kill $WD 2>/dev/null; WD=
+bl_cleanup
+sleep 0.5
+echo "leaks (a test node linked to a non-test node): $( [[ -s $out/leaks.txt ]] && sort -u "$out/leaks.txt" | tr '\n' ';' || echo none)"
+left=$(pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.group"] // empty' | grep -c '^backline-test.player' || true)
+echo "test-group nodes left: $left"
+bl_foreign_nodes >"$out/nodes-after.txt"
+echo "other nodes same as at start: $(bl_same_nodes "$out/nodes-before.txt" "$out/nodes-after.txt")"
+echo "default sink after: $(bl_default_sink) ($( [[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED)); default source $( [[ $(bl_default_source) == "$source_before" ]] && echo unchanged || echo CHANGED); moved during the run: $( [[ -s $out/defaults-moved.txt ]] && head -3 "$out/defaults-moved.txt" || echo never)"; kill $BL_WATCH 2>/dev/null
+[[ -n ${KEEP:-} ]] || rm -f "$out"/*.bin "$out"/*.wav

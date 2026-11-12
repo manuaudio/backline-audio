@@ -59,6 +59,8 @@ static void usage(FILE *f)
 	      "  rec -s NODE ... ARGS   run the one-shot recorder (see backline rec -h)\n"
 	      "  transport play|stop|locate POS|tempo BPM|meter N D|link on|off|status\n"
 	      "  transport ltc|mtc off|generate|chase [--fps F] [--target NODE] [--source NODE]\n"
+	      "  play load FILE [--at POS] [--gain DB] [--target NODE] [--id ID]   a file on the timeline\n"
+	      "  play unload ID|gain ID DB|start ID POS|list|show ID\n"
 	      "  version\n",
 	      f);
 }
@@ -671,6 +673,8 @@ int main(int argc, char **argv)
 		r = cmd_host(n - 1, args + 1);
 	else if (!strcmp(cmd, "transport"))
 		r = cli_transport(C, g_json, n - 1, args + 1);
+	else if (!strcmp(cmd, "play"))
+		r = cli_play(C, g_json, n - 1, args + 1);
 	else if (!strcmp(cmd, "params"))
 		r = cmd_params(n, args);
 	else if (!strcmp(cmd, "get"))

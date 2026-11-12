@@ -228,6 +228,26 @@ int bl_clock_link(bl_client *c, bool enable);
 int bl_clock_timecode(bl_client *c, bool ltc, const char *mode, double fps, const char *target, const char *source);
 int bl_clock_get(bl_client *c, bl_clock_status *st);
 
+/* ----------------------------------------------------------------- Player1 */
+/* docs/api/Player1.md. NULL strings and NAN numbers mean the default. */
+typedef struct bl_play_options {
+	const char *id;          /* default: from the file name */
+	const char *at;          /* timeline position (as bl_clock_locate); default "0" */
+	const char *target;      /* node to play into; default: the session manager links it */
+	double gain_db;          /* default 0 */
+	int autoconnect;         /* -1 default, 0, 1 (ignored with a target) */
+} bl_play_options;
+#define BL_PLAY_OPTIONS_INIT { NULL, NULL, NULL, 0.0, -1 }
+
+/* file: an absolute path. Returns once the node is up (and linked). */
+int bl_player_load(bl_client *c, const char *file, const bl_play_options *opt, char *id, size_t id_size);
+int bl_player_unload(bl_client *c, const char *id);
+int bl_player_set_gain(bl_client *c, const char *id, double db);
+int bl_player_set_start(bl_client *c, const char *id, const char *position, uint64_t *frame);
+/* JSON: backline.player/1 (List) and backline.clip/1 (Get); release with bl_free. */
+int bl_player_list(bl_client *c, char **json);
+int bl_player_get(bl_client *c, const char *id, char **json);
+
 /* --------------------------------------------------------------- helpers */
 /* The worker's bus name for a node name (non-alphanumerics become '_'). */
 void bl_bus_name_for_node(const char *node, char *out, size_t n);

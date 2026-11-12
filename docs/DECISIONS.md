@@ -109,3 +109,19 @@ sets the tempo must not change the tempo of somebody's Live set on the same
 network. In the namespace, the second Link peer is the only one there is. The
 PipeWire and D-Bus sockets are filesystem sockets, so the test still talks to
 the real (throwaway) graph.
+
+## D7. One player node per file (2026-11-12)
+
+**Decision.** `backline-playerd` makes one PipeWire node per loaded file,
+not one node per "player" with a port group per track.
+
+**Why.** Every clip then appears as its own stream in mixers, volume
+controls and patchbays, and can be routed and recorded on its own, the way
+D2 treats instruments. Alignment doesn't need a shared node: each clip reads
+the same transport frame from the same `spa_io_position` in the same cycle,
+so clips line up to the sample (§4.9 measures it). Loading or unloading one
+clip never touches another's node.
+
+**Revisit when** sessions need hundreds of clips at once (one node each has
+a cost per cycle), or a clip needs to be mixed inside the player before it
+reaches the graph.

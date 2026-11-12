@@ -48,6 +48,12 @@ Move the transport. `position` is one of:
 
 Returns the frame it located to. Errors: `InvalidArgs`, `State` (chasing).
 
+### `Resolve(s position) → (t frame)`
+
+The frame `position` names (the same forms as `Locate`), with the current
+frame rate and tempo map, without moving the transport. The player places
+clips with it. Errors: `InvalidArgs`.
+
 ### `SetTempo(d bpm) → ()`
 
 20 to 999 BPM. With Link on, it proposes the tempo to the Link session.

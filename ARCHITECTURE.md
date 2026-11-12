@@ -68,7 +68,7 @@ effect-insert component.
 | `backline-registry` + `backline-probe` | The system plugin index (CLAP, VST3, LV2), with crash-proof scanning and validation on install | C | **Built and measured** (§4.4): sandboxed probes, grades, cache, `Registry1` |
 | `backline-hostd` + `backline-plugin-worker` | Out-of-process plugin host: each instance one process and one PipeWire node, with MIDI in, params and presets over D-Bus and OSC | C (hostd), C++ (worker) | **Built and measured** (§4.1, §4.3, §4.5): CLAP, VST3 and LV2; presets; supervisor with restart-with-state |
 | `backline-recorderd` | Records any set of nodes to sample-aligned, timestamped multitrack WAV/BWF (RF64 past 4 GB) or FLAC; virtual soundcheck | C | **Built and measured** (§4.2, §4.6, §4.7): `Recorder1`, markers, takes, input-latency compensation, stall-proof disk thread, soundcheck |
-| `backline-playerd` | Plays files into the graph, locked to the shared timeline | C | Design |
+| `backline-playerd` | Plays files into the graph on the shared timeline: each file a node, starting on an exact transport frame, with its own gain | C | **Built and measured** (§4.9): `Player1`, sample-exact starts, streaming past an in-memory head |
 | `backline-clockd` | Transport, tempo and timecode: the PipeWire timeline owner, Ableton Link, LTC/MTC generation and chase | C++ (Link is C++) | **Built and measured** (§4.8): `Clock1`, LTC/MTC to the sample, Link |
 | `backline-controld` | Maps OSC and MIDI to any parameter in the system: Backline instances, filter-chain/clap-pipewire controls, volumes, transport | C | Design (the worker already speaks OSC) |
 | `libbackline` + `backline` CLI + `Backline` QML module | The client surface for apps and Omarchy panels | C (lib), C (CLI), C++/QML (module) | Library skeleton and CLI built (host, instance, plugins, rec); QML is design |
@@ -390,18 +390,40 @@ effect-insert component.
   plausible: a small bash command calling
   `backline rec`. The daemon stays standalone.
 
-### 2.4 Player and transport: `backline-playerd`
+### 2.4 Player: `backline-playerd`
 
-- **Job.** Play files (multitrack sessions, cues, stems) into the graph on
-  the shared timeline. Locate, loop, cue lists, and chase the transport.
-- **Process model.** One process, one `pw_filter` per *player*, with
-  output ports per track. A disk thread prefetches into rings, and the
-  data thread only copies. Sample-accurate start comes from
-  `spa_io_position` (a start at graph frame N).
-- **Interfaces.** D-Bus `Player1`: `Load`, `Play`, `Stop`, `Locate`, `Cue`.
-  OSC `/backline/player/...`.
-- **Reuse.** libsndfile, plus libsamplerate/soxr when the file rate differs
-  from the graph rate. `pw-play` covers the single-file case today.
+- **Job.** Play files (stems, cues, multitrack sessions) into the graph on
+  the shared timeline: each file starts on an exact transport frame, with
+  its own gain, and follows play, stop and locate of the transport.
+- **Process model** (built). One process; one `pw_filter` per loaded file
+  (a *clip*), `Stream/Output/Audio`, one output port per file channel, so
+  every clip shows up in mixers and patchbays as its own stream (D7). The
+  player never moves the transport: it follows what every node sees.
+- **Timeline.** Every cycle a clip reads the transport frame *T* and the
+  rolling state from `spa_io_position` (the segment clockd owns, computed as
+  pipewire-jack does) and writes file frame *T − start + i* to sample *i*,
+  times its gain; silence outside the file and while stopped. A start can
+  fall anywhere inside a cycle. `tc:` and `bbt:` starts are resolved by
+  clockd (`Clock1.Resolve`, added for this) with its tempo map.
+- **Threads.**
+  - *Data* only copies: from the in-memory head (the first `preload`
+    seconds, 4 by default), then from a ring of tagged blocks. On a locate it
+    posts a seek (generation counter + `sem_post`) and drops stale blocks by
+    their tag, so the ring needs no reset handshake.
+  - *Disk* fills the ring from the offset the data thread last asked for:
+    while stopped it prepares the position the transport will start from.
+  - *Main* is D-Bus, linking (`target`, by channel name) and stats.
+- **Gain.** Per clip, in dB; a change ramps over one cycle, then samples are
+  exactly file × gain.
+- **Interfaces** (built). D-Bus `Player1`
+  ([docs/api/Player1.md](docs/api/Player1.md)): `Load(file, {at, gain,
+  target, ...})`, `Unload`, `SetGain`, `SetStart`, `Get`, `List`; signals
+  `Loaded`, `Unloaded`. CLI `backline play load|unload|gain|start|list|show`.
+- **Not built yet.** Resampling (a file at another rate than the graph is
+  silent and says so: `rate_ok: false`), loop ranges, cue lists, OSC
+  `/backline/player/...`.
+- **Reuse.** libsndfile for every format it reads. `pw-play` covers the
+  single-file, untimed case.
 - **Omarchy.** Nothing. This is a production tool.
 
 ### 2.5 Clock, transport and timecode: `backline-clockd`
@@ -777,6 +799,38 @@ test node in one `node.group` driven by a test sink.
   Link timeline stays within 0.63 ms (two ticks) while rolling, excluding the one cycle in
   which a tempo change was still crossing the network.
 
+### 4.9 Player (`tests/player-proof`)
+
+In its own network namespace, on a private bus, with clockd, playerd and two
+capture nodes in one `node.group` driven by a test sink. The capture node
+(`backline-test-tap`) is a native node that keeps every sample it receives
+with the transport frame of its cycle. A stereo file starts at frame 96000
+(0 dB), a mono file at `bbt:3|1|0` (−6 dB; clockd resolved it to 192000 at
+120 BPM). Moves: play from 0 across both starts and past the 4 s in-memory
+head, a gain change to −12 dB while rolling, a locate into the middle while
+rolling, stop + locate to 71999 + play (the starts then fall inside a cycle),
+stop + locate into the streamed part + play. Every received sample is
+compared with the file at (transport − start) × gain, exactly. Two runs, at
+the graph's quantum (128) and a forced 1000:
+
+| | quantum 128 | quantum 1000 |
+|---|---|---|
+| samples inside a clip while rolling | 1 829 821 | 1 821 997 |
+| bit-identical to file × gain | all but the 256 of the gain-ramp cycle | all but the 2 000 of the gain-ramp cycle |
+| wrong, or not silent where they must be | 0, 0 | 0, 0 |
+| first sample of each start (on a cycle boundary, and 65 or 1 frames into a cycle) | at its exact transport frame | at its exact transport frame |
+| underruns | 0 | 0 |
+
+- One development run lost 128 frames (2.7 ms, one cycle) right after a
+  locate into the streamed part while rolling, before the ring had refilled;
+  the final runs lost none. A locate into the head, or any locate while
+  stopped, is exact by construction.
+- A 44.1 kHz file on the 48 kHz graph stays silent and reports
+  `rate_ok: false` (no resampling yet). Errors are typed (`NotFound` for a
+  missing file or target node, `InvalidArgs`, `Busy` for a taken id).
+- No link to a non-test node at any time (a watchdog checks every 0.3 s);
+  nothing left; the other nodes and the defaults unchanged.
+
 ## 5. Build order
 
 1. **Host supervisor and client skeleton.** *Done (§4.3).*
@@ -809,7 +863,8 @@ test node in one `node.group` driven by a test sink.
      a VST3 run check in the registry, LV2 `patch:Parameter` parameters
      (Surge XT's LV2 has only two control ports), saving LV2/CLAP presets,
      GUIs last.
-6. **Player.** Files on the timeline, chasing clockd.
+6. **Player.** *Done (§4.9)*: files on the timeline, sample-exact starts,
+   per-file gain. Still open: resampling, loops and cue lists, OSC.
 7. **Control service.** OSC and MIDI mapping across Backline, filter-chain
    controls and volumes, with MIDI-learn.
 8. **Omarchy PRs**, each one problem with measured evidence, in this order:
