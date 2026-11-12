@@ -1,0 +1,148 @@
+#!/bin/bash
+# recorder-proof: two nodes recorded at once, sample-aligned, with timestamps.
+#
+# One test signal (1 s silence, then irregular impulses, a noise burst and a
+# 1 kHz tone; R = -0.5 x L) is played into TWO different null sinks at once.
+# backline-recorder records both sinks' monitors as two tracks. The tracks must
+# be identical sample for sample (lag 0), the same length, and carry the same
+# BWF time reference. As a control, two pw-record processes record the same two
+# sinks at the same time; they start on different cycles and carry no timestamp.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+out=$here/out/recorder
+rm -rf "$out"; mkdir -p "$out"
+exec > >(tee "$out/report.txt") 2>&1
+trap bl_cleanup EXIT
+wait_log() { for _ in $(seq 200); do grep -q "$2" "$1" 2>/dev/null && return 0; sleep 0.05; done; echo "timeout: $2"; return 1; }
+
+echo "== recorder-proof $(date -Is)"
+default_before=$(bl_default_sink)
+bl_foreign_nodes >"$out/foreign-before.txt"
+echo "default sink: $default_before"
+
+python3 -I - "$out/signal.wav" <<'EOF'
+import math, random, struct, sys, wave
+r = 48000; random.seed(7)
+L = [0.0] * r                                     # 1 s silence: time to link
+pos = 0
+for gap in (4801, 7333, 2903, 11117, 5003):       # irregular: no ambiguous lag
+    seg = [0.0] * gap; seg[0] = 0.8; L += seg
+L += [random.uniform(-0.5, 0.5) for _ in range(r // 2)]
+L += [0.5 * math.sin(2 * math.pi * 1000 * n / r) for n in range(r // 2)]
+L += [0.0] * (r // 2)
+w = wave.open(sys.argv[1], "wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(r)
+w.writeframes(b"".join(struct.pack("<hh", int(v * 32767), int(-0.5 * v * 32767)) for v in L)); w.close()
+print(f"signal: {len(L)} frames ({len(L)/r:.2f} s), stereo, R = -0.5 x L")
+EOF
+
+# take NAME DRIVER: DRIVER=dedicated -> a third sink with a higher driver
+# priority drives the graph, so both recorded sinks are followers.
+# DRIVER=recorded -> one of the two recorded sinks is the graph driver.
+take() {
+  local name=$1 mode=$2 x
+  if [[ $mode == dedicated ]]; then
+    bl_testbed backline-test.rec-a backline-test.rec-b backline-test.clock@1000
+  else
+    bl_testbed backline-test.rec-a backline-test.rec-b
+  fi
+  # The recorders first (they wait for their links), then the player.
+  "$BL_BIN/backline-recorder" -s backline-test.rec-a -s backline-test.rec-b -o "$out" -n "$name" -d 5.0 \
+    >/dev/null 2>"$out/rec-$name.log" &
+  local rec=$!
+  for x in a b; do
+    bl_spawn pw-record -P "{ node.autoconnect = false node.name = backline-test.pwrec-$x }" \
+      --rate 48000 --channels 2 --format f32 "$out/$name-pw-record-$x.wav" >/dev/null
+  done
+  bl_wait_node backline-test.pwrec-a; bl_wait_node backline-test.pwrec-b
+  wait_log "$out/rec-$name.log" armed
+  for x in a b; do
+    pw-link "backline-test.rec-$x:monitor_FL" "backline-test.pwrec-$x:input_FL"
+    pw-link "backline-test.rec-$x:monitor_FR" "backline-test.pwrec-$x:input_FR"
+  done
+  bl_spawn pw-play -P '{ node.autoconnect = false node.name = backline-test.player node.dont-fallback = true }' "$out/signal.wav"
+  bl_wait_node backline-test.player
+  local sinks="backline-test.rec-a backline-test.rec-b"
+  [[ $mode == dedicated ]] && sinks+=" backline-test.clock"
+  for x in $sinks; do   # one player, fanned out
+    pw-link backline-test.player:output_FL "$x:playback_FL"
+    pw-link backline-test.player:output_FR "$x:playback_FR"
+  done
+  wait $rec
+  bl_cleanup
+  sleep 0.3
+}
+
+evaluate() { # NAME EXPECT(zero|quantum)
+  python3 -I - "$here" "$out" "$1" "$2" <<'EOF2'
+import json, sys, time
+here, out, name, expect = sys.argv[1:5]
+sys.path.insert(0, here)
+import analyze as A
+take = json.load(open(f"{out}/{name}.json"))
+t1, t2 = (t["file"] for t in take["tracks"])
+print(f"  sidecar: start {take['start']['utc']}, graph frame {take['start']['graph_position']}, "
+      f"{take['frames']} frames, quantum {take['quantum_range'][0]}..{take['quantum_range'][1]}, overruns {take['overrun_frames']}")
+for f in (t1, t2):
+    i = A.cmd_info(f); b = i["bext"]
+    print(f"  {f.rsplit('/',1)[1]}: {i['frames']} frames, {i['channels']} ch {i['format']}{i['bits']}, "
+          f"bext {b['origination_date']} {b['origination_time']} time_reference={b['time_reference']}")
+al = A.cmd_align(t1, t2)
+wa, wb = A.read_wav(t1), A.read_wav(t2)
+lag = al["lag_samples"]
+lo, hi = max(0, -lag), min(wa["frames"], wb["frames"] - lag)
+rdiff = max(abs(wa["data"][1][i] - wb["data"][1][i + lag]) for i in range(lo, hi))
+chmap = max(max(abs(r + 0.5 * l) for l, r in zip(w["data"][0], w["data"][1])) for w in (wa, wb))
+print(f"  lag track 2 vs track 1: {lag} samples; max |difference| at that lag: L {al['max_abs_diff_at_lag']} R {rdiff} "
+      f"over {al['identical_samples_compared']} frames ({al['nonzero_samples']} non-silent)")
+print(f"  first impulses (sample index), track 1: {al['onsets_a'][:5]}")
+print(f"                                 track 2: {al['onsets_b'][:5]}")
+print(f"  channel map: max |R + 0.5 L| = {chmap:.1e} on both tracks (R = -0.5 x L as played)")
+st = take["start"]
+lt = time.localtime(st["realtime_ns"] // 10**9)
+tref = round(((lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec) * 10**9 + st["realtime_ns"] % 10**9) * take["rate"] / 1e9)
+b1, b2 = (A.cmd_info(f)["bext"]["time_reference"] for f in (t1, t2))
+print(f"  BWF time_reference: track 1 {b1}, track 2 {b2}; sidecar UTC start as samples since local midnight: {tref}")
+same = al["max_abs_diff_at_lag"] == 0 and rdiff == 0 and wa["frames"] == wb["frames"] and b1 == b2 == tref \
+    and take["overrun_frames"] == 0 and chmap < 1e-4 and al["nonzero_samples"] > 40000
+c = A.cmd_align(f"{out}/{name}-pw-record-a.wav", f"{out}/{name}-pw-record-b.wav")
+ia, ib = A.cmd_info(f"{out}/{name}-pw-record-a.wav"), A.cmd_info(f"{out}/{name}-pw-record-b.wav")
+print(f"  control, two pw-record processes on the same nodes: lag {c['lag_samples']} samples, "
+      f"lengths {ia['frames']} vs {ib['frames']}, timestamps: {'bext' if ia['bext'] else 'none'}")
+if expect == "zero":
+    ok = same and lag == 0
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'} (bit-identical at lag 0, equal length, equal timestamps, no overruns)")
+else:
+    q = take["quantum_range"][1]
+    ok = same and abs(lag) == q
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'} (bit-identical, offset by exactly one quantum = {q}: the driver sink's "
+          f"monitor carries the previous cycle)")
+json.dump({"take": name, "lag": lag, "l_diff": al["max_abs_diff_at_lag"], "r_diff": rdiff, "bext": [b1, b2],
+           "expected_bext": tref, "control_lag": c["lag_samples"], "pass": ok}, open(f"{out}/result-{name}.json", "w"), indent=1)
+EOF2
+}
+
+echo; echo "-- 1. two follower nodes (a dedicated driver runs the graph): the same signal on both"
+take take-align dedicated
+evaluate take-align zero
+
+echo; echo "-- 2. same, but one of the two recorded sinks is the graph driver"
+take take-driver recorded
+evaluate take-driver quantum
+
+# A FLAC take too (24-bit), with the timestamp in the Vorbis comment.
+echo; echo "-- FLAC: same recorder, -f flac"
+bl_testbed backline-test.rec-a
+"$BL_BIN/backline-recorder" -s backline-test.rec-a -o "$out" -n take-flac -f flac -d 1.0 >/dev/null 2>"$out/rec-flac.log"
+f=$(jq -r '.tracks[0].file' "$out/take-flac.json")
+echo "  $(basename "$f"): $(metaflac --show-sample-rate --show-channels --show-bps --show-total-samples "$f" | tr '\n' ' ')"
+echo "  $(metaflac --export-tags-to=- "$f" | grep -i comment)"
+bl_cleanup
+sleep 0.3
+
+echo; echo "-- clean up"
+left=$(pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // empty' | grep -c '^backline' || true)
+echo "backline nodes left: $left; processes left: $(pgrep -c -x 'backline-plugin|backline-record|backline-test-k|pw-record|pw-play' || true)"
+bl_foreign_nodes >"$out/foreign-end.txt"
+echo "other nodes same as at start: $(bl_same_nodes "$out/foreign-before.txt" "$out/foreign-end.txt")"
+echo "default sink after: $(bl_default_sink) ($([[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED))"

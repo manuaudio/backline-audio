@@ -1,0 +1,245 @@
+#!/bin/bash
+# host-proof: a CLAP instrument as a system PipeWire node, measured.
+#
+#  1. A virtual keyboard on the ALSA sequencer (what a USB keyboard looks like)
+#     plays Surge XT through PipeWire's MIDI bridge. The worker finds and links
+#     the keyboard itself (--midi-follow). Measured: signal on note-on, silence
+#     after note-off, pitch by FFT, MIDI-to-audio latency.
+#  2. A parameter changed live over OSC, read back and restored over D-Bus.
+#  3. One plugin process is killed (SIGKILL) while two instances play. The
+#     other instance, the recorder and every other node keep running.
+#
+# Throwaway only: null sinks owned by this script, nothing linked to real devices.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+out=$here/out/host
+rm -rf "$out"; mkdir -p "$out"
+exec > >(tee "$out/report.txt") 2>&1
+trap bl_cleanup EXIT
+OBJ=/io/github/manuaudio/Backline/Instance
+IFACE=io.github.manuaudio.Backline.Instance1
+bus() { busctl --user --json=short call "$1" $OBJ $IFACE "${@:2}"; }
+prop() { busctl --user get-property "$1" $OBJ $IFACE "$2" | awk '{print $2}'; }
+mono() { python3 -I -c 'import time; print(time.monotonic_ns())'; }
+osc() { python3 -I "$here/oscsend.py" "$@"; }
+wait_log() { # file pattern
+  for _ in $(seq 200); do grep -q "$2" "$1" 2>/dev/null && return 0; sleep 0.05; done
+  echo "timed out waiting for '$2' in $1"; return 1
+}
+eval_py() { python3 -I - "$here" "$out" "$@"; }
+
+echo "== host-proof $(date -Is)"
+echo "pipewire $(pipewire --version | sed -n 's/.*libpipewire \(.*\)/\1/p' | tail -1), kernel $(uname -r)"
+default_before=$(bl_default_sink)
+pw_pids_before="$(pidof pipewire) / $(pidof wireplumber)"
+bl_foreign_nodes >"$out/foreign-before.txt"
+echo "default sink: $default_before"
+echo "other nodes in the graph: $(wc -l <"$out/foreign-before.txt"); pipewire/wireplumber pids: $pw_pids_before"
+
+bl_testbed backline-test.sink-a backline-test.sink-b
+
+# ---------------------------------------------------------------- 1. notes
+echo; echo "-- 1. virtual keyboard -> PipeWire MIDI bridge -> Surge XT (CLAP, own process) -> test sink"
+bl_spawn "$BL_BIN/backline-plugin-worker" -p "Surge XT" -n backline.surge-a \
+  -t backline-test.sink-a -m '^Midi-Bridge:backline-test-kbd' >"$out/a.json" 2>"$out/a.log"
+bl_wait_node backline.surge-a 200
+a_pid=$(jq -r .pid "$out/a.json"); a_osc=$(jq -r .osc_port "$out/a.json"); a_bus=$(jq -r .dbus "$out/a.json")
+echo "worker A: pid $a_pid, node $(bl_node_id backline.surge-a), OSC 127.0.0.1:$a_osc, D-Bus $a_bus"
+
+"$BL_BIN/backline-recorder" -s backline-test.sink-a -o "$out" -n take-notes -d 7.5 >/dev/null 2>"$out/rec-notes.log" &
+rec=$!
+wait_log "$out/rec-notes.log" armed
+"$BL_BIN/backline-test-keyboard" --name backline-test-kbd wait=0.5 \
+  on=69,100 wait=1.0 off=69 wait=1.0 on=60,100 wait=1.0 off=60 wait=1.0 on=76,100 wait=1.0 off=76 \
+  >"$out/kbd-notes.jsonl"
+wait $rec
+grep midi-follow "$out/a.log" | sed 's/^/  /'
+eval_py <<'EOF'
+import glob, json, math, sys
+here, out = sys.argv[1], sys.argv[2]
+sys.path.insert(0, here)
+import analyze as A
+wav = glob.glob(f"{out}/take-notes-01-*.wav")[0]
+take = json.load(open(f"{out}/take-notes.json"))
+w = A.read_wav(wav); rate = w["rate"]; x = A.mono(w)
+kbd = [json.loads(l) for l in open(f"{out}/kbd-notes.jsonl")]
+ons = [e for e in kbd if e["event"].startswith("on=")]
+offs = [e for e in kbd if e["event"].startswith("off=")]
+t0 = take["start"]["monotonic_ns"]
+names = {69: "A4", 60: "C4", 76: "E5"}
+res = {"file": wav.rsplit("/", 1)[1], "notes": []}
+print(f"  recorded {w['frames']} frames at {rate} Hz; take starts at graph frame {take['start']['graph_position']}")
+print(f"  {'note':4} {'expect Hz':>9} {'FFT Hz':>9} {'cents':>6} {'level':>9} {'on->sound':>10} {'off->-60dB':>10} {'gap peak':>9}")
+for on, off in zip(ons, offs):
+    key = on["a"]; expect = 440.0 * 2 ** ((key - 69) / 12)
+    i_on = max(0, int((on["t_ns"] - t0) * rate / 1e9))
+    onset = next(i for i in range(i_on, len(x)) if abs(x[i]) > 1e-3)
+    i_off = int((off["t_ns"] - t0) * rate / 1e9)
+    seg = x[onset + int(0.2 * rate): i_off - int(0.1 * rate)]
+    f, _ = A.f0(seg[:32768], rate)
+    cents = 1200 * math.log2(f / expect)
+    lvl = A.db(A.rms(seg))
+    # release: first 1 ms window after note-off whose RMS is below -60 dBFS
+    hop = rate // 1000
+    rel = next(k for k in range(i_off, len(x), hop) if A.db(A.rms(x[k:k + hop])) < -60)
+    # the silent gap: from 300 ms after note-off to the next note-on (or the end)
+    nxt = [e for e in ons if e["t_ns"] > off["t_ns"]]
+    g_end = int((nxt[0]["t_ns"] - t0) * rate / 1e9) if nxt else len(x)
+    gap = x[i_off + int(0.3 * rate): g_end]
+    gpk = A.db(max(abs(v) for v in gap)) if gap else None
+    n = {"key": key, "name": names.get(key, str(key)), "expect_hz": round(expect, 3), "fft_hz": round(f, 3),
+         "cents": round(cents, 2), "rms_dbfs": round(lvl, 1),
+         "midi_to_audio_ms": round((onset - i_on) / rate * 1000, 2),
+         "release_to_minus60_ms": round((rel - i_off) / rate * 1000, 1), "gap_peak_dbfs": gpk}
+    res["notes"].append(n)
+    print(f"  {n['name']:4} {expect:9.3f} {f:9.3f} {cents:6.2f} {lvl:6.1f} dB {n['midi_to_audio_ms']:7.2f} ms "
+          f"{n['release_to_minus60_ms']:7.1f} ms {gpk:6.1f} dB")
+ok = all(abs(n["cents"]) < 5 and n["rms_dbfs"] > -40 and (n["gap_peak_dbfs"] or -240) < -90 for n in res["notes"])
+res["pass"] = ok and len(res["notes"]) == 3
+print(f"  RESULT: {'PASS' if res['pass'] else 'FAIL'} (3 notes, pitch within 5 cents, sounding > -40 dBFS, gaps < -90 dBFS peak)")
+json.dump(res, open(f"{out}/result-notes.json", "w"), indent=1)
+EOF
+
+# ------------------------------------------------- 1b. unplug, key held
+echo; echo "-- 1b. keyboard unplugged while a key is down (its note-off never comes)"
+a_log_mark=$(($(wc -l <"$out/a.log") + 1))
+"$BL_BIN/backline-recorder" -s backline-test.sink-a -o "$out" -n take-unplug -d 2.5 >/dev/null 2>"$out/rec-unplug.log" &
+rec=$!
+wait_log "$out/rec-unplug.log" armed
+"$BL_BIN/backline-test-keyboard" --name backline-test-kbd --linger 0 on=64,100 wait=0.8 >"$out/kbd-unplug.jsonl"
+t_unplug=$(mono)
+wait $rec
+tail -n +"$a_log_mark" "$out/a.log" | grep "went away" | sed 's/^/  /'
+echo "  worker A ReleasedNotes: $(prop "$a_bus" ReleasedNotes)"
+eval_py "$t_unplug" <<'EOF2'
+import glob, json, sys
+here, out, t_unplug = sys.argv[1], sys.argv[2], int(sys.argv[3])
+sys.path.insert(0, here)
+import analyze as A
+f = glob.glob(f"{out}/take-unplug-01-*.wav")[0]
+take = json.load(open(f"{out}/take-unplug.json"))
+t0 = take["start"]["monotonic_ns"]
+on = json.loads(open(f"{out}/kbd-unplug.jsonl").readlines()[1])["t_ns"]
+s_on, s_un = (on - t0) / 1e9, (t_unplug - t0) / 1e9
+held = A.cmd_level(f, s_on + 0.2, s_un - 0.05)["rms_dbfs"][0]
+after = A.cmd_level(f, s_un + 0.3, 2.5)["peak_dbfs"][0]
+ok = held > -40 and after < -90
+print(f"  held note {held:.1f} dBFS; from 300 ms after unplug: peak {after:.1f} dBFS")
+print(f"  RESULT: {'PASS' if ok else 'FAIL'} (no stuck note)")
+json.dump({"held": held, "after_peak": after, "pass": ok}, open(f"{out}/result-unplug.json", "w"), indent=1)
+EOF2
+
+# ------------------------------------------------------ 2. live parameter
+echo; echo "-- 2. live parameter change: Surge 'Global Volume' over OSC, read back and restored over D-Bus"
+orig=$(bus "$a_bus" GetParam s "Global Volume" | jq '.data[0]')
+echo "  Global Volume before: $orig (D-Bus GetParam)"
+"$BL_BIN/backline-recorder" -s backline-test.sink-a -o "$out" -n take-param -d 4.0 >/dev/null 2>"$out/rec-param.log" &
+rec=$!
+wait_log "$out/rec-param.log" armed
+"$BL_BIN/backline-test-keyboard" --name backline-test-kbd on=57,100 wait=3.4 off=57 >"$out/kbd-param.jsonl" &
+kbd=$!
+sleep 1.2
+t_osc=$(mono); osc "$a_osc" /backline/param/set "Global Volume" 0.5
+echo "  OSC  /backline/param/set \"Global Volume\" 0.5"
+echo "  OSC  /backline/param/get reply: $(osc "$a_osc" /backline/param/get "Global Volume")"
+sleep 1.0
+t_dbus=$(mono); bus "$a_bus" SetParam sd "Global Volume" "$orig" >/dev/null
+echo "  D-Bus SetParam(\"Global Volume\", $orig); GetParam -> $(bus "$a_bus" GetParam s "Global Volume" | jq '.data[0]')"
+wait $kbd; wait $rec
+eval_py "$t_osc" "$t_dbus" <<'EOF'
+import glob, json, sys
+here, out, t_osc, t_dbus = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+sys.path.insert(0, here)
+import analyze as A
+w = A.read_wav(glob.glob(f"{out}/take-param-01-*.wav")[0]); rate = w["rate"]; x = A.mono(w)
+t0 = json.load(open(f"{out}/take-param.json"))["start"]["monotonic_ns"]
+kbd = {e["event"].split("=")[0]: e for e in map(json.loads, open(f"{out}/kbd-param.jsonl"))}
+idx = lambda t: int((t - t0) * rate / 1e9)
+on, off = idx(kbd["on"]["t_ns"]), idx(kbd["off"]["t_ns"])
+a, b = idx(t_osc), idx(t_dbus)
+lv = lambda i, j: A.db(A.rms(x[i:j]))
+before = lv(on + int(0.2 * rate), a - int(0.05 * rate))
+during = lv(a + int(0.15 * rate), b - int(0.05 * rate))
+after = lv(b + int(0.15 * rate), off - int(0.05 * rate))
+# when did it take effect? first 5 ms window (1 ms steps) more than 6 dB below
+# the steady level; the window END is reported, so this is an upper bound
+win, step = rate // 200, rate // 1000
+def change_at(start, ref):
+    for k in range(start - win, start + rate, step):
+        if lv(k, k + win) < ref - 6:
+            return (k + win - start) / rate * 1000
+eff_osc = change_at(a, before)
+print(f"  level before {before:.2f} dBFS | after OSC 0.5: {during:.2f} dBFS ({during - before:+.2f} dB) | after D-Bus restore: {after:.2f} dBFS")
+print(f"  OSC send -> level down by 6 dB: <= {eff_osc:.1f} ms (upper bound: 5 ms analysis window; includes the sender's start-up)")
+ok = during < before - 6 and abs(after - before) < 0.5
+print(f"  RESULT: {'PASS' if ok else 'FAIL'} (change > 6 dB while set, restored within 0.5 dB)")
+json.dump({"before": before, "during": during, "after": after, "osc_to_effect_ms": eff_osc, "pass": ok},
+          open(f"{out}/result-param.json", "w"), indent=1)
+EOF
+
+# ------------------------------------------------------ 3. crash isolation
+echo; echo "-- 3. crash isolation: two instances playing; SIGKILL instance A mid-note"
+bl_spawn "$BL_BIN/backline-plugin-worker" -p "Surge XT" -n backline.surge-b -t backline-test.sink-b \
+  >"$out/b.json" 2>"$out/b.log"
+bl_wait_node backline.surge-b 200
+b_bus=$(jq -r .dbus "$out/b.json")
+bus "$a_bus" NoteOn yyy 0 69 100 >/dev/null   # A: A4, held
+bus "$b_bus" NoteOn yyy 0 64 100 >/dev/null   # B: E4, held
+sleep 0.3
+bl_foreign_nodes >"$out/foreign-mid.txt"
+"$BL_BIN/backline-recorder" -s backline-test.sink-a -s backline-test.sink-b -o "$out" -n take-crash -d 4.0 \
+  >/dev/null 2>"$out/rec-crash.log" &
+rec=$!
+wait_log "$out/rec-crash.log" armed
+sleep 1.5
+b_cycles_before=$(prop "$b_bus" Cycles)
+t_kill=$(mono); kill -KILL "$a_pid" 2>/dev/null
+echo "  SIGKILL -> worker A (pid $a_pid)"
+sleep 0.5
+b_cycles_after=$(prop "$b_bus" Cycles)
+wait $rec
+sleep 0.2
+echo "  worker A node present after kill: $([[ -n $(bl_node_id backline.surge-a) ]] && echo YES || echo no)"
+echo "  worker A D-Bus name present: $(busctl --user status "$a_bus" >/dev/null 2>&1 && echo YES || echo no)"
+echo "  worker B: cycles $b_cycles_before -> $b_cycles_after across the kill; still answers D-Bus: $(bus "$b_bus" GetParam s "Global Volume" | jq '.data[0]')"
+bl_foreign_nodes >"$out/foreign-after.txt"
+echo "  other nodes (ids + names) unchanged across the crash: $(bl_same_nodes "$out/foreign-mid.txt" "$out/foreign-after.txt")"
+echo "  pipewire/wireplumber pids: $(pidof pipewire) / $(pidof wireplumber) (before: $pw_pids_before)"
+eval_py "$t_kill" <<'EOF'
+import glob, json, sys
+here, out, t_kill = sys.argv[1], sys.argv[2], int(sys.argv[3])
+sys.path.insert(0, here)
+import analyze as A
+take = json.load(open(f"{out}/take-crash.json"))
+t0, rate = take["start"]["monotonic_ns"], take["rate"]
+k = (t_kill - t0) / 1e9
+fa = glob.glob(f"{out}/take-crash-01-*.wav")[0]; fb = glob.glob(f"{out}/take-crash-02-*.wav")[0]
+a_before = A.cmd_level(fa, 0.2, k - 0.05)["rms_dbfs"][0]
+a_after = A.cmd_level(fa, k + 0.1, 3.9)["peak_dbfs"][0]
+b_win = A.cmd_windows(fb, 0.2, 3.9, 20)        # whole take, across the kill
+b_ref = A.cmd_windows(fb, 0.2, k - 0.05, 20)    # steady state before the kill
+b_pre = A.cmd_level(fb, 0.2, k - 0.05)["rms_dbfs"][0]
+b_post = A.cmd_level(fb, k + 0.05, 3.9)["rms_dbfs"][0]
+print(f"  kill at {k:.3f} s into the take; recorder overruns: {take['overrun_frames']} frames")
+print(f"  track A (killed):   {a_before:.2f} dBFS before, peak {a_after:.1f} dBFS after (silent: PipeWire dropped the node)")
+spread, ref_spread = b_win["max_dbfs"] - b_win["min_dbfs"], b_ref["max_dbfs"] - b_ref["min_dbfs"]
+print(f"  track B (survivor): {b_pre:.2f} dBFS before, {b_post:.2f} dBFS after the kill")
+print(f"    20 ms windows: spread {spread:.3f} dB over the whole take vs {ref_spread:.3f} dB before the kill; "
+      f"longest run of exact zeros: {b_win['longest_exact_zero_run_samples']} samples (a dropped cycle would be >= 64)")
+ok = (abs(b_post - b_pre) < 0.1 and spread < ref_spread + 0.1 and b_win["longest_exact_zero_run_samples"] < 8
+      and a_after < -90 and take["overrun_frames"] == 0)
+print(f"  RESULT: {'PASS' if ok else 'FAIL'} (survivor unchanged and gap-free across the kill; killed track silent)")
+json.dump({"kill_s": k, "a_before": a_before, "a_after_peak": a_after, "b": b_win, "b_pre": b_pre, "b_post": b_post, "pass": ok},
+          open(f"{out}/result-crash.json", "w"), indent=1)
+EOF
+
+# ---------------------------------------------------------------- cleanup
+echo; echo "-- clean up"
+bl_cleanup
+sleep 0.5
+left=$(pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // empty' | grep -c '^backline' || true)
+echo "backline nodes left: $left; processes left: $(pgrep -c -x 'backline-plugin|backline-record|backline-test-k|pw-record|pw-play' || true)"
+bl_foreign_nodes >"$out/foreign-end.txt"
+echo "other nodes same as at start: $(bl_same_nodes "$out/foreign-before.txt" "$out/foreign-end.txt")"
+echo "default sink after: $(bl_default_sink) ($([[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED))"

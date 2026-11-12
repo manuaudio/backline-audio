@@ -1,0 +1,40 @@
+== recorder-proof 2026-11-11T17:39:51-08:00
+default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
+signal: 151157 frames (3.15 s), stereo, R = -0.5 x L
+
+-- 1. two follower nodes (a dedicated driver runs the graph): the same signal on both
+./tests/out/recorder/take-align-pw-record-a.wav
+./tests/out/recorder/take-align-pw-record-b.wav
+  sidecar: start 2026-11-12T01:39:51.683608687Z, graph frame 1152, 240000 frames, quantum 128..2048, overruns 0
+  take-align-01-backline-test.rec-a.wav: 240000 frames, 2 ch float32, bext 2026-11-11 17:39:51 time_reference=3052400813
+  take-align-02-backline-test.rec-b.wav: 240000 frames, 2 ch float32, bext 2026-11-11 17:39:51 time_reference=3052400813
+  lag track 2 vs track 1: 0 samples; max |difference| at that lag: L 0.0 R 0.0 over 240000 frames (47003 non-silent)
+  first impulses (sample index), track 1: [51968, 56769, 64102, 67005, 78122]
+                                 track 2: [51968, 56769, 64102, 67005, 78122]
+  channel map: max |R + 0.5 L| = 1.5e-05 on both tracks (R = -0.5 x L as played)
+  BWF time_reference: track 1 3052400813, track 2 3052400813; sidecar UTC start as samples since local midnight: 3052400813
+  control, two pw-record processes on the same nodes: lag -512 samples, lengths 240128 vs 239488, timestamps: none
+  RESULT: PASS (bit-identical at lag 0, equal length, equal timestamps, no overruns)
+
+-- 2. same, but one of the two recorded sinks is the graph driver
+./tests/out/recorder/take-driver-pw-record-b.wav
+./tests/out/recorder/take-driver-pw-record-a.wav
+  sidecar: start 2026-11-12T01:39:59.094255044Z, graph frame 1280, 240000 frames, quantum 128..2048, overruns 0
+  take-driver-01-backline-test.rec-a.wav: 240000 frames, 2 ch float32, bext 2026-11-11 17:39:59 time_reference=3052756524
+  take-driver-02-backline-test.rec-b.wav: 240000 frames, 2 ch float32, bext 2026-11-11 17:39:59 time_reference=3052756524
+  lag track 2 vs track 1: -2048 samples; max |difference| at that lag: L 0.0 R 0.0 over 237952 frames (47003 non-silent)
+  first impulses (sample index), track 1: [53760, 58561, 65894, 68797, 79914]
+                                 track 2: [51712, 56513, 63846, 66749, 77866]
+  channel map: max |R + 0.5 L| = 1.5e-05 on both tracks (R = -0.5 x L as played)
+  BWF time_reference: track 1 3052756524, track 2 3052756524; sidecar UTC start as samples since local midnight: 3052756524
+  control, two pw-record processes on the same nodes: lag -384 samples, lengths 240000 vs 239616, timestamps: none
+  RESULT: PASS (bit-identical, offset by exactly one quantum = 2048: the driver sink's monitor carries the previous cycle)
+
+-- FLAC: same recorder, -f flac
+  take-flac-01-backline-test.rec-a.flac: 48000 2 24 48000 
+  comment=BACKLINE_TIME_REFERENCE=3053103855 BACKLINE_GRAPH_POSITION=1280
+
+-- clean up
+backline nodes left: 0; processes left: 0
+other nodes same as at start: yes (6 nodes)
+default sink after: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} (unchanged)
