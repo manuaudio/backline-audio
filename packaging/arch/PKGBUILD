@@ -1,13 +1,13 @@
 # Maintainer: manuaudio <188948351+manuaudio@users.noreply.github.com>
 # SPDX-License-Identifier: MIT
 #
-# Backline for Arch Linux. Not published to the AUR yet; checked locally with
-# makepkg. On a release: tag v$pkgver, then run updpkgsums for the first
-# source.
+# Backline for Arch Linux, for the AUR (docs/AUR.md). Checked in a clean
+# container with packaging/arch/container-check. On a release: tag
+# v$pkgver, then updpkgsums and a new .SRCINFO.
 pkgname=backline-audio
 pkgver=0.4.0
 pkgrel=1
-pkgdesc='System audio services for PipeWire: plugin host (CLAP, VST3, LV2), plugin index, recorder, clock (LTC, MTC, Ableton Link)'
+pkgdesc='Mac-style pro audio for PipeWire and Omarchy: plugin host (CLAP, VST3, LV2), plugin index, recorder, player, clock (LTC, MTC, Link), OSC/MIDI control'
 arch=(x86_64 aarch64)
 url='https://github.com/manuaudio/backline-audio'
 # MIT for everything; backline-clockd is built with Ableton Link, which makes

@@ -1,17 +1,36 @@
 # Backline
 
-**System audio services for Linux, built on PipeWire.** Backline hosts audio
-plugins as ordinary PipeWire nodes. It keeps an index of every installed
-plugin and records any set of nodes to sample-aligned, timestamped files.
-Every piece is a small, separate process that apps, the desktop shell and
-scripts can drive over D-Bus, OSC or a command line. It covers the part of
-macOS's CoreAudio system layer, AudioComponent registry and AUv3 hosting
-that Linux has no shared answer for yet.
+**Mac-style pro audio for Omarchy Linux.** System instruments from any MIDI
+keyboard, sample-aligned multitrack recording, files played on one shared
+transport, an index of every installed plugin, and OSC/MIDI control of all
+of it, as small PipeWire services with panels in the Omarchy bar.
+
+```sh
+yay -S backline-audio && omarchy plugin add https://github.com/manuaudio/backline-audio --enable
+```
+
+> The AUR package is prepared but not published yet ([docs/AUR.md](docs/AUR.md)); until it
+> is, [build from source](#build). Optional: `omarchy-backline-setup` adds Backline's
+> menu rows and `Super + Ctrl` hotkeys, and asks first. Update with `omarchy plugin update
+> io.github.manuaudio.backline` and `yay -Syu`; remove with `omarchy-backline-setup
+> --uninstall`, `omarchy plugin remove io.github.manuaudio.backline` and `yay -R
+> backline-audio` ([docs/OMARCHY-PLUGIN.md](docs/OMARCHY-PLUGIN.md)). The panels need
+> Omarchy's Quattro shell (4.x with `ShellIpc`); the services and the `backline` command
+> work on any Linux with PipeWire ≥ 1.4.
+
+Under the panels, Backline is a set of system audio services for Linux,
+built on PipeWire. It hosts audio plugins as ordinary PipeWire nodes, keeps an
+index of every installed plugin, records any set of nodes to sample-aligned,
+timestamped files, plays files on the shared timeline and maps control
+surfaces to any parameter. Every piece is a small, separate process that apps,
+the desktop shell and scripts can drive over D-Bus, OSC or a command line. It
+covers the part of macOS's CoreAudio system layer, AudioComponent registry
+and AUv3 hosting that Linux has no shared answer for yet.
 
 > **Status: early, working slices; not a product.** The parts below are built,
 > unit-tested and measured on a real PipeWire 1.6.8 system (see
-> [Proofs](#proofs)). The D-Bus interfaces are 0.x and will change. There are no
-> packages yet.
+> [Proofs](#proofs)). The D-Bus interfaces are 0.x (additive only within an
+> interface). Changes per release are in [CHANGELOG.md](CHANGELOG.md).
 
 The design and the reasoning behind it are in [ARCHITECTURE.md](ARCHITECTURE.md).
 The choices that shape the project are in [docs/DECISIONS.md](docs/DECISIONS.md).
@@ -42,15 +61,23 @@ The choices that shape the project are in [docs/DECISIONS.md](docs/DECISIONS.md)
 - **One transport for the whole system.** The clock service owns PipeWire's
   transport and bar (JACK apps see it as the JACK transport), generates and
   chases LTC and MTC to the sample, and joins an Ableton Link session.
+  Hosted plugins follow it: CLAP transport, VST3 `ProcessContext` and LV2
+  `time:Position`, so a tempo-synced arpeggio or delay locks to the clock.
+- **Play files on that timeline.** Each file starts on an exact transport
+  frame (frames, timecode or bar/beat), with its own gain, and follows play,
+  stop and locate; every sample lands where the timeline says.
+- **Control it all from a surface.** MIDI CC, notes and OSC mapped to plugin
+  parameters, volumes, the transport and the recorder, with MIDI and OSC
+  learn. No network socket unless you ask for one; beyond localhost only with
+  an allow-list, and TCP only with a shared secret.
 
 ## On the desktop: Omarchy panels and a mixer
 
 On [Omarchy](https://omarchy.org), Backline lives in the desktop's own workflow:
 
-- **Four bar panels:** Instruments, Record, Plugins and Transport. They're built from Omarchy's own shell components and theme tokens.
+- **One Omarchy plugin, four bar panels:** Instruments, Record, Plugins and Transport, side by side in one bar slot, installed with `omarchy plugin add`. They're built from Omarchy's own shell components and theme tokens.
 - **`omarchy-backline-*` commands.**
-- **Menu rows** in the Omarchy menu.
-- **`Super + Ctrl` hotkeys.**
+- **Menu rows** in the Omarchy menu and **`Super + Ctrl` hotkeys**, added by `omarchy-backline-setup` when you agree.
 
 A larger **mixer window** has a channel strip with a live meter for every input, instrument and output, plus the transport and the takes. It follows the Omarchy theme and language live. Every job takes a few keystrokes, measured end to end against the real services.
 
@@ -80,9 +107,10 @@ See [omarchy/README.md](omarchy/README.md) (panels, commands, menu, hotkeys, ins
 | `backline-recorderd` | The recorder as a D-Bus service ([`Recorder1`](docs/api/Recorder1.md)): arm, record, stop, markers, takes, a disk thread behind large rings, and virtual soundcheck (a take played back as its inputs, switched per input) | Built, measured |
 | `backline-clockd` | Transport, tempo and meter as PipeWire's position segment ([`Clock1`](docs/api/Clock1.md)), LTC and MTC generate and chase, Ableton Link (in its own process: Link is GPL) | Built, measured |
 | `backline-controld` | OSC and MIDI mapped to any parameter ([`Control1`](docs/api/Control1.md)): plugin parameters, volumes and mutes, filter-chain controls, transport and recorder; MIDI and OSC learn. Opens no network socket unless asked; beyond localhost it needs an allow-list, and TCP a shared secret | Built, measured |
-| `libbackline` | The MIT C client library (sd-bus only, no PipeWire dependency): `Host1`, `Instance1`, `Registry1`, `Recorder1`, `Clock1` and `Control1` calls and a signal watcher | Skeleton, used by the CLI |
+| `libbackline` | The MIT C client library (sd-bus only, no PipeWire dependency): `Host1`, `Instance1`, `Registry1`, `Recorder1`, `Clock1`, `Player1` and `Control1` calls and a signal watcher | Skeleton, used by the CLI |
 | `backline` | The command line over `libbackline`; `--json` on every command | Built |
-| Player, QML module | Playing files on the timeline | Design only ([ARCHITECTURE.md](ARCHITECTURE.md)) |
+| `backline-playerd` | Files played into the graph on the shared timeline ([`Player1`](docs/api/Player1.md)): one node per file, a start on an exact transport frame (frames, `tc:`, `bbt:`), per-file gain, streaming past an in-memory head | Built, measured |
+| QML module | A Qt Quick module over `libbackline` | Design only ([ARCHITECTURE.md](ARCHITECTURE.md)) |
 
 In-graph CLAP effects (a plugin inside PipeWire's filter-chain, for device
 effects) are a separate project,
@@ -134,6 +162,13 @@ build/registry/backline-registry scan                    # index ~/.clap ~/.vst3
 build/backline plugins list --kind instrument --grade pass
 
 build/backline rec -s <sink-or-node> -o takes -d 10      # or -P 5 for 5 s of pre-roll, then: kill -USR1
+
+build/clock/backline-clockd &                            # the transport
+build/player/backline-playerd &                          # files on its timeline
+build/backline play load song.wav --at 'bbt:5|1|0' --gain -3
+build/backline transport play
+build/control/backline-controld &                        # OSC/MIDI mapping (no network socket unless asked)
+build/backline map learn 'instance:backline.surge-xt/Global Volume'   # then move a knob
 ```
 
 To play from a hardware keyboard, add
@@ -159,11 +194,14 @@ in [`docs/proofs/`](docs/proofs/).
 | [`rf64-proof`](docs/proofs/rf64-proof.txt) | A live 16-channel take of 1460 s (4.2 GiB in one file), with an independent second recorder | A valid RF64 file (ds64 sizes match), every frame there, bext and cue markers intact, 0 ring overruns; continuity is only as good as the graph's scheduling (see the report) |
 | [`rescan-proof`](docs/proofs/rescan-proof.txt) | The shipped rescan units verified; the same watch as a transient unit over throwaway plugin directories | An install, a pacman-style stamp and a removal each rescan once, ≈ 2.1 s after the change |
 | [`controld-proof`](docs/proofs/controld-proof.txt) | MIDI CC and OSC to a plugin parameter, the transport, the recorder, a sink's volume and mute; MIDI and OSC learn; the network rules, in its own network namespace | No socket by default; 8 unsafe listeners refused. A CC lands on exactly the value D-Bus would set (0.00 dB apart), 5-7 ms from keyboard to sound. Volume exact to 0.001 dB. Wrong secrets, peers off the allow-list, malformed packets and floods change nothing |
+| [`player-proof`](docs/proofs/player-proof.txt) | Two files on clockd's timeline (one at a frame, one at `bbt:3\|1\|0`, −6 dB) into native capture nodes; play, locates while rolling and stopped, a gain change; at quantum 128 and 1000 | Every received sample bit-identical to the file at (transport − start) × gain (1.8 M samples per run; only the one gain-ramp cycle differs). Each start on its exact frame, on a cycle boundary or inside a cycle. 0 underruns |
+| [`transport-proof`](docs/proofs/transport-proof.txt) | Beat-click test plugins (CLAP, VST3, LV2) and Odin2's arpeggiator in the worker while clockd changes tempo and meter, locates and stops | Every click on the sample PipeWire's transport gives (0 samples off clockd's tempo map for CLAP and VST3, 0–1 for LV2). Odin2's steps on clockd's grid at 120 and 90 BPM in all three formats, with Odin2's own constant lead |
 | [`clockd-proof`](docs/proofs/clockd-proof.txt) | Transport and bar seen by a native PipeWire node; LTC/MTC generate and chase (25, 29.97 DF, 24, 30 fps), through a sink monitor and a jump; Link with a second peer | Frames and bar exact to the tick. LTC/MTC frame starts within 2 samples (0 at 25/30 fps); chase locked in 37-75 ms with 0 samples of error. Link: tempo both ways, beat phase within 0.63 ms |
 
 ```sh
 tests/host-proof; tests/hostd-proof; tests/formats-proof; tests/registry-proof; tests/recorder-proof
 tests/recorderd-proof; tests/rf64-proof; tests/clockd-proof; tests/rescan-proof; tests/controld-proof
+tests/player-proof; tests/transport-proof
 ```
 
 The proofs need a running PipeWire (≥ 1.4) with WirePlumber, a systemd user
@@ -181,11 +219,13 @@ Dexed, Dragonfly Hall Reverb (VST3), Odin2, CHOW Tape Model and Cardinal
   grades VST3 on loading only. LV2 parameters are control ports only, not
   `patch:Parameter` (so Surge XT's LV2 shows two). Presets are saved only
   for VST3 (`.vstpreset`).
-- **No plugin GUIs.** The worker doesn't take the clock's transport yet
-  (`clap_process.transport` is null; VST3 gets a fixed 120 BPM context).
+- **No plugin GUIs.** Hosted plugins get the clock's transport, but a meter
+  change made while rolling doesn't renumber the bars before it (no full
+  multi-meter map yet).
 - **The clock follows PipeWire's driver.** Its transport is the driver's: run
   clockd in the graph whose transport you want. Two clockds under one driver
-  fight over it. The bar has tick resolution (1/1920 beat).
+  fight over it. The bar's beat is exact to the frame (clockd sets the bar
+  offset below PipeWire's 1/1920-beat tick).
 - **State is whatever the plugin saves.** hostd restores the plugin's state;
   a plugin that leaves something out of its state loses it on a restart. A
   note held at the moment of a crash is cut, and the next note-on sounds.
@@ -199,6 +239,10 @@ Dexed, Dragonfly Hall Reverb (VST3), Odin2, CHOW Tape Model and Cardinal
   moved to the playback node and put back on live (also after a crash, on the
   next start). A session manager that re-links a stream while the input is in
   playback is undone each time; no resampling if the take's rate differs.
+- **The player plays a file only at the graph's rate** (no resampling yet;
+  such a clip stays silent and says so), has no loops or cue lists, and a
+  locate into the streamed part of a file while rolling can leave a cycle of
+  silence while its ring refills.
 - **Realtime scheduling was off** in the proofs (no rtkit on the test machine).
   They pass at quantum 128 anyway, but this is not a latency benchmark.
 - **Probes run with your real `$HOME`.** A plugin can write its own settings
