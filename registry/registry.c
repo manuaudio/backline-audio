@@ -4,7 +4,7 @@
  *   backline-registry scan [--no-validate] [--jobs N] [--timeout S] [--path FMT:DIR]... [--force] [--json]
  *   backline-registry list [--kind K] [--format F] [--grade G] [--text T] [--json]
  *   backline-registry show ID|NAME [--json]
- *   backline-registry serve [--idle SECONDS]
+ *   backline-registry serve [--idle SECONDS]   (0: never exit when idle)
  *
  * scan finds every plugin in the formats' search paths, probes each binary in
  * its own sandboxed process (runner.c), grades it pass / warn / fail and
@@ -824,6 +824,8 @@ static struct {
 
 static void touch_idle(void)
 {
+	if (!S.idle)
+		return; /* --idle 0: stays up until stopped */
 	uint64_t now;
 	sd_event_now(S.ev, CLOCK_MONOTONIC, &now);
 	sd_event_source_set_time(S.idle, now + S.idle_usec);
@@ -961,11 +963,17 @@ static int cmd_serve(double idle, const struct scan_opts *so)
 		return 1;
 	}
 	sd_bus_attach_event(S.bus, S.ev, 0);
-	uint64_t now;
-	sd_event_now(S.ev, CLOCK_MONOTONIC, &now);
-	sd_event_add_time(S.ev, &S.idle, CLOCK_MONOTONIC, now + S.idle_usec, 0, on_idle, NULL);
-	fprintf(stderr, "backline-registry: serving %s (%d plugins), idle exit after %.0f s\n", BUS_NAME,
-		(int)json_object_array_length(jobj(S.reg, "plugins")), idle);
+	int n = (int)json_object_array_length(jobj(S.reg, "plugins"));
+	if (idle > 0) {
+		uint64_t now;
+		sd_event_now(S.ev, CLOCK_MONOTONIC, &now);
+		sd_event_add_time(S.ev, &S.idle, CLOCK_MONOTONIC, now + S.idle_usec, 0, on_idle, NULL);
+		fprintf(stderr, "backline-registry: serving %s (%d plugins), idle exit after %.0f s\n", BUS_NAME, n, idle);
+	} else {
+		/* 0 (or less): never exit when idle, as --idle-exit 0 does for the
+		 * other services; for a systemd unit that keeps it running */
+		fprintf(stderr, "backline-registry: serving %s (%d plugins), no idle exit\n", BUS_NAME, n);
+	}
 	r = sd_event_loop(S.ev);
 	sd_bus_release_name(S.bus, BUS_NAME);
 	sd_bus_flush_close_unref(S.bus);
@@ -981,7 +989,7 @@ static void usage(FILE *f)
 	      "                              [--path clap|vst3|lv2:DIR]... [--only-paths] [--force] [--no-sandbox] [--json]\n"
 	      "       backline-registry list [--kind K] [--format F] [--grade G] [--text T] [--json]\n"
 	      "       backline-registry show ID|NAME [--json]\n"
-	      "       backline-registry serve [--idle SECONDS]\n"
+	      "       backline-registry serve [--idle SECONDS]   (default 60; 0 = stay up until stopped)\n"
 	      "cache: $BACKLINE_CACHE_DIR or $XDG_CACHE_HOME/backline (plugins.json, probe-cache.json)\n", f);
 }
 

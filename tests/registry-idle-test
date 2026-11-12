@@ -1,0 +1,29 @@
+#!/bin/bash
+# backline-registry serve --idle 0 stays up (what a systemd unit wants), and
+# --idle N still exits after N idle seconds. On a session bus of its own
+# (dbus-run-session), so it never meets a registry the user is running.
+# Exit 77 (skip) without dbus-run-session.
+#   registry-idle-test BACKLINE-REGISTRY
+set -uo pipefail
+registry=$1
+if [[ -z ${BL_PRIVATE_BUS:-} ]]; then
+  command -v dbus-run-session >/dev/null || { echo "SKIP: no dbus-run-session"; exit 77; }
+  BL_PRIVATE_BUS=1 exec dbus-run-session -- "$0" "$@"
+fi
+cache=$(mktemp -d)
+trap 'kill $pid0 $pid1 2>/dev/null; rm -rf -- "$cache"' EXIT
+echo '{"plugins": []}' >"$cache/plugins.json"
+export BACKLINE_CACHE_DIR=$cache
+"$registry" serve --idle 1 2>"$cache/one.log" &
+pid1=$!
+for _ in $(seq 40); do kill -0 $pid1 2>/dev/null || break; sleep 0.1; done
+if kill -0 $pid1 2>/dev/null; then echo "not ok - serve --idle 1 exits when idle"; exit 1; fi
+echo "ok - serve --idle 1 exits after a second idle"
+"$registry" serve --idle 0 2>"$cache/zero.log" &
+pid0=$!
+sleep 3
+if ! kill -0 $pid0 2>/dev/null; then echo "not ok - serve --idle 0 stays up"; cat "$cache/zero.log"; exit 1; fi
+busctl --user status io.github.manuaudio.Backline.Registry >/dev/null 2>&1 ||
+  { echo "not ok - it owns its bus name"; exit 1; }
+grep -q 'no idle exit' "$cache/zero.log" || { echo "not ok - it says it won't exit when idle"; cat "$cache/zero.log"; exit 1; }
+echo "ok - serve --idle 0 stays up and serves (3 s idle and still on the bus)"

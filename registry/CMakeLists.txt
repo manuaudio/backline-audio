@@ -54,4 +54,8 @@ if(BUILD_TESTING)
     --path clap:${CMAKE_BINARY_DIR}/test-plugins)
   set_tests_properties(registry-scan-contained PROPERTIES TIMEOUT 30
     PASS_REGULAR_EXPRESSION "1 crashed, 1 timed out, 0 errors.*clap +4 +2 +0 +2 +0")
+  # serve --idle 0 never exits when idle (a systemd unit's choice), on a
+  # private session bus; skipped without dbus-run-session.
+  add_test(NAME registry-serve-idle COMMAND ${PROJECT_SOURCE_DIR}/tests/registry-idle-test $<TARGET_FILE:backline-registry>)
+  set_tests_properties(registry-serve-idle PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endif()
