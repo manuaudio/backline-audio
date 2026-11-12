@@ -154,6 +154,12 @@ static void test_grades(void)
 	CHECK_STR(grade("vst3", "{\"status\":\"ok\"}", NULL, &checked, &r), "pass");
 	CHECK_STR(checked, "load");
 	json_object_put(r);
+	/* Cardinal Synth with a corrupt settings file: the reason says what the
+	 * plugin itself said, not the C++ runtime's wrapping */
+	CHECK_STR(grade("clap", "{\"status\":\"ok\"}", "{\"status\":\"crashed\",\"signal\":6,\"signal_name\":\"SIGABRT\",\"stderr\":\"terminate called after throwing an instance of 'rack::Exception'\\n  what():  Settings file has invalid JSON at 62:3 end of file expected near '{'\\n\"}", &checked, &r), "fail");
+	CHECK_STR(json_object_get_string(json_object_array_get_idx(r, 0)),
+		  "check crashed (SIGABRT, signal 6): the plugin stopped on its own error: \"Settings file has invalid JSON at 62:3 end of file expected near '{'\"");
+	json_object_put(r);
 	CHECK_STR(grade("vst3", "{\"status\":\"crashed\",\"signal\":6,\"signal_name\":\"SIGABRT\"}", NULL, &checked, &r), "fail");
 	json_object_put(r);
 

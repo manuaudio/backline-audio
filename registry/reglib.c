@@ -99,9 +99,22 @@ void reg_result_problem(json_object *r, char *out, size_t n)
 	} else if (!strcmp(st, "crashed")) {
 		const char *sn = jget_str(r, "signal_name");
 		const char *se = jget_str(r, "stderr");
-		while (se && (*se == ' ' || *se == '\t')) se++;
-		snprintf(out, n, "crashed (%s, signal %d)%s%.300s", sn ? sn : "?", (int)jget_int(r, "signal", 0),
-			 se && *se ? "; last stderr: " : "", se && *se ? se : "");
+		const char *what = se ? strstr(se, "what():") : NULL;
+		int sig = (int)jget_int(r, "signal", 0);
+		if (what) {
+			/* a C++ exception nobody caught: say what the plugin said, without
+			 * the runtime's "terminate called ... what():" wrapping */
+			what += strlen("what():");
+			while (*what == ' ' || *what == '\t') what++;
+			size_t len = strcspn(what, "\n");
+			while (len && (what[len - 1] == ' ' || what[len - 1] == '\r')) len--;
+			snprintf(out, n, "crashed (%s, signal %d): the plugin stopped on its own error: \"%.*s\"",
+				 sn ? sn : "?", sig, (int)(len > 300 ? 300 : len), what);
+		} else {
+			while (se && (*se == ' ' || *se == '\t')) se++;
+			snprintf(out, n, "crashed (%s, signal %d)%s%.300s", sn ? sn : "?", sig,
+				 se && *se ? "; the plugin's last output: " : "", se && *se ? se : "");
+		}
 	} else if (!strcmp(st, "timeout")) {
 		json_object *v;
 		double s = json_object_object_get_ex(r, "seconds", &v) ? json_object_get_double(v) : 0;
