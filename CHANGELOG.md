@@ -61,13 +61,17 @@ installable plugin.
   (`backline.record`, …) are replaced on install.
 - `backline-registry` no longer compiles in the build tree's probe path.
 - `tests/rf64-proof` runs in its own node group and driver at quantum 1024
-  and logs the machine load.
+  and logs the machine load. Re-run: a 4.18 GiB RF64 take with all
+  70 080 000 frames continuous and identical to an independent reference,
+  0 missed cycles (other agents' work ran at load ≈ 2; no realtime
+  priority).
 
 ### Fixed
 
 - The UI bench's leak watchdog could outlive its bench and poll the graph
   forever; it now ends with the bench.
-- The proofs' pw-cli feeders no longer outlive a killed script.
+- The proofs' pw-cli feeders no longer outlive a killed script, and the
+  proofs' exit traps no longer stop half-way (exit status 2 after a pass).
 - The default-device watch in the proofs no longer reports a failed
   `pw-metadata` read as a move.
 

@@ -28,7 +28,7 @@ source "$here/lib.sh"
 out=$here/out/clockd
 rm -rf "$out"; mkdir -p "$out"
 exec > >(tee "$out/report.txt") 2>&1
-CK=; trap 'bl_cleanup; [[ -n $CK ]] && kill $CK 2>/dev/null; kill ${BL_WATCH:-} ${INTR:-} 2>/dev/null; true' EXIT
+CK=; trap 'set +e; bl_cleanup; [[ -n $CK ]] && kill $CK 2>/dev/null; kill ${BL_WATCH:-} ${INTR:-} 2>/dev/null; true' EXIT
 trap 'exit 130' INT TERM
 G='node.group = backline-test.clock'
 export PIPEWIRE_PROPS="{ $G }"

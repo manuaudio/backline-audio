@@ -66,7 +66,9 @@ bl_testbed() {
 
 # Keeps a pw-cli fed (so its nodes stay) until this script exits, however it
 # exits: a plain `sleep` here outlived killed scripts as an orphan.
-bl_hold() { while kill -0 $$ 2>/dev/null; do sleep 0.5; done; }
+# It also ends when its pw-cli is gone (the empty line it writes then fails),
+# so `wait` on the pipeline returns.
+bl_hold() { while kill -0 $$ 2>/dev/null && echo 2>/dev/null; do sleep 0.5; done; }
 
 bl_spawn() { # cmd... (tracked for cleanup)
   "$@" &

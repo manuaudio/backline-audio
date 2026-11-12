@@ -1,51 +1,64 @@
-== rf64-proof 2026-11-11T23:46:43-08:00
-default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}; free space:  290G
-  65 s: 199 MB; default sink unchanged, source unchanged
-  125 s: 384 MB; default sink unchanged, source unchanged
-  185 s: 568 MB; default sink unchanged, source unchanged
-  245 s: 752 MB; default sink unchanged, source unchanged
-  305 s: 936 MB; default sink unchanged, source unchanged
-  365 s: 1120 MB; default sink unchanged, source unchanged
-  425 s: 1305 MB; default sink unchanged, source unchanged
-  485 s: 1489 MB; default sink unchanged, source unchanged
-  545 s: 1674 MB; default sink unchanged, source unchanged
-  605 s: 1858 MB; default sink unchanged, source unchanged
-  665 s: 2042 MB; default sink unchanged, source unchanged
-  725 s: 2227 MB; default sink unchanged, source unchanged
-  785 s: 2411 MB; default sink unchanged, source unchanged
-  845 s: 2595 MB; default sink unchanged, source unchanged
-  905 s: 2780 MB; default sink unchanged, source unchanged
-  965 s: 2964 MB; default sink unchanged, source unchanged
-  1025 s: 3148 MB; default sink unchanged, source unchanged
-  1085 s: 3333 MB; default sink unchanged, source unchanged
-  1145 s: 3517 MB; default sink unchanged, source unchanged
-  1205 s: 3701 MB; default sink unchanged, source unchanged
-  1265 s: 3886 MB; default sink unchanged, source unchanged
-  1325 s: 4070 MB; default sink unchanged, source unchanged
-  1385 s: 4254 MB; default sink unchanged, source unchanged
-  1445 s: 4439 MB; default sink unchanged, source unchanged
-  1505 s: 4485 MB; default sink unchanged, source unchanged
+== rf64-proof 2026-11-12T02:50:15-08:00
+quantum 1024 (forced on the test driver only); realtime priority: none (RLIMIT_RTPRIO 0, no rtkit)
+load at start: 1.85 2.20 2.71 on 16 cpus; processes over 5% CPU:
+    53.8       00:00 bun test
+    47.0    17:59:43 foot --app-id=org.omarchy.screensaver --config=/usr/share/omarchy/default/foot/screensaver.in
+    11.2  5-04:13:40 Hyprland --watchdog-fd 4
+default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}; free space:  286G
+  65 s: 199 MB; load 2.08; default sink unchanged, source unchanged
+  125 s: 383 MB; load 1.47; default sink unchanged, source unchanged
+  185 s: 568 MB; load 1.30; default sink unchanged, source unchanged
+  245 s: 752 MB; load 2.10; default sink unchanged, source unchanged
+  305 s: 936 MB; load 1.99; default sink unchanged, source unchanged
+  365 s: 1121 MB; load 2.28; default sink unchanged, source unchanged
+  425 s: 1305 MB; load 2.94; default sink unchanged, source unchanged
+  485 s: 1490 MB; load 3.01; default sink unchanged, source unchanged
+  545 s: 1674 MB; load 1.97; default sink unchanged, source unchanged
+  605 s: 1858 MB; load 2.37; default sink unchanged, source unchanged
+  665 s: 2043 MB; load 2.25; default sink unchanged, source unchanged
+  725 s: 2227 MB; load 1.60; default sink unchanged, source unchanged
+  785 s: 2411 MB; load 2.10; default sink unchanged, source unchanged
+  845 s: 2596 MB; load 2.62; default sink unchanged, source unchanged
+  905 s: 2780 MB; load 1.98; default sink unchanged, source unchanged
+  965 s: 2964 MB; load 1.55; default sink unchanged, source unchanged
+  1025 s: 3149 MB; load 1.64; default sink unchanged, source unchanged
+  1085 s: 3333 MB; load 1.84; default sink unchanged, source unchanged
+  1145 s: 3517 MB; load 2.47; default sink unchanged, source unchanged
+  1205 s: 3702 MB; load 2.86; default sink unchanged, source unchanged
+  1265 s: 3886 MB; load 2.08; default sink unchanged, source unchanged
+  1325 s: 4071 MB; load 1.74; default sink unchanged, source unchanged
+  1385 s: 4255 MB; load 1.53; default sink unchanged, source unchanged
+  1445 s: 4439 MB; load 1.85; default sink unchanged, source unchanged
+  1505 s: 4485 MB; load 2.61; default sink unchanged, source unchanged
+load at the end: 2.61 2.23 2.26; processes over 5% CPU:
+    47.0    18:24:52 foot --app-id=org.omarchy.screensaver --config=/usr/share/omarchy/default/foot/screensaver.in
+    12.5       00:05 bun install --frozen-lockfile
+    11.2  5-04:38:48 Hyprland --watchdog-fd 4
+     6.3       00:06 /usr/bin/python3 -I /tmp/.netgate.py forward -- sh -c bun install --frozen-lockfile && true
 recorder: no overrun warnings
-reference take starts 95872 frames earlier
-{"file_bytes": 4485120942, "container": "RF64", "ds64": {"riff_size": 4485120934, "data_size": 4485120000, "sample_count": 70080000}, "rate": 48000, "channels": 16, "frames_header": 70080000, "frames_read": 70080000, "discontinuities": 2015, "max_residual": 0.497, "min_channel_peak": 0.2486, "first_bad_frame": 131328, "ref_compared": 70080000, "ref_differ": 61721533, "ref_first_diff": 2146048}
-  sidecar: 70080000 frames, overruns 0, container rf64, markers [('five seconds', 237824), ('past four GB', 66805248)]
+reference take starts 95232 frames earlier
+{"file_bytes": 4485120942, "container": "RF64", "ds64": {"riff_size": 4485120934, "data_size": 4485120000, "sample_count": 70080000}, "rate": 48000, "channels": 16, "frames_header": 70080000, "frames_read": 70080000, "discontinuities": 0, "max_residual": 2.64e-08, "min_channel_peak": 0.2486, "first_bad_frame": -1, "ref_compared": 70080000, "ref_differ": 0, "ref_first_diff": -1}
+  sidecar: 70080000 frames, overruns 0, container rf64, markers [('five seconds', 236544), ('past four GB', 66812928)]
   file: 4485120942 bytes = 4.18 GiB, RF64, ds64 riff 4485120934 (file - 8 = 4485120934), data 4485120000 = frames x 64 = 4485120000
-  read back: 70080000 frames (header 70080000, expected 70080000), discontinuities 2015, max residual 0.497, quietest channel peak 0.2486
-  bext time_reference 4109094615; cues [('five seconds', 237824), ('past four GB', 66805248)]
-  against the independent reference recording: 70080000 frames compared, 61721533 differ
-  cycles the graph didn't run the recorder for (xruns, no realtime priority here): this take 61 (1637246127241 frames), reference 48
+  read back: 70080000 frames (header 70080000, expected 70080000), discontinuities 0, max residual 2.64e-08, quietest channel peak 0.2486
+  bext time_reference 490499283; cues [('five seconds', 236544), ('past four GB', 66812928)]
+  against the independent reference recording: 70080000 frames compared, 0 differ
+  cycles the graph didn't run the recorder for (xruns, no realtime priority here): this take 0 (0 frames), reference 0
   RESULT: PASS (a live take past 4 GB is a valid RF64 file: ds64, frames, bext and markers)
-  RESULT: GRAPH XRUNS (the sine breaks in 2015 samples; the recorder logged 61 missed cycles, so the graph dropped them, not the disk path: overruns 0)
+  RESULT: PASS (every frame continuous and equal to the reference)
 other nodes same as at start: yes (6 nodes)
-default sink after: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} (unchanged); default source unchanged; moved during the run: 23:50:56 sink={"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} source={"name":"alsa_input.pci-0000_00_1f.3.analog-stereo"}
-00:03:52 sink={"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} source={"name":"alsa_input.pci-0000_00_1f.3.analog-stereo"}
-00:06:09 sink={"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} source={"name":"alsa_input.pci-0000_00_1f.3.analog-stereo"}
+default sink after: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} (unchanged); default source unchanged; moved during the run: never
 
-(notes, 2026-11-12: this run shared the machine with two other agents'
-benchmarks, without realtime priority. The take is a valid RF64 file with
-every frame present and 0 ring overruns. Both recorders logged missed
-cycles (61 and 48), so the sine breaks where the graph didn't run them and
-the two files diverge after the first one; that is scheduling, not the disk
-path. The graph_gap_frames figure above is inflated by a driver change
-during the take, which the recorder then counted as a gap; it now counts
-gaps only under the same driver.)
+(notes, 2026-11-12, re-run for 0.4.0: the machine was not idle. My own
+agents had finished, but other agent workloads I may not stop were running
+throughout: two contribution coder runs (contrib pipeline go-run, with
+opencode/bun inside) and two background Claude Code sessions, with load
+1.85-2.86 on 16 CPUs (logged every minute above). I waited 90 minutes for
+a quiet window first; none came. No realtime priority (RLIMIT_RTPRIO 0,
+no rtkit). Changes since the 0.3.0 run: the take runs in its own node group
+under its own test driver, at a forced quantum of 1024 (21 ms). Result: the
+graph missed no cycle in either recorder, and every one of the 70 080 000
+frames of all 16 channels is continuous and equal to the independent
+reference recording. The run's teardown hung on a harness bug introduced
+the same day (bl_hold; fixed right after) and was released by hand once
+the results were written; the two lines above it are from that teardown.)

@@ -815,15 +815,19 @@ the recorder writes one 16-channel float track for 1460 s, 4 485 120 942
 bytes in one file, while a second, independent recorder records the same
 node. Measured: the file is RF64 with `ds64` sizes equal to the file and the
 data, 70 080 000 frames read back (as asked), `bext` present, and both
-markers (one past 4 GB) in the cue chunk; 0 ring overruns. Continuity: in
-the runs so far, made while three other agents' benchmarks loaded the
-machine and without realtime priority, the sine breaks in a few thousand
-samples and the two recorders diverge, which is what missed graph cycles do
-(the first runs also fed the sines through a pipe that could underrun). The
-recorder now logs missed cycles in the sidecar: in the latest run the
-take and the reference logged 61 and 48 missed cycles, which accounts for
-the breaks. A continuity run on a quiet machine with realtime priority is
-still to do.
+markers (one past 4 GB) in the cue chunk; 0 ring overruns.
+
+**Continuity (re-run for 0.4.0, 2026-11-12):** with the take in its own
+node group under its own test driver at a forced quantum of 1024, **all
+70 080 000 frames of all 16 channels are continuous (0 discontinuities)
+and equal to the independent reference recording (0 of 70 080 000 frames
+differ); neither recorder missed a graph cycle.** The machine was not idle:
+two contribution coder runs and two background Claude Code sessions ran
+throughout (load 1.85-2.86 on 16 CPUs, logged every minute), after a
+90-minute wait for a quiet window that didn't come; no realtime priority.
+The 0.3.0 runs, at the graph's quantum and sharing a driver with real
+devices while three benchmarks loaded the machine, missed 61 and 48 cycles
+and broke the sine accordingly.
 
 ### 4.8 Clock (`tests/clockd-proof`)
 

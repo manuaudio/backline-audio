@@ -28,7 +28,7 @@ out=$here/out/player
 rm -rf "$out"; mkdir -p "$out"
 exec > >(tee "$out/report.txt") 2>&1
 CK=; PD=; WD=
-trap 'kill ${TAPS:-} 2>/dev/null; bl_cleanup; [[ -n $PD ]] && kill $PD 2>/dev/null; [[ -n $CK ]] && kill $CK 2>/dev/null; kill ${BL_WATCH:-} ${WD:-} 2>/dev/null; true' EXIT
+trap 'set +e; [[ -n ${TAPS:-} ]] && kill $TAPS 2>/dev/null; bl_cleanup; [[ -n $PD ]] && kill $PD 2>/dev/null; [[ -n $CK ]] && kill $CK 2>/dev/null; kill ${BL_WATCH:-} ${WD:-} 2>/dev/null; true' EXIT
 trap 'exit 130' INT TERM
 G='node.group = backline-test.player'
 export PIPEWIRE_PROPS="{ $G }"
@@ -214,5 +214,5 @@ left=$(pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node
 echo "test-group nodes left: $left"
 bl_foreign_nodes >"$out/nodes-after.txt"
 echo "other nodes same as at start: $(bl_same_nodes "$out/nodes-before.txt" "$out/nodes-after.txt")"
-echo "default sink after: $(bl_default_sink) ($( [[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED)); default source $( [[ $(bl_default_source) == "$source_before" ]] && echo unchanged || echo CHANGED); moved during the run: $( [[ -s $out/defaults-moved.txt ]] && head -3 "$out/defaults-moved.txt" || echo never)"; kill $BL_WATCH 2>/dev/null
+echo "default sink after: $(bl_default_sink) ($( [[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED)); default source $( [[ $(bl_default_source) == "$source_before" ]] && echo unchanged || echo CHANGED); moved during the run: $( [[ -s $out/defaults-moved.txt ]] && head -3 "$out/defaults-moved.txt" || echo never)"; kill $BL_WATCH 2>/dev/null || true
 [[ -n ${KEEP:-} ]] || rm -f "$out"/*.bin "$out"/*.wav
