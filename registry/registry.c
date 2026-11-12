@@ -143,9 +143,6 @@ static const char *probe_path(void)
 			if (access(p, X_OK) == 0) return p;
 		}
 	}
-#ifdef BL_PROBE_BUILD_PATH
-	if (access(BL_PROBE_BUILD_PATH, X_OK) == 0) return BL_PROBE_BUILD_PATH;
-#endif
 	return "backline-probe";
 }
 

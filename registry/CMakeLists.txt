@@ -20,8 +20,8 @@ target_link_libraries(bl_registry PUBLIC PkgConfig::JSONC PkgConfig::CRYPTO)
 
 add_executable(backline-registry registry.c runner.c)
 target_link_libraries(backline-registry PRIVATE bl_registry PkgConfig::SYSTEMD PkgConfig::JSONC)
-target_compile_definitions(backline-registry PRIVATE
-  BL_PROBE_BUILD_PATH="$<TARGET_FILE:backline-probe>")
+# The probe is found next to the registry binary (build tree and install
+# alike), so no build path is compiled in.
 add_dependencies(backline-registry backline-probe)
 
 install(TARGETS backline-probe backline-registry RUNTIME DESTINATION bin)

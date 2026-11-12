@@ -14,20 +14,20 @@ url='https://github.com/manuaudio/backline-audio'
 # that one binary GPL-2.0-or-later (docs/DECISIONS.md D3)
 license=('MIT' 'GPL-2.0-or-later')
 depends=(
-  alsa-lib
-  gcc-libs
   glibc
   json-c
+  libgcc
   libltc
   libpipewire
   libsndfile
+  libstdc++
   lilv
   openssl
   pipewire
   pipewire-jack
   systemd-libs
 )
-makedepends=(asio cmake ninja vst3sdk)
+makedepends=(alsa-lib asio cmake ninja vst3sdk)
 optdepends=('clap-validator: deeper validation of CLAP plugins in the registry')
 install=backline-audio.install
 _link=4.1.1

@@ -1,0 +1,38 @@
+#!/bin/bash
+# Build the Arch package in a clean archlinux container, the way the AUR's
+# users will: makepkg -s resolves and installs the dependencies (inside the
+# container, as its own root; nothing on the host), builds, runs check(),
+# packages, and namcap lints the PKGBUILD and the package. Nothing is
+# installed on the host and no sudo is needed (only docker).
+#
+#   packaging/arch/container-check            the PKGBUILD as it is (the release tarball)
+#   packaging/arch/container-check --local    this checkout's HEAD as the source (before a tag exists)
+#
+# Output: the package, .SRCINFO and the log in packaging/arch/out/.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+repo=$(cd "$here/../.." && pwd)
+out=$here/out
+rm -rf "$out"; mkdir -p "$out/pkg"
+cp "$here/PKGBUILD" "$here/backline-audio.install" "$out/pkg/"
+ver=$(sed -n 's/^pkgver=//p' "$here/PKGBUILD")
+if [[ ${1:-} == --local ]]; then
+  git -C "$repo" archive --format=tar.gz --prefix="backline-audio-$ver/" HEAD >"$out/pkg/backline-audio-$ver.tar.gz"
+  # the first source becomes the local tarball (checksum skipped for it)
+  sed -i "s|^source=(\"\$pkgname-\$pkgver.tar.gz::[^\"]*\"|source=(\"\$pkgname-\$pkgver.tar.gz\"|" "$out/pkg/PKGBUILD"
+  echo "source: HEAD of $repo ($(git -C "$repo" rev-parse --short HEAD)) as backline-audio-$ver.tar.gz"
+fi
+docker run --rm -v "$out/pkg:/pkg" archlinux:latest bash -euo pipefail -c '
+  pacman -Syu --noconfirm --needed base-devel git namcap >/dev/null
+  useradd -m builder
+  echo "builder ALL=(ALL) NOPASSWD: ALL" >/etc/sudoers.d/builder
+  chown -R builder /pkg
+  cd /pkg
+  sudo -u builder makepkg --printsrcinfo >.SRCINFO
+  sudo -u builder makepkg -s --noconfirm --cleanbuild 2>&1 | tail -40
+  echo "== namcap PKGBUILD"; namcap PKGBUILD || true
+  echo "== namcap package"; namcap ./*.pkg.tar.zst || true
+  echo "== files"; tar -tf $(ls ./*.pkg.tar.zst | grep -v -- -debug-) | grep -v "/$" | sort
+' 2>&1 | tee "$out/log.txt"
+cp "$out/pkg"/*.pkg.tar.zst "$out/pkg/.SRCINFO" "$out/" 2>/dev/null || true
+ls -la "$out"

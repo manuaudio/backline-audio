@@ -2,3 +2,4 @@ build/
 build-*/
 tests/out/
 __pycache__/
+packaging/arch/out/
