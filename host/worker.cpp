@@ -271,7 +271,9 @@ void WorkerHost::request_callback()
 }
 void WorkerHost::params_changed()
 {
-    if (W->inst && W->param_index.size() != W->inst->params.size())
+    if (!W->inst || !W->values)
+        return; // still loading: the index is built once the plugin is up
+    if (W->param_index.size() != W->inst->params.size())
         rebuild_param_index();
     else
         refresh_values();
@@ -284,6 +286,8 @@ void WorkerHost::param_from_plugin(uint32_t id, double value)
 }
 int WorkerHost::set_param(uint32_t id, double value)
 {
+    if (!W->inst || !W->values)
+        return -EAGAIN;
     auto it = W->param_index.find(id);
     if (it == W->param_index.end())
         return -ENOENT;

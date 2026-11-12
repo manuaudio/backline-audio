@@ -1,0 +1,472 @@
+#!/bin/bash
+# formats-proof: VST3 and LV2 in the plugin worker, and presets in all three
+# formats, measured.
+#
+#  1. Instruments: Surge XT as VST3 and Odin2 as LV2, each its own worker and
+#     node, both following one virtual keyboard (ALSA sequencer -> PipeWire's
+#     MIDI bridge -> --midi-follow). Both tracks recorded in one take; pitch
+#     by FFT, level, MIDI-to-sound. The nodes' channel layout from pw-dump.
+#  2. Parameters: set over OSC, read back over OSC and D-Bus, restored over
+#     D-Bus, for each format; the level change measured while a note holds.
+#  3. Effects: a test signal (tone burst) into a throwaway sink; Dragonfly
+#     Hall Reverb (VST3) and CHOW Tape Model (LV2) take that sink's monitor
+#     (--audio-source). Dry and both wet signals recorded in one take: the
+#     reverb's tail, the tape model's harmonics.
+#  4. Presets: count per format, and one load per format with a measurable
+#     effect (parameter values, sound): CLAP preset-discovery + preset-load
+#     (Surge XT), VST3 program list and a .vstpreset written and read back
+#     (Dexed), LV2 pset:Preset (CHOW Tape Model).
+#  5. Supervisor: hostd runs the VST3 and the LV2 instrument from a registry
+#     index; three parameters moved on each; SIGKILL; restarted with state;
+#     every parameter compared exactly; a note's level and pitch before and
+#     after. The registry gate refuses an LV2 plugin graded fail, by URI.
+#
+# Throwaway only: null sinks owned by this script, nothing linked to real
+# devices, state and presets in tests/out/formats.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+out=$here/out/formats
+rm -rf "$out"; mkdir -p "$out"
+exec > >(tee "$out/report.txt") 2>&1
+trap bl_cleanup EXIT
+OBJ=/io/github/manuaudio/Backline/Instance
+IFACE=io.github.manuaudio.Backline.Instance1
+W="$BL_BIN/backline-plugin-worker"
+B="$BL_BIN/backline"
+bus() { busctl --user --json=short call "$1" $OBJ $IFACE "${@:2}"; }
+prop() { busctl --user get-property "$1" $OBJ $IFACE "$2" | awk '{print $2}'; }
+mono() { python3 -I -c 'import time; print(time.monotonic_ns())'; }
+osc() { python3 -I "$here/oscsend.py" "$@"; }
+wait_log() { # file pattern
+  for _ in $(seq 300); do grep -q "$2" "$1" 2>/dev/null && return 0; sleep 0.05; done
+  echo "timed out waiting for '$2' in $1"; return 1
+}
+wait_for() { # description command...
+  local d=$1; shift
+  for _ in $(seq 600); do "$@" >/dev/null 2>&1 && return 0; sleep 0.025; done
+  echo "timed out waiting for: $d"; return 1
+}
+eval_py() { python3 -I - "$here" "$out" "$@"; }
+record() { # name seconds sink... (background; sets $rec)
+  local name=$1 secs=$2; shift 2
+  local args=(); for s in "$@"; do args+=(-s "$s"); done
+  "$BL_BIN/backline-recorder" "${args[@]}" -o "$out" -n "$name" -d "$secs" >/dev/null 2>"$out/rec-$name.log" &
+  rec=$!
+  wait_log "$out/rec-$name.log" armed
+}
+worker() { # tag args... : starts a worker, waits for its node, sets <tag>_bus/_osc/_pid
+  local tag=$1; shift
+  bl_spawn "$W" "$@" >"$out/$tag.json" 2>"$out/$tag.log"
+  wait_for "$tag ready" test -s "$out/$tag.json"
+  bl_wait_node "$(jq -r .node "$out/$tag.json")" 200
+  printf -v "${tag}_bus" '%s' "$(jq -r .dbus "$out/$tag.json")"
+  printf -v "${tag}_osc" '%s' "$(jq -r .osc_port "$out/$tag.json")"
+  printf -v "${tag}_pid" '%s' "$(jq -r .pid "$out/$tag.json")"
+}
+KBD=backline-fmt-kbd
+FOLLOW="^Midi-Bridge:$KBD"
+
+echo "== formats-proof $(date -Is)"
+echo "pipewire $(pipewire --version | sed -n 's/.*libpipewire \(.*\)/\1/p' | tail -1), kernel $(uname -r), systemd $(systemctl --version | head -1 | awk '{print $2}')"
+echo "worker: $("$W" --help 2>&1 | head -1)"
+default_before=$(bl_default_sink)
+pw_pids_before="$(pidof pipewire) / $(pidof wireplumber)"
+bl_foreign_nodes >"$out/foreign-before.txt"
+echo "default sink: $default_before"
+echo "other nodes in the graph: $(wc -l <"$out/foreign-before.txt"); pipewire/wireplumber pids: $pw_pids_before"
+
+bl_testbed backline-fmt.inst-v backline-fmt.inst-l backline-fmt.src backline-fmt.fx-v backline-fmt.fx-l backline-fmt.pre
+
+# --------------------------------------------------------- 1. instruments
+echo; echo "-- 1. instruments: virtual keyboard -> MIDI bridge -> Surge XT (VST3) and Odin2 (LV2), one take"
+worker iv -f vst3 -p "Surge XT" -n backline.fmt-vst3 -t backline-fmt.inst-v -m "$FOLLOW"
+worker il -p https://thewavewarden.com/odin2 -n backline.fmt-lv2 -t backline-fmt.inst-l -m "$FOLLOW"
+for t in iv il; do
+  jq -c '{node, format, plugin, plugin_path, pid}' "$out/$t.json" | sed 's/^/  /'
+  grep -E "loaded " "$out/$t.log" | sed 's/^backline-plugin-worker: /    /'
+done
+record notes 7.5 backline-fmt.inst-v backline-fmt.inst-l
+"$BL_BIN/backline-test-keyboard" --name $KBD wait=0.5 \
+  on=69,100 wait=1.0 off=69 wait=1.0 on=60,100 wait=1.0 off=60 wait=1.0 on=76,100 wait=1.0 off=76 \
+  >"$out/kbd-notes.jsonl"
+wait $rec
+grep -h "midi-follow: linking" "$out/iv.log" "$out/il.log" | sort -u | sed 's/^backline-plugin-worker: /  /'
+eval_py <<'EOF'
+import glob, json, math, sys
+here, out = sys.argv[1], sys.argv[2]
+sys.path.insert(0, here)
+import analyze as A
+take = json.load(open(f"{out}/notes.json"))
+t0 = take["start"]["monotonic_ns"]
+kbd = [json.loads(l) for l in open(f"{out}/kbd-notes.jsonl")]
+ons = [e for e in kbd if e["event"].startswith("on=")]
+offs = [e for e in kbd if e["event"].startswith("off=")]
+names = {69: "A4", 60: "C4", 76: "E5"}
+res = {}
+for track, label in ((1, "VST3 Surge XT"), (2, "LV2 Odin2")):
+    w = A.read_wav(glob.glob(f"{out}/notes-0{track}-*.wav")[0]); rate = w["rate"]; x = A.mono(w)
+    print(f"  {label}: {'note':4} {'expect Hz':>9} {'FFT Hz':>9} {'cents':>6} {'level':>9} {'on->sound':>10} {'gap peak':>9}")
+    notes = []
+    for on, off in zip(ons, offs):
+        key = on["a"]; expect = 440.0 * 2 ** ((key - 69) / 12)
+        i_on = max(0, int((on["t_ns"] - t0) * rate / 1e9))
+        onset = next(i for i in range(i_on, len(x)) if abs(x[i]) > 1e-3)
+        i_off = int((off["t_ns"] - t0) * rate / 1e9)
+        seg = x[onset + int(0.2 * rate): i_off - int(0.1 * rate)]
+        f, _ = A.f0(seg[:32768], rate)
+        cents = 1200 * math.log2(f / expect)
+        lvl = A.db(A.rms(seg))
+        nxt = [e for e in ons if e["t_ns"] > off["t_ns"]]
+        g_end = int((nxt[0]["t_ns"] - t0) * rate / 1e9) if nxt else len(x)
+        gap = x[i_off + int(0.5 * rate): g_end - int(0.02 * rate)]  # 0.5 s after note-off to 20 ms before the next
+        gpk = A.db(max(abs(v) for v in gap)) if gap else -240
+        n = {"name": names.get(key, str(key)), "expect_hz": round(expect, 3), "fft_hz": round(f, 3), "cents": round(cents, 2),
+             "rms_dbfs": round(lvl, 1), "midi_to_audio_ms": round((onset - i_on) / rate * 1000, 2), "gap_peak_dbfs": round(gpk, 1)}
+        notes.append(n)
+        print(f"  {' ' * len(label)}  {n['name']:4} {expect:9.3f} {f:9.3f} {cents:6.2f} {lvl:6.1f} dB {n['midi_to_audio_ms']:7.2f} ms {gpk:6.1f} dB")
+    ok = len(notes) == 3 and all(abs(n["cents"]) < 5 and n["rms_dbfs"] > -40 and n["gap_peak_dbfs"] < -80 for n in notes)
+    res[label] = {"notes": notes, "pass": ok}
+print(f"  overruns: {take['overrun_frames']} frames")
+ok = all(r["pass"] for r in res.values()) and take["overrun_frames"] == 0
+print(f"  RESULT: {'PASS' if ok else 'FAIL'} (each format: 3 notes from the keyboard, pitch within 5 cents, > -40 dBFS, silent between notes)")
+json.dump(res | {"pass": ok}, open(f"{out}/result-notes.json", "w"), indent=1)
+EOF
+
+echo; echo "-- 1b. channel layout of the worker nodes (pw-dump)"
+for n in backline.fmt-vst3 backline.fmt-lv2; do
+  id=$(bl_node_id $n)
+  pw-dump 2>/dev/null | jq -r --arg n "$n" --argjson id "$id" '
+    (.[] | select(.type=="PipeWire:Interface:Node" and .id==$id) | .info.props) as $p
+    | [.[] | select(.type=="PipeWire:Interface:Port" and .info.props["node.id"]==$id and .info.direction=="output")
+        | "\(.info.props["port.name"])=\(.info.props["audio.channel"])"] as $ports
+    | "  \($n): media.class \($p["media.class"]), audio.channels \($p["audio.channels"]), audio.position \($p["audio.position"]); out ports: \($ports | join(" "))"'
+done
+
+# ----------------------------------------------------------- 2. parameters
+echo; echo "-- 2. parameters over OSC and D-Bus: a note before, one after the OSC set, one after the D-Bus restore"
+declare -A PKEY=([iv]="Global Volume" [il]="Amplifier Gain")
+declare -A PSET=([iv]=0.5 [il]=0.25)
+notes_both() { # one 0.8 s A3 on both instruments; prints the note-on time
+  local t; t=$(mono)
+  bus "$iv_bus" NoteOn yyy 0 57 100 >/dev/null; bus "$il_bus" NoteOn yyy 0 57 100 >/dev/null
+  sleep 0.8
+  bus "$iv_bus" NoteOff yy 0 57 >/dev/null; bus "$il_bus" NoteOff yy 0 57 >/dev/null
+  sleep 0.4
+  echo "$t"
+}
+record param 6.0 backline-fmt.inst-v backline-fmt.inst-l
+sleep 0.2
+t1=$(notes_both)
+for t in iv il; do
+  b=${t}_bus; o=${t}_osc; key=${PKEY[$t]}
+  orig=$(bus "${!b}" GetParam s "$key" | jq '.data[0]')
+  echo "$orig" >"$out/param-orig-$t.txt"
+  osc "${!o}" /backline/param/set "$key" "${PSET[$t]}"
+  echo "  $(prop "${!b}" PluginFormat | tr -d '"'): \"$key\" D-Bus GetParam $orig; OSC /param/set ${PSET[$t]}"
+  echo "    OSC /param/get -> $(osc "${!o}" /backline/param/get "$key" | jq -c .args)"
+  echo "    D-Bus GetParam -> $(bus "${!b}" GetParam s "$key" | jq '.data[0]')"
+done
+t2=$(notes_both)
+for t in iv il; do
+  b=${t}_bus; o=${t}_osc; key=${PKEY[$t]}
+  orig=$(cat "$out/param-orig-$t.txt")
+  bus "${!b}" SetParam sd "$key" "$orig" >/dev/null
+  echo "  $(prop "${!b}" PluginFormat | tr -d '"'): D-Bus SetParam(\"$key\", $orig) -> GetParam $(bus "${!b}" GetParam s "$key" | jq '.data[0]'), OSC /param/get $(osc "${!o}" /backline/param/get "$key" | jq -c '.args[2]')"
+done
+t3=$(notes_both)
+wait $rec
+eval_py "$t1" "$t2" "$t3" <<'EOF'
+import glob, json, sys
+here, out = sys.argv[1], sys.argv[2]
+ts = [int(v) for v in sys.argv[3:6]]
+sys.path.insert(0, here)
+import analyze as A
+take = json.load(open(f"{out}/param.json")); t0 = take["start"]["monotonic_ns"]
+res = {}
+for track, label in ((1, "VST3"), (2, "LV2")):
+    w = A.read_wav(glob.glob(f"{out}/param-0{track}-*.wav")[0]); rate = w["rate"]; x = A.mono(w)
+    lv = []
+    for t in ts:  # the same stretch of each note: 0.2-0.7 s after its note-on was sent
+        i = int((t - t0) * rate / 1e9)
+        lv.append(A.db(A.rms(x[i + int(0.2 * rate): i + int(0.7 * rate)])))
+    before, during, after = lv
+    ok = during < before - 3 and abs(after - before) < 0.5
+    res[label] = {"before": before, "during": during, "after": after, "pass": ok}
+    print(f"  {label}: note before {before:.2f} dBFS | after the OSC set {during:.2f} dBFS ({during - before:+.2f} dB) | after the D-Bus restore {after:.2f} dBFS ({after - before:+.2f} dB)")
+ok = all(r["pass"] for r in res.values())
+print(f"  RESULT: {'PASS' if ok else 'FAIL'} (each format: OSC set and get, D-Bus get and set; quieter while set, back within 0.5 dB)")
+json.dump(res | {"pass": ok}, open(f"{out}/result-param.json", "w"), indent=1)
+EOF
+
+# -------------------------------------------------------------- 3. effects
+echo; echo "-- 3. effects: tone burst -> Dragonfly Hall Reverb (VST3) and CHOW Tape Model (LV2)"
+python3 -I - "$out/burst.wav" <<'EOF'
+import math, struct, sys, wave
+rate = 48000
+fr = []
+for i in range(int(2.5 * rate)):
+    t = i / rate
+    v = 0.25 * math.sin(2 * math.pi * 1000 * t) if 0.25 <= t < 0.75 else 0.0
+    fr.append(struct.pack("<hh", int(v * 32767), int(v * 32767)))
+with wave.open(sys.argv[1], "wb") as w:
+    w.setnchannels(2); w.setsampwidth(2); w.setframerate(rate); w.writeframes(b"".join(fr))
+EOF
+worker fv -f vst3 -p DragonflyHallReverb -n backline.fmt-fx-vst3 -S backline-fmt.src -t backline-fmt.fx-v
+worker fl -p "$HOME/.lv2/CHOWTapeModel.lv2" -n backline.fmt-fx-lv2 -S backline-fmt.src -t backline-fmt.fx-l
+for t in fv fl; do
+  jq -c '{node, format, plugin}' "$out/$t.json" | sed 's/^/  /'
+  grep -E "audio-(source|target): linking" "$out/$t.log" | sed 's/^backline-plugin-worker: /    /'
+done
+play_burst() { # take-name
+  record "$1" 3.2 backline-fmt.src backline-fmt.fx-v backline-fmt.fx-l
+  pw-play --target backline-fmt.src "$out/burst.wav" &
+  local p=$!; BL_PIDS+=($p)
+  wait $p || true
+  wait $rec
+}
+play_burst fx
+eval_py <<'EOF'
+import cmath, glob, json, math, sys
+here, out = sys.argv[1], sys.argv[2]
+sys.path.insert(0, here)
+import analyze as A
+def tr(n):
+    w = A.read_wav(glob.glob(f"{out}/fx-0{n}-*.wav")[0]); return w["rate"], A.mono(w)
+rate, dry = tr(1); _, rev = tr(2); _, tape = tr(3)
+on = next(i for i, v in enumerate(dry) if abs(v) > 0.01)
+off = max(i for i, v in enumerate(dry) if abs(v) > 0.01)
+lv = lambda x, a, b: A.db(A.rms(x[a:b]))
+body = (on + int(0.1 * rate), off - int(0.05 * rate))
+tail = (off + int(0.2 * rate), off + int(1.0 * rate))
+def harmonics(x):
+    n = 16384; seg = x[body[0]:body[0] + n]
+    win = [0.5 - 0.5 * math.cos(2 * math.pi * i / (n - 1)) for i in range(n)]
+    sp = [abs(v) for v in A.fft([s * w for s, w in zip(seg, win)])[: n // 2]]
+    pk = lambda f: max(sp[int(f * n / rate) - 3:int(f * n / rate) + 4])
+    h1 = pk(1000)
+    return A.db(pk(2000) / h1), A.db(pk(3000) / h1)
+r = {"burst_s": round((off - on) / rate, 3)}
+r["dry"] = {"body": lv(dry, *body), "tail": lv(dry, *tail), "h2_h3": harmonics(dry)}
+r["reverb_vst3"] = {"body": lv(rev, *body), "tail": lv(rev, *tail)}
+r["tape_lv2"] = {"body": lv(tape, *body), "tail": lv(tape, *tail), "h2_h3": harmonics(tape)}
+print(f"  dry (sink monitor): 1 kHz burst {r['burst_s']} s at {r['dry']['body']:.2f} dBFS; 0.2-1.0 s after it: {r['dry']['tail']:.1f} dBFS; "
+      f"H2 {r['dry']['h2_h3'][0]:.1f} dB, H3 {r['dry']['h2_h3'][1]:.1f} dB (re H1)")
+print(f"  VST3 Dragonfly Hall Reverb: during the burst {r['reverb_vst3']['body']:.2f} dBFS; reverb tail 0.2-1.0 s after it: {r['reverb_vst3']['tail']:.1f} dBFS")
+print(f"  LV2 CHOW Tape Model: during the burst {r['tape_lv2']['body']:.2f} dBFS ({r['tape_lv2']['body'] - r['dry']['body']:+.2f} dB); "
+      f"H2 {r['tape_lv2']['h2_h3'][0]:.1f} dB, H3 {r['tape_lv2']['h2_h3'][1]:.1f} dB (re H1); after it: {r['tape_lv2']['tail']:.1f} dBFS")
+ok = (r["dry"]["tail"] < -90 and r["reverb_vst3"]["tail"] > -60 and r["reverb_vst3"]["body"] > -40
+      and r["tape_lv2"]["body"] > -40 and (r["tape_lv2"]["h2_h3"][1] > r["dry"]["h2_h3"][1] + 20 or abs(r["tape_lv2"]["body"] - r["dry"]["body"]) > 1))
+r["pass"] = ok
+print(f"  RESULT: {'PASS' if ok else 'FAIL'} (reverb: a tail where the dry signal is silent; tape: added harmonics or a level change)")
+json.dump(r, open(f"{out}/result-fx.json", "w"), indent=1)
+EOF
+
+# -------------------------------------------------------------- 4. presets
+echo; echo "-- 4. presets"
+params_json() { bus "$1" ListParams | jq '[.data[0][] | {id: .[0], name: .[1], value: .[3]}]'; }
+note_take() { # name bus sink : one A4 note, 1.2 s
+  record "$1" 1.6 "$3"
+  bus "$2" NoteOn yyy 0 69 100 >/dev/null; sleep 1.2; bus "$2" NoteOff yy 0 69 >/dev/null
+  wait $rec
+}
+diff_params() { # before.json after.json -> "changed N of M"
+  jq -n --slurpfile a "$1" --slurpfile b "$2" '
+    ($a[0] | map({key: (.id|tostring), value: .value}) | from_entries) as $A
+    | [$b[0][] | select($A[(.id|tostring)] != .value)] | "\(length) of \($b[0] | length) parameter values changed"' -r
+}
+# CLAP: Surge XT, preset-discovery + preset-load
+worker pc -p "Surge XT" -n backline.fmt-clap -t backline-fmt.pre
+bus "$pc_bus" ListPresets | jq '.data[0]' >"$out/presets-clap.json"
+echo "  CLAP Surge XT: $(jq length "$out/presets-clap.json") presets from preset-discovery, e.g. $(jq -c '.[0]' "$out/presets-clap.json")"
+params_json "$pc_bus" >"$out/pc-before.json"; note_take pre-clap-a "$pc_bus" backline-fmt.pre
+pid_=$(jq -r '[.[] | select(.[1]=="Attacky")][0][0]' "$out/presets-clap.json")
+bus "$pc_bus" LoadPreset s "$pid_" >/dev/null && echo "    LoadPreset(\"$pid_\") ok"
+sleep 0.7; params_json "$pc_bus" >"$out/pc-after.json"; note_take pre-clap-b "$pc_bus" backline-fmt.pre
+echo "    $(diff_params "$out/pc-before.json" "$out/pc-after.json")"
+# VST3: Dexed, its program list, and a .vstpreset written and read back
+worker pv -f vst3 -p Dexed -n backline.fmt-presets-vst3 -t backline-fmt.pre --preset-dir "$out/vst3-presets"
+bus "$pv_bus" ListPresets | jq '.data[0]' >"$out/presets-vst3.json"
+echo "  VST3 Dexed: $(jq length "$out/presets-vst3.json") presets (program list), e.g. $(jq -c '.[1]' "$out/presets-vst3.json")"
+params_json "$pv_bus" >"$out/pv-before.json"; note_take pre-vst3-a "$pv_bus" backline-fmt.pre
+bus "$pv_bus" LoadPreset s "LAURIE" >/dev/null && echo "    LoadPreset(\"LAURIE\") ok (a program change through the program-change parameter)"
+sleep 0.7; params_json "$pv_bus" >"$out/pv-after.json"; note_take pre-vst3-b "$pv_bus" backline-fmt.pre
+echo "    $(diff_params "$out/pv-before.json" "$out/pv-after.json")"
+saved=$(bus "$pv_bus" SavePreset s "Backline proof" | jq -r '.data[0]')
+echo "    SavePreset(\"Backline proof\") -> $saved ($(stat -c %s "$saved") bytes, header $(head -c 4 "$saved"))"
+params_json "$pv_bus" >"$out/pv-saved.json"
+bus "$pv_bus" LoadPreset s "Say Again." >/dev/null; sleep 0.5; params_json "$pv_bus" >"$out/pv-other.json"
+echo "    LoadPreset(\"Say Again.\"): $(diff_params "$out/pv-saved.json" "$out/pv-other.json")"
+echo "    ListPresets now: $(bus "$pv_bus" ListPresets | jq -c '[.data[0][] | select(.[0] | endswith(".vstpreset"))]')"
+bus "$pv_bus" LoadPreset s "Backline proof" >/dev/null; sleep 0.5; params_json "$pv_bus" >"$out/pv-restored.json"
+echo "    LoadPreset(\"Backline proof\") (the .vstpreset): $(diff_params "$out/pv-saved.json" "$out/pv-restored.json") against the saved values: $(jq -n -c --slurpfile a "$out/pv-saved.json" --slurpfile b "$out/pv-restored.json" '($a[0] | map({key: (.id|tostring), value: .value}) | from_entries) as $A | [$b[0][] | select($A[(.id|tostring)] != .value) | {name, saved: $A[(.id|tostring)], now: .value}]')"
+# LV2: CHOW Tape Model presets, through the tone burst again
+bus "$fl_bus" ListPresets | jq '.data[0]' >"$out/presets-lv2.json"
+echo "  LV2 CHOW Tape Model: $(jq length "$out/presets-lv2.json") pset:Preset presets, e.g. $(jq -c '.[0]' "$out/presets-lv2.json")"
+params_json "$fl_bus" >"$out/pl-before.json"
+lv2_preset=$(jq -r '[.[] | select(.[1]=="Bass Pusher I")][0][0]' "$out/presets-lv2.json")
+bus "$fl_bus" LoadPreset s "$lv2_preset" >/dev/null && echo "    LoadPreset(\"$lv2_preset\") ok"
+sleep 0.3; params_json "$fl_bus" >"$out/pl-after.json"
+echo "    $(diff_params "$out/pl-before.json" "$out/pl-after.json")"
+play_burst fx2
+eval_py <<'EOF'
+import glob, json, math, sys
+here, out = sys.argv[1], sys.argv[2]
+sys.path.insert(0, here)
+import analyze as A
+def note(name):
+    w = A.read_wav(glob.glob(f"{out}/{name}-01-*.wav")[0]); rate = w["rate"]; x = A.mono(w)
+    on = next(i for i, v in enumerate(x) if abs(v) > 1e-3)
+    seg = x[on + int(0.2 * rate): on + int(1.0 * rate)]
+    f, _ = A.f0(seg, rate)
+    # spectral centroid of the note, a plain "how bright" number
+    n = 16384; s = seg[:n]
+    sp = [abs(v) for v in A.fft([a * (0.5 - 0.5 * math.cos(2 * math.pi * i / (n - 1))) for i, a in enumerate(s)])[: n // 2]]
+    cen = sum(k * v for k, v in enumerate(sp)) / max(sum(sp), 1e-12) * rate / n
+    return {"rms": round(A.db(A.rms(seg)), 2), "f0": round(f, 2), "centroid_hz": round(cen)}
+def changed(a, b, skip=()):
+    A_ = {p["id"]: p["value"] for p in json.load(open(f"{out}/{a}"))}
+    return sum(1 for p in json.load(open(f"{out}/{b}")) if A_.get(p["id"]) != p["value"] and p["name"] not in skip)
+res = {}
+for fmt, a, b in (("CLAP", "pre-clap-a", "pre-clap-b"), ("VST3", "pre-vst3-a", "pre-vst3-b")):
+    x, y = note(a), note(b)
+    res[fmt] = {"before": x, "after": y}
+    print(f"  {fmt}: A4 before the preset {x['rms']} dBFS, f0 {x['f0']} Hz, centroid {x['centroid_hz']} Hz | after {y['rms']} dBFS, f0 {y['f0']} Hz, centroid {y['centroid_hz']} Hz")
+def burst(name, track):
+    w = A.read_wav(glob.glob(f"{out}/{name}-0{track}-*.wav")[0]); rate = w["rate"]; x = A.mono(w)
+    d = A.mono(A.read_wav(glob.glob(f"{out}/{name}-01-*.wav")[0]))
+    on = next(i for i, v in enumerate(d) if abs(v) > 0.01); off = max(i for i, v in enumerate(d) if abs(v) > 0.01)
+    return A.db(A.rms(x[on + int(0.1 * rate): off - int(0.05 * rate)]))
+lb, la = burst("fx", 3), burst("fx2", 3)
+res["LV2"] = {"before": lb, "after": la}
+print(f"  LV2: tone burst through CHOW before the preset {lb:.2f} dBFS, after {la:.2f} dBFS ({la - lb:+.2f} dB)")
+c = {"CLAP": changed("pc-before.json", "pc-after.json"), "VST3": changed("pv-before.json", "pv-after.json"),
+     "LV2": changed("pl-before.json", "pl-after.json"), "vst3_roundtrip": changed("pv-saved.json", "pv-restored.json", skip=("Program",)),
+     "vst3_other": changed("pv-saved.json", "pv-other.json")}
+counts = {f: len(json.load(open(f"{out}/presets-{f.lower()}.json"))) for f in ("CLAP", "VST3", "LV2")}
+audible = lambda r: abs(r["after"]["rms"] - r["before"]["rms"]) > 1 or abs(r["after"]["centroid_hz"] - r["before"]["centroid_hz"]) > 100
+ok = (all(counts[f] > 0 for f in counts) and c["CLAP"] > 0 and c["VST3"] > 0 and c["LV2"] > 0 and c["vst3_other"] > 0
+      and c["vst3_roundtrip"] == 0 and audible(res["CLAP"]) and audible(res["VST3"]) and abs(la - lb) > 0.5)
+print(f"  presets listed: CLAP {counts['CLAP']}, VST3 {counts['VST3']}, LV2 {counts['LV2']}; values changed by the load: "
+      f"CLAP {c['CLAP']}, VST3 {c['VST3']}, LV2 {c['LV2']}; .vstpreset round trip: {c['vst3_roundtrip']} differ "
+      f"(not counting Dexed's program-change parameter, which a program selects and its state does not keep)")
+print(f"  RESULT: {'PASS' if ok else 'FAIL'} (each format lists presets; a load changes parameters and the sound; a written .vstpreset reads back exactly)")
+json.dump({"counts": counts, "changed": c, "sound": res, "pass": ok}, open(f"{out}/result-presets.json", "w"), indent=1)
+EOF
+
+# --------------------------------------------- 5. hostd: restart with state
+echo; echo "-- 5. supervisor: VST3 and LV2 instances, SIGKILL, restart with state"
+mkdir -p "$out/plugins/vst3" "$out/plugins/lv2"
+ln -s "$HOME/.vst3/Surge XT.vst3" "$out/plugins/vst3/"
+ln -s "$HOME/.lv2/Odin2.lv2" "$HOME/.lv2/CardinalSynth.lv2" "$out/plugins/lv2/"
+BACKLINE_CACHE_DIR="$out/registry" "$BL_BIN/registry/backline-registry" scan --only-paths --timeout 20 \
+  --path "vst3:$out/plugins/vst3" --path "lv2:$out/plugins/lv2" >"$out/registry-scan.txt" 2>&1
+echo "  registry (throwaway index): $(jq -c '[.plugins[] | {format, name, grade}]' "$out/registry/plugins.json")"
+bl_spawn "$BL_BIN/backline-hostd" --state-dir "$out/state" --log-dir "$out/logs" \
+  --registry "$out/registry/plugins.json" >"$out/hostd.json" 2>"$out/hostd.log"
+wait_for "hostd on the bus" busctl --user status io.github.manuaudio.Backline.Host
+cardinal_uri=$(jq -r '.plugins[] | select(.format=="lv2" and (.name|test("Cardinal"))) | .id' "$out/registry/plugins.json" | head -1)
+if $B host load "$cardinal_uri" --id cardinal 2>"$out/gate.err"; then echo "  registry gate: $cardinal_uri ACCEPTED"; gate=bad; $B host unload cardinal || true
+else echo "  registry gate: load $cardinal_uri refused: $(cat "$out/gate.err")"; gate=ok; fi
+$B --json host load "Surge XT" --format vst3 --id synth-vst3 --target backline-fmt.inst-v >"$out/load-v.json"
+$B --json host load https://thewavewarden.com/odin2 --id synth-lv2 --target backline-fmt.inst-l >"$out/load-l.json"
+for t in v l; do jq -c '{id, plugin, plugin_id, pid, unit, state_file}' "$out/load-$t.json" | sed 's/^/  /'; done
+declare -A MOVES=([synth-vst3]="Global Volume=0.5|A Pitch=0.6|Send FX 1 Return=0.25" [synth-lv2]="Amplifier Gain=0.6|Osc1 Semitones=0.6|Filter1 Frequency=0.3")
+saved() { [[ $($B counter "$1" StateSaved) == $($B counter "$1" StateSerial) ]]; }
+for id in synth-vst3 synth-lv2; do
+  IFS='|' read -ra kvs <<<"${MOVES[$id]}"
+  line="  $id:"
+  for kv in "${kvs[@]}"; do line+=" \"${kv%=*}\" ${kv#*=} -> $($B set $id "${kv%=*}" "${kv#*=}");"; done
+  echo "$line"
+  wait_for "$id state saved" saved $id
+  sf=$($B --json host show $id | jq -r .state_file)
+  echo "    StateSerial $($B counter $id StateSerial) = StateSaved $($B counter $id StateSaved); $(basename "$sf"): $(stat -c %s "$sf") bytes, starts with $(head -c 4 "$sf" | tr -c '[:print:]' '.')"
+  $B --json params $id >"$out/params-before-$id.json"
+done
+record state-before 1.6 backline-fmt.inst-v backline-fmt.inst-l
+$B note synth-vst3 on 69 100; $B note synth-lv2 on 69 100; sleep 1.2; $B note synth-vst3 off 69; $B note synth-lv2 off 69
+wait $rec
+$B --json host watch --count 4 --timeout 30 >"$out/events.jsonl" &
+watch=$!
+sleep 0.3
+pv0=$(jq -r .pid "$out/load-v.json"); pl0=$(jq -r .pid "$out/load-l.json")
+t_kill=$(mono); kill -KILL "$pv0" "$pl0"
+echo "  SIGKILL -> workers $pv0 (VST3) and $pl0 (LV2)"
+wait $watch || true
+running_new() { [[ $($B --json host show "$1" | jq -r '"\(.state) \(.pid)"') == "running "* ]] && [[ $($B --json host show "$1" | jq -r .pid) != "$2" ]]; }
+wait_for "VST3 back" running_new synth-vst3 "$pv0"; wait_for "LV2 back" running_new synth-lv2 "$pl0"
+wait_for "VST3 answers" $B get synth-vst3 "Global Volume"; wait_for "LV2 answers" $B get synth-lv2 "Amplifier Gain"
+for id in synth-vst3 synth-lv2; do
+  $B --json host show $id | jq -c '{id, state, pid, restarts, last_signal, unit}' | sed 's/^/  /'
+  grep -h "restored state" "$out/logs/$id.log" | sed 's/^backline-plugin-worker: /    worker: /'
+  $B --json params $id >"$out/params-after-$id.json"
+done
+record state-after 1.6 backline-fmt.inst-v backline-fmt.inst-l
+$B note synth-vst3 on 69 100; $B note synth-lv2 on 69 100; sleep 1.2; $B note synth-vst3 off 69; $B note synth-lv2 off 69
+wait $rec
+eval_py "$t_kill" "$pv0" "$pl0" "$gate" <<'EOF'
+import glob, json, math, sys
+here, out, t_kill, pv0, pl0, gate = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
+sys.path.insert(0, here)
+import analyze as A
+ev = [json.loads(l) for l in open(f"{out}/events.jsonl")]
+res, ok = {}, gate == "ok"
+for track, id_, pid0, moves in ((1, "synth-vst3", pv0, ("Global Volume", "A Pitch", "Send FX 1 Return")),
+                                (2, "synth-lv2", pl0, ("Amplifier Gain", "Osc1 Semitones", "Filter1 Frequency"))):
+    before = {p["id"]: p for p in json.load(open(f"{out}/params-before-{id_}.json"))}
+    after = {p["id"]: p for p in json.load(open(f"{out}/params-after-{id_}.json"))}
+    import struct
+    f32 = lambda v: struct.unpack("f", struct.pack("f", v))[0]
+    diff = [i for i in before if i not in after or before[i]["value"] != after[i]["value"]]
+    diff32 = [i for i in before if i not in after or f32(before[i]["value"]) != f32(after[i]["value"])]
+    crash = next(e for e in ev if e["event"] == "Crashed" and e["id"] == id_)
+    rst = next(e for e in ev if e["event"] == "Restarted" and e["id"] == id_)
+    ms = lambda t: (t - t_kill) / 1e6
+    def note(name):
+        w = A.read_wav(glob.glob(f"{out}/{name}-0{track}-*.wav")[0]); rate = w["rate"]; x = A.mono(w)
+        on = next(i for i, v in enumerate(x) if abs(v) > 1e-3)
+        seg = x[on + int(0.2 * rate): on + int(1.0 * rate)]
+        return A.db(A.rms(seg)), A.f0(seg, rate)[0]
+    (lb, fb), (la, fa) = note("state-before"), note("state-after")
+    print(f"  {id_}: {len(before)} parameters before, {len(after)} after; values that differ: {len(diff)} (exact comparison), "
+          f"{len(diff32)} at 32-bit float precision")
+    for i in diff:
+        print(f"    differs exactly: {before[i]['name']} {before[i]['value']!r} -> {after[i].get('value')!r} (the plugin keeps it as a 32-bit float)")
+    for n in moves:
+        b = next(p["value"] for p in before.values() if p["name"] == n); a = next(p["value"] for p in after.values() if p["name"] == n)
+        print(f"    {n:18} before {b:.6g}  after {a:.6g}")
+    print(f"    Crashed(signal {crash['signal']}) +{ms(crash['monotonic_ns']):.1f} ms, Restarted(pid {rst['pid']}, restarts {rst['restarts']}) +{ms(rst['monotonic_ns']):.1f} ms after the kill")
+    print(f"    A4 before the kill {lb:.2f} dBFS, {fb:.2f} Hz | after the restart {la:.2f} dBFS, {fa:.2f} Hz ({la - lb:+.2f} dB, {1200 * math.log2(fa / fb):+.2f} cents)")
+    good = (not diff32 and len(before) > 100 and crash["signal"] == 9 and rst["pid"] != pid0 and abs(la - lb) < 0.2
+            and abs(1200 * math.log2(fa / fb)) < 2)
+    res[id_] = {"params": len(before), "diffs": len(diff), "diffs_float32": len(diff32), "crashed_ms": ms(crash["monotonic_ns"]),
+                "restarted_ms": ms(rst["monotonic_ns"]), "level_db": [lb, la], "f0": [fb, fa], "pass": good}
+    ok = ok and good
+print(f"  RESULT: {'PASS' if ok else 'FAIL'} (both formats come back with every parameter value and the same sound; the gate refuses a fail grade)")
+json.dump(res | {"gate": gate, "pass": ok}, open(f"{out}/result-hostd.json", "w"), indent=1)
+EOF
+$B --json host unload synth-vst3 >/dev/null; $B --json host unload synth-lv2 >/dev/null
+
+# ---------------------------------------------------------------- summary
+echo; echo "-- summary"
+for r in notes param fx presets hostd; do
+  echo "  $r: $(jq -r 'if .pass then "PASS" else "FAIL" end' "$out/result-$r.json")"
+done
+
+# ---------------------------------------------------------------- cleanup
+echo; echo "-- clean up"
+started=("${BL_PIDS[@]}")
+bl_cleanup
+sleep 0.5
+left=$(pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // empty' | grep -c '^backline[.-]fmt' || true)
+mine=0; for p in "${started[@]}"; do kill -0 "$p" 2>/dev/null && mine=$((mine + 1)); done
+echo "this proof's nodes left: $left; processes it started still running: $mine; worker scopes left: $(systemctl --user list-units 'backline-worker-synth-*' 'backline-worker-cardinal*' --no-legend | wc -l)"
+bl_foreign_nodes >"$out/foreign-end.txt"
+# The desktop shell's own meter streams (quickshell) come and go with its
+# panels; they are listed, not judged.
+grep -v ' quickshell' "$out/foreign-before.txt" >"$out/foreign-before-judged.txt" || true
+grep -v ' quickshell' "$out/foreign-end.txt" >"$out/foreign-end-judged.txt" || true
+echo "other nodes same as at start: $(bl_same_nodes "$out/foreign-before-judged.txt" "$out/foreign-end-judged.txt")"
+echo "  (quickshell meter streams: $(grep -c ' quickshell' "$out/foreign-before.txt" || true) at start, $(grep -c ' quickshell' "$out/foreign-end.txt" || true) at the end; not judged)"
+echo "pipewire/wireplumber pids: $(pidof pipewire) / $(pidof wireplumber) (before: $pw_pids_before)"
+echo "default sink after: $(bl_default_sink) ($([[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED))"

@@ -730,6 +730,17 @@ std::unique_ptr<PluginInstance> load_vst3(Host *h, const std::string &path, cons
         die("%s: %s is not an audio processor", path.c_str(), chosen->name().c_str());
     I->units = FUnknownPtr<IUnitInfo>(I->controller);
     I->controller->setComponentHandler(&I->handler);
+    // Bring the controller in line with the processor's state, as hosts do
+    // after creating a plugin (otherwise a controller may report values the
+    // processor doesn't have).
+    {
+        MemoryStream ms;
+        if (I->component->getState(&ms) == kResultOk) {
+            int64 pos = 0;
+            ms.seek(0, IBStream::kIBSeekSet, &pos);
+            I->controller->setComponentState(&ms);
+        }
+    }
     I->setup_buses();
     I->setup_midi_map();
     I->midi_input = I->event_bus;
