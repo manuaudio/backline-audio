@@ -34,7 +34,7 @@ struct bl_client {
 
 const char *bl_version(void)
 {
-	return "0.2.0";
+	return "0.3.0";
 }
 
 void bl_free(void *p)
