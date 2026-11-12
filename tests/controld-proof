@@ -107,7 +107,7 @@ WD=$!
   'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.ctl-sink media.class = Audio/Sink audio.position = [ FL FR ] audio.rate = 48000 object.linger = false priority.session = 1 monitor.channel-volumes = false node.virtual = true }' \
   'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.ctl-vol media.class = Audio/Sink audio.position = [ FL FR ] audio.rate = 48000 object.linger = false priority.session = 1 monitor.channel-volumes = true node.virtual = true }' \
   'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.ctl-clk media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true node.group = backline-test.ctl-clock }'
-  exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+  bl_hold; } | pw-cli >/dev/null 2>&1 &
 BL_PIDS+=($!)
 for n in backline-test.ctl-sink backline-test.ctl-vol backline-test.ctl-clk; do bl_wait_node $n; done
 

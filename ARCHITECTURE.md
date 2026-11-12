@@ -866,7 +866,7 @@ the graph's quantum (128) and a forced 1000:
 
 | | quantum 128 | quantum 1000 |
 |---|---|---|
-| samples inside a clip while rolling | 1 829 821 | 1 821 997 |
+| samples inside a clip while rolling | 1 830 589 | 1 821 997 |
 | bit-identical to file × gain | all but the 256 of the gain-ramp cycle | all but the 2 000 of the gain-ramp cycle |
 | wrong, or not silent where they must be | 0, 0 | 0, 0 |
 | first sample of each start (on a cycle boundary, and 65 or 1 frames into a cycle) | at its exact transport frame | at its exact transport frame |

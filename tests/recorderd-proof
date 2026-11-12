@@ -286,7 +286,7 @@ fi
 if want 4; then
 echo; echo "-- 4. virtual soundcheck"
 vsrc() { echo "create-node adapter { factory.name = support.null-audio-sink node.name = $1 node.description = \"Backline test $1\" media.class = Audio/Source/Virtual audio.position = [ FL FR ] object.linger = false priority.session = 1 node.virtual = true }"; }
-{ vsrc backline-test.mic-a; vsrc backline-test.mic-b; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+{ vsrc backline-test.mic-a; vsrc backline-test.mic-b; bl_hold; } | pw-cli >/dev/null 2>&1 &
 BL_PIDS+=($!)
 bl_testbed backline-test.foh
 bl_wait_node backline-test.mic-a; bl_wait_node backline-test.mic-b

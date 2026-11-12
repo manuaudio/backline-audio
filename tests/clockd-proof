@@ -43,10 +43,10 @@ echo "network: $(ip -br a | tr '\n' ' ')(own namespace)"
 default_before=$(bl_default_sink); source_before=$(bl_default_source); bl_foreign_nodes >"$out/nodes-before.txt"
 bl_watch_defaults "$default_before" "$source_before" "$out/defaults-moved.txt"
 echo "default sink: $default_before"
-{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.clk media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true %s }\n' "$G"; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.clk media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true %s }\n' "$G"; bl_hold; } | pw-cli >/dev/null 2>&1 &
 BL_PIDS+=($!)
 bl_wait_node backline-test.clk
-{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.ltcbus node.description = \"Backline test LTC bus\" media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -2 priority.session = 1 monitor.channel-volumes = false node.virtual = true %s }\n' "$G"; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.ltcbus node.description = \"Backline test LTC bus\" media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -2 priority.session = 1 monitor.channel-volumes = false node.virtual = true %s }\n' "$G"; bl_hold; } | pw-cli >/dev/null 2>&1 &
 BL_PIDS+=($!)
 bl_wait_node backline-test.ltcbus
 ( while sleep 0.5; do

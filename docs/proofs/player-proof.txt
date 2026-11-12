@@ -1,12 +1,12 @@
 # player-proof: two runs, the graph's default quantum and a forced 1000 (test driver only)
 
-== player-proof 2026-11-12T00:39:43-08:00
+== player-proof 2026-11-12T01:11:09-08:00
 quantum: graph default (forced on the test driver only)
-load: 4.32 3.70 5.63 on 16 cpus
+load: 3.54 3.55 3.74 on 16 cpus
 default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
 
 -- 1. load
-  Load a-stereo.wav at 96000 -> a (17 ms, reply after its links are up)
+  Load a-stereo.wav at 96000 -> a (23 ms, reply after its links are up)
   Load b-mono.wav at bbt:3|1|0 (120 BPM 4/4), -6 dB -> b; resolved by clockd to frame 192000
   links: backline.player.a:output_FL |-> backline-test.tapa:input_FL;backline.player.a:output_FR |-> backline-test.tapa:input_FR;backline.player.b:output_MONO |-> backline-test.tapb:input_MONO;
   nodes: backline.player.a [Stream/Output/Audio, 2 ch FL,FR] backline.player.b [Stream/Output/Audio, 1 ch MONO] 
@@ -23,42 +23,38 @@ default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
   Stop, Locate 71999 (before both starts; their starts fall inside a cycle), Play
   Stop, Locate 480000 (a at file frame 384000, past its head), Play
   44.1 kHz file on the 48 kHz graph: rate_ok false, played_frames 0 (silent: no resampling yet)
-  a: cycles 8116, played 705983 frames, underruns 0 (0 frames), ring seeks 3
-  b: cycles 8111, played 417855 frames, underruns 0 (0 frames), ring seeks 2
+  a: cycles 8117, played 706239 frames, underruns 0 (0 frames), ring seeks 3
+  b: cycles 8110, played 418111 frames, underruns 0 (0 frames), ring seeks 2
   CLI: a                start 96000      end 1056000    ["FL","FR"] ch 48000 Hz  gain -12.0 dB  backline.player.a -> backline-test.tapa;b                start 192000     end 768000     ["MONO"] ch 48000 Hz  gain -6.0 dB  backline.player.b -> backline-test.tapb;c                start 0          end 44100      ["FL","FR"] ch 44100 Hz  gain 0.0 dB  backline.player.c -> backline-test.tapa;
   unloaded; Clips now: as 0
   player nodes left: 0
 
 -- 3. every received sample against the timeline
-  a (stereo, start 96000, 0 dB then -12 dB): 8241 cycles received (6453 rolling); 1411966 samples inside the clip while rolling:
-     1411710 exact (bit-identical to file x gain), 0 wrong, 0 silent where the file has audio (underrun), 256 in the one gain-ramp cycle
+  a (stereo, start 96000, 0 dB then -12 dB): 8244 cycles received (6455 rolling); 1412478 samples inside the clip while rolling:
+     1412222 exact (bit-identical to file x gain), 0 wrong, 0 silent where the file has audio (underrun), 256 in the one gain-ramp cycle
      samples outside the clip or while stopped that were not silence: 0
      a cycle starting at transport 96000 contains the start 96000: first audio sample at transport 96000 -> error 0 samples
      a cycle starting at transport 95935 contains the start 96000: first audio sample at transport 96000 -> error 0 samples
-  b (mono, start bbt:3|1|0 = 192000, -6 dB): 8242 cycles received (6453 rolling); 417855 samples inside the clip while rolling:
-     417855 exact (bit-identical to file x gain), 0 wrong, 0 silent where the file has audio (underrun), 0 in the one gain-ramp cycle
+  b (mono, start bbt:3|1|0 = 192000, -6 dB): 8245 cycles received (6455 rolling); 418111 samples inside the clip while rolling:
+     418111 exact (bit-identical to file x gain), 0 wrong, 0 silent where the file has audio (underrun), 0 in the one gain-ramp cycle
      samples outside the clip or while stopped that were not silence: 0
      a cycle starting at transport 192000 contains the start 192000: first audio sample at transport 192000 -> error 0 samples
      a cycle starting at transport 191935 contains the start 192000: first audio sample at transport 192000 -> error 0 samples
-  gain change: one ramp cycle at graph position 609664, then exactly x0.251188636 (-12 dB)
+  gain change: one ramp cycle at graph position 612480, then exactly x0.251188636 (-12 dB)
   RESULT: PASS (every sample is the file's frame at (transport - start) x gain, bit-exact; each start lands on its exact transport frame)
   underrun samples (a locate into a file's streamed part while rolling): a 0 frames (0.0 ms), b 0 frames
 
 -- clean up
-leaks (a test node linked to a non-test node): none
-test-group nodes left: 0
-other nodes same as at start: yes (6 nodes)
-default sink after: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} (unchanged); default source unchanged; moved during the run: never
 
 ################################################################
 
-== player-proof 2026-11-12T00:40:07-08:00
+== player-proof 2026-11-12T01:13:39-08:00
 quantum: 1000 (forced on the test driver only)
-load: 4.31 3.76 5.59 on 16 cpus
+load: 2.03 2.96 3.49 on 16 cpus
 default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
 
 -- 1. load
-  Load a-stereo.wav at 96000 -> a (21 ms, reply after its links are up)
+  Load a-stereo.wav at 96000 -> a (23 ms, reply after its links are up)
   Load b-mono.wav at bbt:3|1|0 (120 BPM 4/4), -6 dB -> b; resolved by clockd to frame 192000
   links: backline.player.a:output_FL |-> backline-test.tapa:input_FL;backline.player.a:output_FR |-> backline-test.tapa:input_FR;backline.player.b:output_MONO |-> backline-test.tapb:input_MONO;
   nodes: backline.player.a [Stream/Output/Audio, 2 ch FL,FR] backline.player.b [Stream/Output/Audio, 1 ch MONO] 
@@ -76,28 +72,24 @@ default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
   Stop, Locate 480000 (a at file frame 384000, past its head), Play
   44.1 kHz file on the 48 kHz graph: rate_ok false, played_frames 0 (silent: no resampling yet)
   a: cycles 1039, played 702999 frames, underruns 0 (0 frames), ring seeks 2
-  b: cycles 1038, played 415999 frames, underruns 0 (0 frames), ring seeks 2
+  b: cycles 1039, played 415999 frames, underruns 0 (0 frames), ring seeks 2
   CLI: a                start 96000      end 1056000    ["FL","FR"] ch 48000 Hz  gain -12.0 dB  backline.player.a -> backline-test.tapa;b                start 192000     end 768000     ["MONO"] ch 48000 Hz  gain -6.0 dB  backline.player.b -> backline-test.tapb;c                start 0          end 44100      ["FL","FR"] ch 44100 Hz  gain 0.0 dB  backline.player.c -> backline-test.tapa;
   unloaded; Clips now: as 0
   player nodes left: 0
 
 -- 3. every received sample against the timeline
-  a (stereo, start 96000, 0 dB then -12 dB): 1054 cycles received (823 rolling); 1405998 samples inside the clip while rolling:
+  a (stereo, start 96000, 0 dB then -12 dB): 1059 cycles received (823 rolling); 1405998 samples inside the clip while rolling:
      1403998 exact (bit-identical to file x gain), 0 wrong, 0 silent where the file has audio (underrun), 2000 in the one gain-ramp cycle
      samples outside the clip or while stopped that were not silence: 0
      a cycle starting at transport 96000 contains the start 96000: first audio sample at transport 96000 -> error 0 samples
      a cycle starting at transport 95999 contains the start 96000: first audio sample at transport 96000 -> error 0 samples
-  b (mono, start bbt:3|1|0 = 192000, -6 dB): 1055 cycles received (823 rolling); 415999 samples inside the clip while rolling:
+  b (mono, start bbt:3|1|0 = 192000, -6 dB): 1059 cycles received (823 rolling); 415999 samples inside the clip while rolling:
      415999 exact (bit-identical to file x gain), 0 wrong, 0 silent where the file has audio (underrun), 0 in the one gain-ramp cycle
      samples outside the clip or while stopped that were not silence: 0
      a cycle starting at transport 192000 contains the start 192000: first audio sample at transport 192000 -> error 0 samples
      a cycle starting at transport 191999 contains the start 192000: first audio sample at transport 192000 -> error 0 samples
-  gain change: one ramp cycle at graph position 614000, then exactly x0.251188636 (-12 dB)
+  gain change: one ramp cycle at graph position 617000, then exactly x0.251188636 (-12 dB)
   RESULT: PASS (every sample is the file's frame at (transport - start) x gain, bit-exact; each start lands on its exact transport frame)
   underrun samples (a locate into a file's streamed part while rolling): a 0 frames (0.0 ms), b 0 frames
 
 -- clean up
-leaks (a test node linked to a non-test node): none
-test-group nodes left: 0
-other nodes same as at start: yes (6 nodes)
-default sink after: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} (unchanged); default source unchanged; moved during the run: never

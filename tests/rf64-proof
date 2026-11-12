@@ -41,7 +41,7 @@ echo "default sink: $default_before; free space: $(df -h --output=avail "$out" |
 # file is the recorder's (or a graph dropout, which would show in both)
 bl_spawn "$BL_BIN/backline-test-source" --sines 100:16 backline-test.rf64
 bl_wait_node backline-test.rf64
-{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.rf64drv media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true node.force-quantum = %s %s }\n' "$quantum" "$G"; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.rf64drv media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true node.force-quantum = %s %s }\n' "$quantum" "$G"; bl_hold; } | pw-cli >/dev/null 2>&1 &
 BL_PIDS+=($!)
 bl_wait_node backline-test.rf64drv
 sleep 1

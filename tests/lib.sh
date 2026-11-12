@@ -59,10 +59,14 @@ bl_testbed() {
     cmds+="create-node adapter { factory.name = support.null-audio-sink node.name = $n node.description = \"Backline test $n\" media.class = Audio/Sink audio.position = [ FL FR ] audio.rate = 48000 object.linger = false priority.session = 1 priority.driver = $prio monitor.channel-volumes = false node.virtual = true }"$'\n'
   done
   # pw-cli reads the commands, then stays connected until killed.
-  { printf '%s' "$cmds"; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+  { printf '%s' "$cmds"; bl_hold; } | pw-cli >/dev/null 2>&1 &
   BL_PIDS+=($!)
   for arg in "$@"; do bl_wait_node "${arg%@*}" || return 1; done
 }
+
+# Keeps a pw-cli fed (so its nodes stay) until this script exits, however it
+# exits: a plain `sleep` here outlived killed scripts as an orphan.
+bl_hold() { while kill -0 $$ 2>/dev/null; do sleep 0.5; done; }
 
 bl_spawn() { # cmd... (tracked for cleanup)
   "$@" &

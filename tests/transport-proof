@@ -55,7 +55,7 @@ echo "machine: $(uname -r), PipeWire $(pw-cli --version 2>/dev/null | sed -n 's/
 default_before=$(bl_default_sink); source_before=$(bl_default_source); bl_foreign_nodes >"$out/nodes-before.txt"
 bl_watch_defaults "$default_before" "$source_before" "$out/defaults-moved.txt"
 echo "default sink: $default_before"
-{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.tr-clk media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true node.force-quantum = 128 node.force-rate = 48000 %s }\n' "$G"; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.tr-clk media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true node.force-quantum = 128 node.force-rate = 48000 %s }\n' "$G"; bl_hold; } | pw-cli >/dev/null 2>&1 &
 BL_PIDS+=($!)
 bl_wait_node backline-test.tr-clk
 # Nodes from outside the test group running under its driver (another clock
