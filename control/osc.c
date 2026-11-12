@@ -240,3 +240,23 @@ size_t osc_build(uint8_t *buf, size_t cap, const char *address, const char *type
 	va_end(ap);
 	return ok ? pos : 0;
 }
+
+size_t osc_bundle_begin(uint8_t *buf, size_t cap)
+{
+	if (cap < 16)
+		return 0;
+	memcpy(buf, "#bundle\0\0\0\0\0\0\0\0\1", 16); /* timetag 1: immediately */
+	return 16;
+}
+
+size_t osc_bundle_add(uint8_t *buf, size_t len, size_t cap, const uint8_t *msg, size_t n)
+{
+	if (len < 16 || n == 0 || (n & 3) || len + 4 + n > cap)
+		return 0;
+	buf[len] = (uint8_t)(n >> 24);
+	buf[len + 1] = (uint8_t)(n >> 16);
+	buf[len + 2] = (uint8_t)(n >> 8);
+	buf[len + 3] = (uint8_t)n;
+	memcpy(buf + len + 4, msg, n);
+	return len + 4 + n;
+}

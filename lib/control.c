@@ -216,11 +216,19 @@ int bl_control_cancel_learn(bl_client *c)
 int bl_control_listen(bl_client *c, const char *proto, const char *address, uint16_t port, const bl_listen_options *o,
 		      char *id, size_t n)
 {
+	return bl_control_listen_params(c, proto, address, port, o, NULL, id, n);
+}
+
+int bl_control_listen_params(bl_client *c, const char *proto, const char *address, uint16_t port,
+			     const bl_listen_options *o, const char *params_role, char *id, size_t n)
+{
 	sd_bus_message *m = NULL, *reply = NULL;
 	sd_bus_error e = SD_BUS_ERROR_NULL;
 	int r = sd_bus_message_new_method_call(bl__bus(c), &m, CTL_NAME, CTL_PATH, CTL_IFACE, "Listen");
 	if (r >= 0) r = sd_bus_message_append(m, "ssq", proto, address, port);
 	if (r >= 0) r = sd_bus_message_open_container(m, 'a', "{sv}");
+	if (r >= 0 && params_role && *params_role)
+		r = sd_bus_message_append(m, "{sv}", "params", "s", params_role);
 	if (o && r >= 0) {
 		if (o->secret) r = sd_bus_message_append(m, "{sv}", "secret", "s", o->secret);
 		if (r >= 0 && o->insecure_udp) r = sd_bus_message_append(m, "{sv}", "insecure-udp", "b", 1);
@@ -251,6 +259,13 @@ int bl_control_unlisten(bl_client *c, const char *id)
 	sd_bus_error e = SD_BUS_ERROR_NULL;
 	int r = sd_bus_call_method(bl__bus(c), CTL_NAME, CTL_PATH, CTL_IFACE, "Unlisten", &e, NULL, "s", id);
 	return done(c, r, &e, "Control Unlisten");
+}
+
+int bl_control_set_midi_out(bl_client *c, const char *regex)
+{
+	sd_bus_error e = SD_BUS_ERROR_NULL;
+	int r = sd_bus_call_method(bl__bus(c), CTL_NAME, CTL_PATH, CTL_IFACE, "SetMidiOut", &e, NULL, "s", regex ? regex : "");
+	return done(c, r, &e, "Control SetMidiOut");
 }
 
 int bl_control_set_midi_follow(bl_client *c, const char *regex)

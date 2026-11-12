@@ -35,6 +35,7 @@ struct ctl_listen_spec {
 	uint32_t max_rate;     /* messages per second per peer */
 	uint32_t max_clients;  /* TCP */
 	uint32_t max_size;     /* bytes per packet / frame */
+	char params[32];       /* Params1 over OSC: the role of this listener's peers; "" = not served */
 };
 
 /* A literal IP address (no host names, no wildcard). Fills ss/len and

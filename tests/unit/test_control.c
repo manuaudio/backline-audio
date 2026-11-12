@@ -222,11 +222,116 @@ static void test_mapping(void)
 	CHECK(ctl_db_to_gain(-INFINITY) == 0 && ctl_db_to_gain(-200) == 0);
 }
 
+/* Control1 additions: cc14, NRPN/RPN, relative encoders, takeover, feedback */
+static void test_additions(void)
+{
+	struct ctl_source s;
+	struct ctl_target t;
+	char err[300], buf[160];
+	CHECK(ctl_parse_source("midi:cc14:1:7", &s, err, sizeof(err)) == 0 && s.kind == CTL_SRC_CC14 && s.number == 7);
+	CHECK(ctl_parse_source("midi:cc14:1:32", &s, err, sizeof(err)) < 0);
+	CHECK(ctl_parse_source("midi:nrpn:3:16383", &s, err, sizeof(err)) == 0 && s.kind == CTL_SRC_NRPN && s.channel == 3);
+	ctl_format_source(&s, buf, sizeof(buf));
+	CHECK(!strcmp(buf, "midi:nrpn:3:16383"));
+	CHECK(ctl_parse_source("midi:rpn:*:0", &s, err, sizeof(err)) == 0 && s.kind == CTL_SRC_RPN && s.channel == 0);
+	CHECK(ctl_parse_source("midi:nrpn:1:16384", &s, err, sizeof(err)) < 0);
+	CHECK(ctl_parse_target("param:/console/in.1/fader", &t, err, sizeof(err)) == 0 && t.kind == CTL_T_PARAM &&
+	      !strcmp(t.key, "/console/in.1/fader"));
+	CHECK(ctl_parse_target("param:/console", &t, err, sizeof(err)) < 0);
+	CHECK(ctl_parse_target("param:/console/in.*/fader", &t, err, sizeof(err)) < 0);
+
+	enum ctl_encoding e;
+	CHECK(ctl_parse_encoding("rel-sm", &e) == 0 && e == CTL_ENC_REL_SM && ctl_parse_encoding("rel", &e) < 0);
+	CHECK(ctl_rel_ticks(CTL_ENC_REL_2C, 1) == 1 && ctl_rel_ticks(CTL_ENC_REL_2C, 127) == -1 && ctl_rel_ticks(CTL_ENC_REL_2C, 64) == -64);
+	CHECK(ctl_rel_ticks(CTL_ENC_REL_SM, 0x03) == 3 && ctl_rel_ticks(CTL_ENC_REL_SM, 0x41) == -1 && ctl_rel_ticks(CTL_ENC_REL_SM, 0x45) == -5);
+	CHECK(ctl_rel_ticks(CTL_ENC_REL_OFFSET, 65) == 1 && ctl_rel_ticks(CTL_ENC_REL_OFFSET, 63) == -1 && ctl_rel_ticks(CTL_ENC_REL_OFFSET, 64) == 0);
+	CHECK(fabs(ctl_rel_apply(0.5, 3, 0.01, 1) - 0.53) < 1e-12 && ctl_rel_apply(0.99, 5, 0.01, 1) == 1 && ctl_rel_apply(0.01, -5, 0.01, 1) == 0);
+	CHECK(fabs(ctl_rel_apply(0.5, -2, 0.01, 2) - 0.46) < 1e-12);
+
+	/* 14-bit: a 7-bit device's MSB counts at once; after an LSB, pairs */
+	struct ctl_hires h = { 0 };
+	double n;
+	CHECK(ctl_hires_feed(&h, 0, 127, 0, &n) && n == 1);
+	CHECK(ctl_hires_feed(&h, 1, 0x7f, 1, &n) && n == 1);          /* first LSB: completes with the last MSB */
+	CHECK(!ctl_hires_feed(&h, 0, 64, 1000, &n));                   /* now an MSB waits */
+	CHECK(!ctl_hires_expire(&h, 1000 + CTL_HIRES_TIMEOUT_NS - 1, &n));
+	CHECK(ctl_hires_feed(&h, 1, 1, 2000, &n) && fabs(n - (64 * 128 + 1) / 16383.0) < 1e-12);
+	CHECK(!ctl_hires_feed(&h, 0, 10, 5000, &n));
+	CHECK(ctl_hires_expire(&h, 5000 + CTL_HIRES_TIMEOUT_NS, &n) && fabs(n - 10 * 128 / 16383.0) < 1e-12);
+	CHECK(!ctl_hires_expire(&h, 5000 + 2 * CTL_HIRES_TIMEOUT_NS, &n));
+
+	/* NRPN 0x123 = 291 on channel 2, data 0x40 0x05, then increment */
+	struct ctl_nrpn st;
+	ctl_nrpn_init(&st);
+	bool rpn;
+	int prm, val;
+	CHECK(ctl_nrpn_feed(&st, 1, 6, 10, &rpn, &prm, &val) == CTL_NRPN_NONE); /* nothing selected */
+	CHECK(ctl_nrpn_feed(&st, 1, 99, 2, &rpn, &prm, &val) == CTL_NRPN_NONE);
+	CHECK(ctl_nrpn_feed(&st, 1, 98, 0x23, &rpn, &prm, &val) == CTL_NRPN_NONE);
+	CHECK(ctl_nrpn_feed(&st, 1, 6, 0x40, &rpn, &prm, &val) == CTL_NRPN_DATA_MSB && !rpn && prm == 291 && val == 0x40);
+	CHECK(ctl_nrpn_feed(&st, 1, 38, 5, &rpn, &prm, &val) == CTL_NRPN_DATA_LSB && val == 5);
+	CHECK(ctl_nrpn_feed(&st, 1, 96, 0, &rpn, &prm, &val) == CTL_NRPN_INC && val == 1);
+	CHECK(ctl_nrpn_feed(&st, 1, 97, 3, &rpn, &prm, &val) == CTL_NRPN_DEC && val == 3);
+	CHECK(ctl_nrpn_feed(&st, 0, 6, 1, &rpn, &prm, &val) == CTL_NRPN_NONE); /* per channel */
+	CHECK(ctl_nrpn_feed(&st, 1, 101, 0, &rpn, &prm, &val) == CTL_NRPN_NONE);
+	CHECK(ctl_nrpn_feed(&st, 1, 100, 0, &rpn, &prm, &val) == CTL_NRPN_NONE);
+	CHECK(ctl_nrpn_feed(&st, 1, 6, 2, &rpn, &prm, &val) == CTL_NRPN_DATA_MSB && rpn && prm == 0); /* pitch-bend range */
+	ctl_nrpn_feed(&st, 1, 101, 127, &rpn, &prm, &val);
+	ctl_nrpn_feed(&st, 1, 100, 127, &rpn, &prm, &val);                   /* RPN null */
+	CHECK(ctl_nrpn_feed(&st, 1, 6, 2, &rpn, &prm, &val) == CTL_NRPN_NONE);
+
+	/* takeover: pickup ignores until crossing; scale converges; jump follows */
+	struct ctl_takeover to = { 0 };
+	double out;
+	CHECK(!ctl_takeover_apply(CTL_TO_PICKUP, &to, 0.2, true, 0.6, &out));
+	CHECK(!ctl_takeover_apply(CTL_TO_PICKUP, &to, 0.5, true, 0.6, &out));
+	CHECK(ctl_takeover_apply(CTL_TO_PICKUP, &to, 0.7, true, 0.6, &out) && out == 0.7 && to.picked); /* crossed */
+	CHECK(ctl_takeover_apply(CTL_TO_PICKUP, &to, 0.1, true, 0.7, &out) && out == 0.1);
+	ctl_takeover_lost(&to);
+	CHECK(!ctl_takeover_apply(CTL_TO_PICKUP, &to, 0.12, true, 0.9, &out));
+	CHECK(ctl_takeover_apply(CTL_TO_PICKUP, &to, 0.89, true, 0.9, &out) && out == 0.89); /* within tolerance */
+	struct ctl_takeover sc = { 0 };
+	double tgt = 0.8, c = 0.2;
+	CHECK(!ctl_takeover_apply(CTL_TO_SCALE, &sc, c, true, tgt, &out)); /* first value: no direction yet */
+	int steps = 0;
+	while (!sc.picked && steps < 100) {
+		c += 0.01;
+		if (ctl_takeover_apply(CTL_TO_SCALE, &sc, c, true, tgt, &out)) {
+			CHECK(out >= tgt - 1e-12); /* moving up never moves the target down */
+			tgt = out;
+		}
+		steps++;
+	}
+	CHECK(sc.picked && c < 1.0001 && fabs(c - tgt) <= CTL_TAKEOVER_TOLERANCE + 1e-9);
+	struct ctl_takeover j = { 0 };
+	CHECK(ctl_takeover_apply(CTL_TO_JUMP, &j, 0.3, true, 0.9, &out) && out == 0.3);
+	struct ctl_takeover u = { 0 };
+	CHECK(ctl_takeover_apply(CTL_TO_PICKUP, &u, 0.3, false, 0, &out) && out == 0.3); /* unknown target: follow */
+
+	/* feedback bytes */
+	uint8_t fb[16];
+	ctl_parse_source("midi:cc:2:7", &s, err, sizeof(err));
+	CHECK(ctl_feedback_midi(&s, 1, 7, fb, sizeof(fb)) == 3 && fb[0] == 0xb1 && fb[1] == 7 && fb[2] == 127);
+	ctl_parse_source("midi:cc14:1:7", &s, err, sizeof(err));
+	CHECK(ctl_feedback_midi(&s, 0.5, 14, fb, sizeof(fb)) == 6 && fb[1] == 7 && fb[2] == 64 && fb[4] == 39 && fb[5] == 0);
+	ctl_parse_source("midi:nrpn:*:291", &s, err, sizeof(err));
+	CHECK(ctl_feedback_midi(&s, 1, 14, fb, sizeof(fb)) == 12 && fb[0] == 0xb0 && fb[1] == 99 && fb[2] == 2 && fb[4] == 98 &&
+	      fb[5] == 0x23 && fb[7] == 6 && fb[8] == 127 && fb[10] == 38 && fb[11] == 127);
+	CHECK(ctl_feedback_midi(&s, 1, 7, fb, sizeof(fb)) == 9);
+	ctl_parse_source("midi:note:1:16", &s, err, sizeof(err));
+	CHECK(ctl_feedback_midi(&s, 1, 7, fb, sizeof(fb)) == 3 && fb[0] == 0x90 && fb[2] == 127);
+	ctl_parse_source("midi:pitchbend:1", &s, err, sizeof(err));
+	CHECK(ctl_feedback_midi(&s, 1, 7, fb, sizeof(fb)) == 3 && fb[1] == 0x7f && fb[2] == 0x7f);
+	CHECK(ctl_feedback_midi(&s, 1, 7, fb, 2) == 0); /* no room: nothing */
+	CHECK(fabs(ctl_gain_to_db(0.5) + 6.0206) < 1e-3 && isinf(ctl_gain_to_db(0)));
+}
+
 int main(void)
 {
 	test_osc();
 	test_policy();
 	test_mapping();
+	test_additions();
 	if (fails) {
 		fprintf(stderr, "%d checks failed\n", fails);
 		return 1;

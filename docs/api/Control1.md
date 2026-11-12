@@ -21,6 +21,8 @@ A mapping is a **source**, a **target** and an optional range.
 | Source | Value 0..1 |
 |---|---|
 | `midi:cc:CH:NUM` | controller value / 127 |
+| `midi:cc14:CH:MSB` | a 14-bit pair, CC `MSB` (0-31) with CC `MSB`+32: (msb·128 + lsb) / 16383 |
+| `midi:nrpn:CH:PARAM`, `midi:rpn:CH:PARAM` | data entry (CC 6, and 38 for 14 bits) of parameter `PARAM` (0-16383) selected with CC 99/98 (NRPN) or 101/100 (RPN); increment and decrement (CC 96, 97) move it |
 | `midi:note:CH:KEY` | velocity / 127 on note-on, 0 on note-off |
 | `midi:pitchbend:CH` | 14-bit value / 16383 |
 | `midi:program:CH` | program / 127 |
@@ -38,6 +40,7 @@ OSC patterns).
 | `transport:tempo` | `Clock1.SetTempo` | 60..180 BPM |
 | `transport:play`, `stop`, `toggle`, `locate:POS` | `Clock1.Play`, `Stop`, either (from `Rolling`), `Locate(POS)` (`POS` as `Locate` takes it: frames, `tc:…`, `bbt:…`) | trigger |
 | `recorder:arm`, `record`, `stop`, `marker` | `Recorder1.Arm(args)`, `Record`, `Stop`, `AddMarker(args[0])` | trigger |
+| `param:PATH` | a parameter a program published through [Params1](Params1.md): the 0..1 is its normalised value, and the program applies it | 0..1 |
 
 The value after `invert` is `min + v·(max − min)`. **Triggers** act when the
 value crosses above 0.5 (a button press, a note-on, a CC to 127), not on
@@ -47,13 +50,54 @@ release; an OSC message with no argument is a press every time.
 mixer set (the mixer shows dB = 20·log10 of it). For a hardware sink that
 WirePlumber drives through a device route, the route volume is separate.
 
+### 14-bit values, NRPN, relative encoders, takeover, feedback
+
+- **14-bit pairs** (`cc14`, and NRPN/RPN data entry): a device that has never
+  sent an LSB is treated as 7-bit, so its MSB alone moves the target at once.
+  After the first LSB, an MSB waits up to 20 ms for its LSB.
+- **NRPN/RPN**: the parameter selection is kept per channel; RPN 127/127
+  (null) deselects. Option `bits` (`7` or `14`, default 14) says whether the
+  data is the MSB alone or the pair.
+- **Relative encoders**, option `encoding` (`midi:cc`, `nrpn`, `rpn` sources):
+
+  | `encoding` | A tick up | A tick down | Used by |
+  |---|---|---|---|
+  | `abs` (default) | | | faders, absolute knobs |
+  | `rel-2c` | 1 | 127 (two's complement) | many "relative 1" modes |
+  | `rel-sm` | 1 | 65 (bit 6 is the sign) | Mackie V-Pots |
+  | `rel-offset` | 65 | 63 (64 ± n) | "binary offset" encoders |
+  | `rel-inc-dec` | CC 96 | CC 97 | NRPN data increment/decrement only |
+
+  Each tick moves the normalised value by `step` (default 1/127; for an
+  `int`, `enum` or `bool` parameter one value); `accel` (1-4, default 1)
+  makes fast turns go further (|ticks|^accel). The vendors' own names for
+  these modes differ; check the device's manual for which it sends.
+- **Soft takeover**, option `takeover`, for controls without a motor:
+  `jump` (default) follows at once; `pickup` ignores the control until it
+  reaches or crosses the target's current value; `scale` moves the target in
+  proportion to the travel the control has left until both meet. Once picked
+  up, the control follows until the target is changed from elsewhere. The
+  target's current value comes from Params1 (`param:`), the node (`volume:`,
+  `mute:`), or the last value the mapping sent.
+- **Feedback**, option `feedback: true` (MIDI sources): the target's value is
+  sent back on the same CC, CC pair, NRPN, note or pitch bend (channel `*`
+  sends on 1), through controld's MIDI output (`SetMidiOut`). That drives motor
+  faders and LED rings on generic controllers. `param:` targets feed back what
+  the program confirms (also when its own UI moves it); `volume:` and `mute:`
+  what the node reports; other targets echo what was sent. A relative source
+  gets the absolute value, which is what LED-ring controllers take.
+- **Gestures**, option `gesture: "auto"` (`param:` targets): a gesture begins
+  before the first value of a burst and ends 300 ms after the last, so touch
+  automation works from a fader without a touch sensor. Option `role` (`s`,
+  default `all`) is the Params1 role the sets are made in.
+
 **Delivery.** Values go out as they arrive. D-Bus targets are called
 asynchronously; while one call of a mapping is in flight, newer values of
 that mapping replace each other and only the latest is sent when the call
 returns, so a fast fader never queues up a backlog. Volume, mute and control
 targets go straight to PipeWire.
 
-## MIDI input
+## MIDI input and output
 
 controld is one PipeWire node, `backline.control` (`Midi/Sink`), with one
 MIDI input port `midi_in`. It is never autoconnected. MIDI reaches it through
@@ -63,14 +107,24 @@ keyboard through PipeWire's `Midi-Bridge`), or anyone can link a port to it.
 The port's process callback only copies MIDI 1.0 messages (or UMP, converted)
 into a wait-free ring and wakes the main loop.
 
+The same node has a MIDI output port, `midi_out`, for feedback. It is linked
+by `SetMidiOut(regex)` to every MIDI *input* port (a device's playback side)
+that matches, now and when it is plugged in later. The main loop fills a
+wait-free ring that the process callback drains into the port.
+
 ## Methods
 
 ### `Map(s source, s target, a{sv} options) → (s id)`
 
 Adds a mapping. Options: `min` (`d`), `max` (`d`), `invert` (`b`), `in-min`
 (`d`), `in-max` (`d`), `args` (`as`: the sources for `recorder:arm`, the name
-for `recorder:marker`), `id` (`s`; default `m1`, `m2`, …). Errors:
-`InvalidArgs` with the reason.
+for `recorder:marker`), `id` (`s`; default `m1`, `m2`, …), and the
+[additions](#14-bit-values-nrpn-relative-encoders-takeover-feedback):
+`encoding` (`s`), `step` (`d`), `accel` (`d`), `takeover` (`s`), `feedback`
+(`b`), `bits` (`u`), `gesture` (`s`: `auto` or `none`), `role` (`s`). Errors:
+`InvalidArgs` with the reason (a relative encoding on a note, takeover on a
+relative encoder, feedback from OSC, a gesture on a target that isn't
+`param:`).
 
 ### `AddMapping(s json) → (s id)`
 
@@ -95,7 +149,8 @@ Secrets are never returned (`auth` says whether one is set).
 
 ### `Learn(s target, a{sv} options) → (s id)`
 
-The next MIDI message (note-on, CC, pitch bend, program change) or OSC message
+The next MIDI message (note-on, CC, pitch bend, program change, or an NRPN/RPN
+data entry, which is learned as `midi:nrpn`/`midi:rpn`) or OSC message
 from an accepted peer becomes the source of a new mapping to `target`; that
 input itself is not passed on. Returns the id the mapping will have, and the
 signal `Learned` says when it exists. Options: those of `Map`, plus `from`
@@ -113,8 +168,11 @@ IPv6 address of this machine; `port` 0 picks a free one. Returns
 `udp:ADDRESS:PORT` (IPv6 in brackets). Options: `allow` (`as`, addresses or
 CIDRs), `secret` (`s`), `insecure-udp` (`b`), `max-rate` (`u` messages per
 second per peer, default 500), `max-clients` (`u`, TCP, default 8),
-`max-size` (`u` bytes per packet, default 8192). Every refusal is an
-`InvalidArgs` error with the reason (see [Security](#security)).
+`max-size` (`u` bytes per packet, default 8192), `params` (`s`: serve the
+[Params1](Params1.md#osc) tree to this listener's peers in this role: `all`,
+`read-only`, or a role the program defined; without it the listener serves
+mappings only). Every refusal is an `InvalidArgs` error with the reason (see
+[Security](#security)).
 
 ### `Unlisten(s id) → ()`
 
@@ -124,6 +182,11 @@ Closes a listener and its connections. Error `NotFound`.
 
 POSIX extended regex, case-insensitive; `""` follows nothing. Links controld
 made to sources that no longer match are removed.
+
+### `SetMidiOut(s regex) → ()`
+
+Like `SetMidiFollow`, for controld's MIDI output: feedback goes to every MIDI
+input port whose `node:port | alias` matches. `""` links to nothing.
 
 ### `Save() → (s path)`
 
@@ -139,11 +202,13 @@ may hold a listener's secret). Error `State` when started with `--no-config`.
 | `Listeners` | `as` | Open listener ids |
 | `Learning` | `s` | The target being learned, `""` when not learning |
 | `MidiFollow` | `s` | The follow regex |
+| `MidiOut` | `s` | The MIDI output's regex |
 | `Node` | `s` | controld's PipeWire node name |
 | `ConfigDir` | `s` | Where `Save` writes and the start reads |
 | `Received` | `t` | OSC messages accepted from listeners (*polled*) |
 | `MidiEvents` | `t` | MIDI messages received (*polled*) |
 | `MidiDropped` | `t` | MIDI messages the ring had no room for (*polled*) |
+| `MidiSent` | `t` | MIDI messages sent for feedback (*polled*) |
 | `Rejected` | `t` | Packets and connections refused: not allowed, over the rate, unauthenticated, malformed, oversized (*polled*) |
 | `AuthFailures` | `t` | Wrong or missing secrets and authentication timeouts (*polled*) |
 | `Malformed` | `t` | Packets that are not valid OSC (*polled*) |
@@ -163,7 +228,7 @@ At start, controld reads every `*.json` file in
 `$XDG_CONFIG_HOME/backline/control/` (`--config-dir`, or
 `BACKLINE_CONTROL_DIR`) in name order. Each has the schema of `Mappings()`
 (`"schema": "backline.control/1"`), with `secret` in a listener when it has
-one. A listener the [rules](#security) refuse is not opened and is logged.
+one, and `midi-out` next to `midi-follow`. A listener the [rules](#security) refuse is not opened and is logged.
 `Save` only ever writes `control.json`; other files are left as they are, so
 a hand-written `stage.json` can sit next to it.
 
@@ -201,7 +266,9 @@ can change something inside it. The rules:
 7. **The network can only move what is already mapped.** No OSC message
    creates, changes or removes a mapping or a listener, starts a learn, or
    reaches any target that has no mapping. A message to an unmapped address
-   does nothing.
+   does nothing. The one exception is opt-in per listener: a listener given a
+   `params` role serves the [Params1](Params1.md#osc) tree a program
+   published, within that role, and the program still validates every set.
 8. **Limits.** A token bucket per peer address (`max-rate`, default 500
    messages a second, a burst of one second's worth), `max-size` per packet
    (default 8192 bytes; larger UDP packets and TCP frames are refused, and a
@@ -222,10 +289,13 @@ listen on that interface's address), not over the open LAN.
 
 ```
 backline map add SOURCE TARGET [--min X] [--max Y] [--invert] [--in-min A --in-max B] [--arg S]... [--id ID]
+                               [--encoding E] [--step D] [--accel A] [--takeover T] [--feedback] [--bits 7|14]
+                               [--gesture auto] [--role R]
 backline map learn TARGET [--from midi|osc] [--timeout S]
 backline map list | remove ID | cancel | save | status [--json]
 backline map follow REGEX
-backline map listen udp|tcp ADDRESS PORT [--allow CIDR]... [--secret S | --secret-file F] [--insecure-udp]
+backline map out REGEX
+backline map listen udp|tcp ADDRESS PORT [--allow CIDR]... [--secret S | --secret-file F] [--insecure-udp] [--params ROLE]
 backline map unlisten ID
 ```
 
@@ -239,4 +309,11 @@ backline map listen udp 127.0.0.1 9000
 backline map add osc:/1/fader1 transport:tempo --min 60 --max 180
 backline map listen tcp 100.64.0.7 9001 --allow 100.64.0.0/10 --secret-file ~/.config/backline/control/secret
 backline map save
+# a BCF2000-style box with motor faders, onto a program's parameters
+backline map follow '^Midi-Bridge:BCF2000'
+backline map out '^Midi-Bridge:BCF2000'
+backline map add midi:cc:1:81 param:/console/in.1/fader --feedback --gesture auto
+backline map add midi:cc:1:1 param:/console/in.1/pan --encoding rel-2c --feedback
+backline map add midi:nrpn:1:291 param:/console/in.1/eq.lf --feedback
+backline map add midi:cc:1:7 param:/console/main/fader --takeover pickup
 ```

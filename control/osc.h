@@ -57,6 +57,12 @@ bool osc_arg_number(const struct osc_arg *a, double *out);
  * packet length, or 0 if it doesn't fit in cap. */
 size_t osc_build(uint8_t *buf, size_t cap, const char *address, const char *types, ...);
 
+/* A bundle (timetag "immediately"): begin writes its 16-byte header and
+ * returns 16; add appends one message and returns the new length, or 0 if
+ * it doesn't fit in cap (the bundle is unchanged). */
+size_t osc_bundle_begin(uint8_t *buf, size_t cap);
+size_t osc_bundle_add(uint8_t *buf, size_t len, size_t cap, const uint8_t *msg, size_t n);
+
 #ifdef __cplusplus
 }
 #endif

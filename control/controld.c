@@ -47,8 +47,12 @@
 #include <systemd/sd-bus.h>
 
 #include "bl_graph.h"
+#include "bl_midibuf.h"
+#include "bl_midi_pw.h"
 #include "mapping.h"
 #include "osc.h"
+#include "params.h"
+#include "paramsd.h"
 #include "policy.h"
 
 #define BUS_NAME "io.github.manuaudio.Backline.Control"
@@ -100,6 +104,22 @@ struct mapping {
 	bool range_known, range_inflight, have_norm;
 	double rmin, rmax, norm_pending;
 	uint64_t sends;
+	/* Control1 additions (docs/api/Control1.md) */
+	enum ctl_encoding enc;
+	enum ctl_takeover_mode takeover;
+	double step, accel;
+	bool has_step;
+	int bits;                /* NRPN/RPN data: 7 or 14 */
+	bool feedback, gesture_auto;
+	char role[32];           /* param: targets */
+	struct ctl_hires hires;
+	struct ctl_takeover to;
+	double cur;              /* the last input-space value 0..1 sent */
+	bool cur_known;
+	double fb_last;
+	bool fb_sent;
+	bool gest_open;
+	uint64_t gest_last_ns;
 };
 
 struct peer {
@@ -144,6 +164,8 @@ struct vnode {
 	struct spa_hook listener, proxy_listener;
 	int nch;                 /* channel volumes; 0 = not known yet */
 	int muted;               /* -1 unknown */
+	float gain;              /* the first channel's volume, once known */
+	bool have_gain;
 	bool pend_vol;
 	float pend_gain;
 };
@@ -163,8 +185,13 @@ static struct {
 	struct bl_graph *graph;
 	struct pw_filter *filter;
 	struct spa_hook filter_listener;
-	void *midi_port;
-	uint32_t node_id, midi_port_id;
+	void *midi_port, *midi_out_port;
+	uint32_t node_id, midi_port_id, midi_out_port_id;
+	struct bl_midi_ring out_ring;    /* main -> process callback */
+	uint64_t midi_sent;
+	struct ctl_nrpn nrpn;
+	struct spa_source *tick;
+	bool tick_on;
 	char node_name[128];
 	sd_bus *bus;
 	struct spa_source *bus_io, *midi_ev, *house_timer, *learn_timer;
@@ -185,6 +212,13 @@ static struct {
 	bool follow_on;
 	uint32_t followed[64];
 	int n_followed;
+
+	/* MIDI out (feedback) */
+	char out_follow[256];
+	regex_t out_re;
+	bool out_on;
+	uint32_t out_linked[64];
+	int n_out_linked;
 
 	/* learn */
 	bool learning;
@@ -299,6 +333,13 @@ static void push_ump(uint64_t ns, const void *body, size_t size)
 
 static void on_process(void *data, struct spa_io_position *pos)
 {
+	if (D.midi_out_port) {
+		struct pw_buffer *ob = pw_filter_dequeue_buffer(D.midi_out_port);
+		if (ob) {
+			bl_midi_pw_write(&ob->buffer->datas[0], &D.out_ring);
+			pw_filter_queue_buffer(D.midi_out_port, ob);
+		}
+	}
 	if (!D.midi_port)
 		return;
 	struct pw_buffer *b = pw_filter_dequeue_buffer(D.midi_port);
@@ -359,6 +400,7 @@ static const struct pw_filter_events filter_events = {
 };
 
 /* ============================================================ node props */
+static void vnode_changed(struct vnode *v);
 /* Sends the pending volume once the channel count is known. */
 static void vnode_apply(struct vnode *v)
 {
@@ -387,8 +429,11 @@ static void vnode_param(void *data, int seq, uint32_t id, uint32_t index, uint32
 		if (prop->key == SPA_PROP_channelVolumes) {
 			float vols[64];
 			uint32_t n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float, vols, 64);
-			if (n > 0)
+			if (n > 0) {
 				v->nch = (int)n;
+				v->gain = vols[0];
+				v->have_gain = true;
+			}
 		} else if (prop->key == SPA_PROP_mute) {
 			bool m;
 			if (spa_pod_get_bool(&prop->value, &m) >= 0)
@@ -396,6 +441,7 @@ static void vnode_param(void *data, int seq, uint32_t id, uint32_t index, uint32
 		}
 	}
 	vnode_apply(v);
+	vnode_changed(v);
 }
 
 static const struct pw_node_events vnode_events = {
@@ -539,6 +585,8 @@ static void inst_bus(const char *node, char *out, size_t n)
 }
 
 static void send_value(struct mapping *m, double out);
+static void tick_arm(void);
+static void mapping_feedback(struct mapping *m, double in);
 static int call_async(struct mapping *m, enum call_kind kind, const char *dest, const char *path, const char *iface,
 		      const char *method, const char *types, ...);
 static void apply_norm(struct mapping *m, double norm);
@@ -713,6 +761,23 @@ static void send_value(struct mapping *m, double out)
 		else
 			target_error(m, &SD_BUS_ERROR_MAKE_CONST(ERR_NOTFOUND, "no such node"));
 		return;
+	case CTL_T_PARAM: {
+		char why[256], client[80];
+		snprintf(client, sizeof(client), "control:%s", m->id);
+		if (m->gesture_auto) {
+			if (!m->gest_open && pd_gesture(m->tgt.key, true, client, m->role, why, sizeof(why)) == 0)
+				m->gest_open = true;
+			m->gest_last_ns = now_ns();
+			tick_arm();
+		}
+		if (pd_set(m->tgt.key, true, out, client, m->role, why, sizeof(why)) == 0) {
+			D.dispatched++, m->sends++;
+		} else {
+			sd_bus_error e = SD_BUS_ERROR_MAKE_CONST(ERR_NOTFOUND, why);
+			target_error(m, &e);
+		}
+		return;
+	}
 	default:
 		break;
 	}
@@ -822,7 +887,211 @@ static void mapping_input(struct mapping *m, double norm, bool impulse)
 		m->pressed = on && !impulse;
 		return;
 	}
+	if (!(norm >= 0)) norm = 0;
+	if (norm > 1) norm = 1;
+	m->cur = norm;
+	m->cur_known = true;
 	apply_norm(m, norm);
+	/* targets that never report back are echoed; volume, mute and param:
+	 * feed back what the node or the program confirms */
+	if (m->tgt.kind == CTL_T_INSTANCE || m->tgt.kind == CTL_T_CONTROL || m->tgt.kind == CTL_T_TRANSPORT)
+		mapping_feedback(m, norm);
+}
+
+/* ============================================================ additions */
+/* Out-of-range output (the target's own units) back to the 0..1 input. */
+static double unscale(const struct mapping *m, double out)
+{
+	double lo = m->min, hi = m->max;
+	if (m->tgt.kind == CTL_T_INSTANCE && m->range_known) {
+		if (!m->has_min) lo = m->rmin;
+		if (!m->has_max) hi = m->rmax;
+	}
+	double v = hi != lo ? (out - lo) / (hi - lo) : 0;
+	if (!(v >= 0)) v = 0;
+	if (v > 1) v = 1;
+	return m->invert ? 1 - v : v;
+}
+
+static struct vnode *vnode_known(const char *name)
+{
+	for (int i = 0; i < MAX_VNODES; i++)
+		if (D.vnodes[i].used && !strcmp(D.vnodes[i].name, name))
+			return &D.vnodes[i];
+	return NULL;
+}
+
+/* The target's current value as the mapping's input 0..1, when known. */
+static bool mapping_current(struct mapping *m, double *in)
+{
+	if (m->tgt.kind == CTL_T_PARAM) {
+		struct prm *p = pd_get(m->tgt.key);
+		if (!p || p->type == PRM_STRING || p->type == PRM_TRIGGER)
+			return false;
+		*in = unscale(m, prm_to_norm(p, p->value));
+		return true;
+	}
+	if (m->tgt.kind == CTL_T_VOLUME) {
+		struct vnode *v = vnode_known(m->tgt.node);
+		if (v && v->have_gain) {
+			*in = unscale(m, ctl_gain_to_db(v->gain));
+			return true;
+		}
+	} else if (m->tgt.kind == CTL_T_MUTE) {
+		struct vnode *v = vnode_known(m->tgt.node);
+		if (v && v->muted >= 0) {
+			*in = unscale(m, v->muted);
+			return true;
+		}
+	}
+	if (m->cur_known) {
+		*in = m->cur;
+		return true;
+	}
+	return false;
+}
+
+static void out_push(const uint8_t *b, size_t n)
+{
+	/* channel messages, one control each */
+	for (size_t i = 0; i < n;) {
+		int dl = bl_midi_data_len(b[i]);
+		size_t len = dl < 0 ? n - i : (size_t)dl + 1;
+		if (i + len > n)
+			break;
+		if (bl_midi_ring_push(&D.out_ring, b + i, len))
+			D.midi_sent++;
+		i += len;
+	}
+}
+
+static void mapping_feedback(struct mapping *m, double in)
+{
+	if (!m->feedback || m->src.kind == CTL_SRC_OSC || !D.midi_out_port)
+		return;
+	if (m->fb_sent && fabs(in - m->fb_last) < 1e-9)
+		return;
+	uint8_t b[16];
+	size_t n = ctl_feedback_midi(&m->src, in, m->bits, b, sizeof(b));
+	if (!n)
+		return;
+	out_push(b, n);
+	m->fb_last = in;
+	m->fb_sent = true;
+	VLOG("feedback %s: %.4f\n", m->source_str, in);
+}
+
+/* A target changed from elsewhere: feedback, and takeover must pick up again. */
+static void target_moved(struct mapping *m, double in)
+{
+	if (m->cur_known && fabs(in - m->cur) > 1e-6)
+		ctl_takeover_lost(&m->to);
+	m->cur = in;
+	m->cur_known = true;
+	mapping_feedback(m, in);
+}
+
+static void vnode_changed(struct vnode *v)
+{
+	for (int i = 0; i < MAX_MAPPINGS; i++) {
+		struct mapping *m = &D.maps[i];
+		if (!m->used || strcmp(m->tgt.node, v->name))
+			continue;
+		if (m->tgt.kind == CTL_T_VOLUME && v->have_gain)
+			target_moved(m, unscale(m, ctl_gain_to_db(v->gain)));
+		else if (m->tgt.kind == CTL_T_MUTE && v->muted >= 0)
+			target_moved(m, unscale(m, v->muted));
+	}
+}
+
+static void on_param_changed(void *data, struct prm *p)
+{
+	if (p->type == PRM_STRING || p->type == PRM_TRIGGER)
+		return;
+	for (int i = 0; i < MAX_MAPPINGS; i++) {
+		struct mapping *m = &D.maps[i];
+		if (m->used && m->tgt.kind == CTL_T_PARAM && !strcmp(m->tgt.key, p->path))
+			target_moved(m, unscale(m, prm_to_norm(p, p->value)));
+	}
+}
+
+/* An absolute 0..1 from a control, through soft takeover. */
+static void mapping_abs(struct mapping *m, double norm)
+{
+	if (m->takeover != CTL_TO_JUMP && !ctl_target_is_trigger(&m->tgt)) {
+		double t = 0, out;
+		bool known = mapping_current(m, &t);
+		if (!ctl_takeover_apply(m->takeover, &m->to, norm, known, t, &out)) {
+			VLOG("%s: takeover waits (control %.3f, target %.3f)\n", m->source_str, norm, t);
+			return;
+		}
+		norm = out;
+	}
+	mapping_input(m, norm, false);
+}
+
+static double default_step(const struct mapping *m)
+{
+	if (m->has_step)
+		return m->step;
+	if (m->tgt.kind == CTL_T_PARAM) {
+		struct prm *p = pd_get(m->tgt.key);
+		if (p && (p->type == PRM_INT || p->type == PRM_ENUM || p->type == PRM_BOOL) && p->max > p->min)
+			return (p->step > 0 ? p->step : 1) / (p->max - p->min);
+	}
+	return 1.0 / 127;
+}
+
+/* A relative move of so many ticks. */
+static void mapping_rel(struct mapping *m, int ticks)
+{
+	if (!ticks)
+		return;
+	double cur = 0;
+	mapping_current(m, &cur);
+	mapping_input(m, ctl_rel_apply(cur, ticks, default_step(m), m->accel), false);
+}
+
+static bool enc_relative(enum ctl_encoding e)
+{
+	return e == CTL_ENC_REL_2C || e == CTL_ENC_REL_SM || e == CTL_ENC_REL_OFFSET;
+}
+
+static void tick_arm(void)
+{
+	if (D.tick_on || !D.tick)
+		return;
+	D.tick_on = true;
+	struct timespec v = { 0, 10 * 1000000L };
+	pw_loop_update_timer(D.l, D.tick, &v, &v, false);
+}
+
+/* 10 ms while something waits: an MSB for its LSB, an automatic gesture's end. */
+static void on_tick(void *data, uint64_t exp)
+{
+	uint64_t now = now_ns();
+	bool busy = false;
+	for (int i = 0; i < MAX_MAPPINGS; i++) {
+		struct mapping *m = &D.maps[i];
+		if (!m->used)
+			continue;
+		double n;
+		if (ctl_hires_expire(&m->hires, now, &n))
+			mapping_abs(m, n);
+		busy |= m->hires.pending;
+		if (m->gest_open && now - m->gest_last_ns > 300ull * 1000000ull) {
+			char why[256], client[80];
+			snprintf(client, sizeof(client), "control:%s", m->id);
+			pd_gesture(m->tgt.key, false, client, m->role, why, sizeof(why));
+			m->gest_open = false;
+		}
+		busy |= m->gest_open;
+	}
+	if (!busy) {
+		D.tick_on = false;
+		struct timespec z = { 0, 0 };
+		pw_loop_update_timer(D.l, D.tick, &z, NULL, false);
+	}
 }
 
 /* ============================================================ mappings */
@@ -832,6 +1101,9 @@ static void mapping_defaults(struct mapping *m)
 	m->in_min = 0;
 	m->in_max = 1;
 	m->last_mute = -1;
+	m->bits = 14;
+	m->accel = 1;
+	snprintf(m->role, sizeof(m->role), "all");
 }
 
 /* Fills the parsed fields and the output range; 0 or -1 with err. */
@@ -852,6 +1124,43 @@ static int mapping_finish(struct mapping *m, char *err, size_t n)
 	}
 	if (!(m->in_max != m->in_min) && m->src.kind == CTL_SRC_OSC) {
 		snprintf(err, n, "in-min and in-max must differ");
+		return -1;
+	}
+	bool nrpn = m->src.kind == CTL_SRC_NRPN || m->src.kind == CTL_SRC_RPN;
+	if (enc_relative(m->enc) && m->src.kind != CTL_SRC_CC && !nrpn) {
+		snprintf(err, n, "encoding %s is for midi:cc, midi:nrpn and midi:rpn sources", ctl_encoding_name(m->enc));
+		return -1;
+	}
+	if (m->enc == CTL_ENC_REL_INCDEC && !nrpn) {
+		snprintf(err, n, "encoding rel-inc-dec is for midi:nrpn and midi:rpn sources");
+		return -1;
+	}
+	if (m->enc != CTL_ENC_ABS && m->takeover != CTL_TO_JUMP) {
+		snprintf(err, n, "takeover is for absolute controls (a relative encoder never jumps)");
+		return -1;
+	}
+	if (m->bits != 7 && m->bits != 14) {
+		snprintf(err, n, "bits is 7 or 14");
+		return -1;
+	}
+	if (m->feedback && m->src.kind == CTL_SRC_OSC) {
+		snprintf(err, n, "feedback is for MIDI sources (OSC clients subscribe through Params1)");
+		return -1;
+	}
+	if (m->gesture_auto && m->tgt.kind != CTL_T_PARAM) {
+		snprintf(err, n, "gesture: auto is for param: targets");
+		return -1;
+	}
+	if (strcmp(m->role, "all") && strcmp(m->role, "read-only") && !prm_role_name_valid(m->role)) {
+		snprintf(err, n, "'%s' is not a role name", m->role);
+		return -1;
+	}
+	if (m->has_step && !(m->step > 0 && m->step <= 1)) {
+		snprintf(err, n, "step is above 0 and at most 1");
+		return -1;
+	}
+	if (!(m->accel >= 1 && m->accel <= 4)) {
+		snprintf(err, n, "accel is 1 to 4");
 		return -1;
 	}
 	return 0;
@@ -907,7 +1216,29 @@ static int mapping_from_json(json_object *o, struct mapping *m, char *err, size_
 			for (size_t i = 0; i < json_object_array_length(val) && m->nargs < MAX_ARGS; i++)
 				snprintf(m->args[m->nargs++], sizeof(m->args[0]), "%s",
 					 json_object_get_string(json_object_array_get_idx(val, i)));
-		} else if (!strcmp(key, "sends") || !strcmp(key, "origin")) {
+		} else if (!strcmp(key, "encoding")) {
+			if (ctl_parse_encoding(json_object_get_string(val), &m->enc) < 0) {
+				snprintf(err, n, "encoding is abs, rel-2c, rel-sm, rel-offset or rel-inc-dec");
+				return -1;
+			}
+		} else if (!strcmp(key, "takeover")) {
+			if (ctl_parse_takeover(json_object_get_string(val), &m->takeover) < 0) {
+				snprintf(err, n, "takeover is jump, pickup or scale");
+				return -1;
+			}
+		} else if (!strcmp(key, "step")) { m->step = json_object_get_double(val); m->has_step = true; }
+		else if (!strcmp(key, "accel")) m->accel = json_object_get_double(val);
+		else if (!strcmp(key, "bits")) m->bits = json_object_get_int(val);
+		else if (!strcmp(key, "feedback")) m->feedback = json_object_get_boolean(val);
+		else if (!strcmp(key, "gesture")) {
+			const char *g = json_object_get_string(val);
+			if (!g || (strcmp(g, "auto") && strcmp(g, "none"))) {
+				snprintf(err, n, "gesture is auto or none");
+				return -1;
+			}
+			m->gesture_auto = !strcmp(g, "auto");
+		} else if (!strcmp(key, "role")) snprintf(m->role, sizeof(m->role), "%s", json_object_get_string(val));
+		else if (!strcmp(key, "sends") || !strcmp(key, "origin")) {
 			/* output-only fields of Mappings() */
 		} else {
 			snprintf(err, n, "unknown mapping key '%s'", key);
@@ -941,6 +1272,14 @@ static json_object *mapping_to_json(const struct mapping *m, bool runtime)
 			json_object_array_add(a, json_object_new_string(m->args[i]));
 		json_object_object_add(o, "args", a);
 	}
+	if (m->enc != CTL_ENC_ABS) json_object_object_add(o, "encoding", json_object_new_string(ctl_encoding_name(m->enc)));
+	if (m->takeover != CTL_TO_JUMP) json_object_object_add(o, "takeover", json_object_new_string(ctl_takeover_name(m->takeover)));
+	if (m->has_step) json_object_object_add(o, "step", json_object_new_double(m->step));
+	if (m->accel != 1) json_object_object_add(o, "accel", json_object_new_double(m->accel));
+	if (m->bits != 14) json_object_object_add(o, "bits", json_object_new_int(m->bits));
+	if (m->feedback) json_object_object_add(o, "feedback", json_object_new_boolean(1));
+	if (m->gesture_auto) json_object_object_add(o, "gesture", json_object_new_string("auto"));
+	if (strcmp(m->role, "all")) json_object_object_add(o, "role", json_object_new_string(m->role));
 	if (runtime) {
 		json_object_object_add(o, "sends", json_object_new_int64((int64_t)m->sends));
 		if (m->origin[0])
@@ -994,6 +1333,7 @@ static bool learn_input(const struct ctl_source *src)
 }
 
 /* ============================================================ inputs */
+static void nrpn_event(int channel, bool rpn, int param, enum ctl_nrpn_ev ev, int dv, uint64_t now);
 static void on_midi_event(void *data, uint64_t count)
 {
 	for (;;) {
@@ -1013,17 +1353,116 @@ static void on_midi_event(void *data, uint64_t count)
 			ctl_format_source(&src, s, sizeof(s));
 			VLOG("midi %s %.4f (cycle t=%" PRIu64 ", main t=%" PRIu64 ")\n", s, v, e.ns, now_ns());
 		}
-		/* only note-ons and controller moves are learned */
-		if (!(src.kind == CTL_SRC_NOTE && v == 0) && learn_input(&src))
+		uint64_t now = now_ns();
+		bool nrpn_cc = false;
+		if (src.kind == CTL_SRC_CC) {
+			int cc = src.number, val = e.data[2] & 0x7f;
+			bool rpn;
+			int prm, dv;
+			enum ctl_nrpn_ev ev = ctl_nrpn_feed(&D.nrpn, src.channel - 1, cc, val, &rpn, &prm, &dv);
+			nrpn_cc = cc == 6 || cc == 38 || (cc >= 96 && cc <= 101);
+			if (ev != CTL_NRPN_NONE)
+				nrpn_event(src.channel, rpn, prm, ev, dv, now);
+			/* 14-bit pairs: CC n (MSB) with n+32 (LSB) */
+			for (int i = 0; i < MAX_MAPPINGS; i++) {
+				struct mapping *m = &D.maps[i];
+				if (!m->used || m->src.kind != CTL_SRC_CC14 || (m->src.channel && m->src.channel != src.channel))
+					continue;
+				int part = cc == m->src.number ? 0 : cc == m->src.number + 32 ? 1 : -1;
+				double n;
+				if (part < 0)
+					continue;
+				if (ctl_hires_feed(&m->hires, part, val, now, &n))
+					mapping_abs(m, n);
+				else if (m->hires.pending)
+					tick_arm();
+			}
+		}
+		/* only note-ons and controller moves are learned (NRPN through nrpn_event) */
+		if (!(src.kind == CTL_SRC_NOTE && v == 0) && !nrpn_cc && learn_input(&src))
 			continue;
-		for (int i = 0; i < MAX_MAPPINGS; i++)
-			if (D.maps[i].used && D.maps[i].src.kind != CTL_SRC_OSC && ctl_source_matches(&D.maps[i].src, &src))
-				mapping_input(&D.maps[i], v, false);
+		for (int i = 0; i < MAX_MAPPINGS; i++) {
+			struct mapping *m = &D.maps[i];
+			if (!m->used || m->src.kind == CTL_SRC_OSC || !ctl_source_matches(&m->src, &src))
+				continue;
+			if (m->src.kind == CTL_SRC_CC && enc_relative(m->enc))
+				mapping_rel(m, ctl_rel_ticks(m->enc, e.data[2]));
+			else
+				mapping_abs(m, v);
+		}
 	}
+}
+
+/* An NRPN/RPN data entry or increment on a channel (1-16). */
+static void nrpn_event(int channel, bool rpn, int param, enum ctl_nrpn_ev ev, int dv, uint64_t now)
+{
+	struct ctl_source src = { .kind = rpn ? CTL_SRC_RPN : CTL_SRC_NRPN, .channel = channel, .number = param };
+	if (ev == CTL_NRPN_DATA_MSB || ev == CTL_NRPN_INC || ev == CTL_NRPN_DEC)
+		if (learn_input(&src))
+			return;
+	for (int i = 0; i < MAX_MAPPINGS; i++) {
+		struct mapping *m = &D.maps[i];
+		if (!m->used || !ctl_source_matches(&m->src, &src))
+			continue;
+		if (ev == CTL_NRPN_INC || ev == CTL_NRPN_DEC) {
+			mapping_rel(m, ev == CTL_NRPN_INC ? dv : -dv);
+		} else if (enc_relative(m->enc)) {
+			if (ev == CTL_NRPN_DATA_MSB)
+				mapping_rel(m, ctl_rel_ticks(m->enc, dv));
+		} else if (m->enc == CTL_ENC_REL_INCDEC) {
+			/* data entry on an inc/dec mapping: ignored */
+		} else if (m->bits == 7) {
+			if (ev == CTL_NRPN_DATA_MSB)
+				mapping_abs(m, dv / 127.0);
+		} else {
+			double n;
+			if (ctl_hires_feed(&m->hires, ev == CTL_NRPN_DATA_MSB ? 0 : 1, dv, now, &n))
+				mapping_abs(m, n);
+			else if (m->hires.pending)
+				tick_arm();
+		}
+	}
+}
+
+struct osc_ctx {
+	struct listener *l;
+	struct conn *c;
+	struct sockaddr_storage peer;
+	socklen_t plen;
+};
+
+static void peer_label(const struct sockaddr_storage *ss, bool tcp, char *out, size_t n)
+{
+	char a[INET6_ADDRSTRLEN] = "?";
+	uint16_t port = 0;
+	if (ss->ss_family == AF_INET) {
+		inet_ntop(AF_INET, &((const struct sockaddr_in *)ss)->sin_addr, a, sizeof(a));
+		port = ntohs(((const struct sockaddr_in *)ss)->sin_port);
+	} else if (ss->ss_family == AF_INET6) {
+		inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)ss)->sin6_addr, a, sizeof(a));
+		port = ntohs(((const struct sockaddr_in6 *)ss)->sin6_port);
+	}
+	snprintf(out, n, "osc:%s:%s:%u", tcp ? "tcp" : "udp", a, port);
 }
 
 static void osc_dispatch(void *data, const struct osc_msg *msg)
 {
+	struct osc_ctx *ctx = data;
+	if (ctx && ctx->l->spec.params[0]) {
+		struct pd_peer pp;
+		memset(&pp, 0, sizeof(pp));
+		pp.listener = (int)(ctx->l - D.lis);
+		pp.conn = ctx->c;
+		pp.tcp = ctx->c != NULL;
+		pp.addr = ctx->peer;
+		pp.alen = ctx->plen;
+		snprintf(pp.role, sizeof(pp.role), "%s", ctx->l->spec.params);
+		peer_label(&ctx->peer, pp.tcp, pp.label, sizeof(pp.label));
+		if (pd_osc(&pp, msg)) {
+			D.received++;
+			return;
+		}
+	}
 	struct ctl_source src;
 	memset(&src, 0, sizeof(src));
 	src.kind = CTL_SRC_OSC;
@@ -1040,8 +1479,12 @@ static void osc_dispatch(void *data, const struct osc_msg *msg)
 		return;
 	for (int i = 0; i < MAX_MAPPINGS; i++) {
 		struct mapping *m = &D.maps[i];
-		if (m->used && m->src.kind == CTL_SRC_OSC && !strcmp(m->src.address, src.address))
-			mapping_input(m, impulse ? 1 : ctl_normalize(x, m->in_min, m->in_max), impulse);
+		if (!m->used || m->src.kind != CTL_SRC_OSC || strcmp(m->src.address, src.address))
+			continue;
+		if (impulse)
+			mapping_input(m, 1, true);
+		else
+			mapping_abs(m, ctl_normalize(x, m->in_min, m->in_max));
 	}
 }
 
@@ -1111,7 +1554,8 @@ static void on_udp(void *data, int fd, uint32_t mask)
 			reject("packet over max-size", &ss);
 			continue;
 		}
-		if (osc_parse(l->udp_buf, (size_t)n, osc_dispatch, NULL) < 0) {
+		struct osc_ctx x = { l, NULL, ss, sl };
+		if (osc_parse(l->udp_buf, (size_t)n, osc_dispatch, &x) < 0) {
 			D.malformed++;
 			reject("malformed OSC", &ss);
 		}
@@ -1121,6 +1565,7 @@ static void on_udp(void *data, int fd, uint32_t mask)
 static void conn_close(struct conn *c)
 {
 	struct listener *l = c->l;
+	pd_peer_gone((int)(l - D.lis), c);
 	pw_loop_destroy_source(D.l, c->src);
 	close(c->fd);
 	free(c->buf);
@@ -1134,8 +1579,8 @@ static void conn_close(struct conn *c)
 
 static void tcp_send(struct conn *c, const uint8_t *pkt, size_t n)
 {
-	uint8_t frame[4 + 512];
-	if (n > 512)
+	uint8_t frame[4 + 8192];
+	if (n > 8192)
 		return;
 	frame[0] = (uint8_t)(n >> 24); frame[1] = (uint8_t)(n >> 16); frame[2] = (uint8_t)(n >> 8); frame[3] = (uint8_t)n;
 	memcpy(frame + 4, pkt, n);
@@ -1197,7 +1642,8 @@ static bool tcp_packet(struct conn *c, const uint8_t *pkt, size_t n)
 		conn_close(c);
 		return false;
 	}
-	osc_parse(pkt, n, osc_dispatch, NULL);
+	struct osc_ctx x = { l, c, c->peer, sizeof(c->peer) };
+	osc_parse(pkt, n, osc_dispatch, &x);
 	return true;
 }
 
@@ -1272,10 +1718,28 @@ static void on_tcp_accept(void *data, int fd, uint32_t mask)
 	}
 }
 
+/* Params1 replies and subscriptions (paramsd.c) go out here. */
+static void pd_send(void *data, const struct pd_peer *p, const uint8_t *pkt, size_t n)
+{
+	if (p->listener < 0 || p->listener >= MAX_LISTENERS || !D.lis[p->listener].used)
+		return;
+	struct listener *l = &D.lis[p->listener];
+	if (p->tcp) {
+		for (int i = 0; i < l->n_conns; i++)
+			if (l->conns[i] == p->conn && l->conns[i]->authed) {
+				tcp_send(l->conns[i], pkt, n);
+				return;
+			}
+		return;
+	}
+	(void)!sendto(l->fd, pkt, n, MSG_DONTWAIT | MSG_NOSIGNAL, (const struct sockaddr *)&p->addr, p->alen);
+}
+
 static void listener_close(struct listener *l)
 {
 	while (l->n_conns)
 		conn_close(l->conns[0]);
+	pd_peer_gone((int)(l - D.lis), NULL);
 	if (l->src)
 		pw_loop_destroy_source(D.l, l->src);
 	if (l->fd > 0)
@@ -1344,7 +1808,8 @@ static struct listener *listener_open(const struct ctl_listen_spec *spec, const 
 		l->udp_buf = malloc(spec->max_size + 1);
 		l->src = pw_loop_add_io(D.l, fd, SPA_IO_IN, false, on_udp, l);
 	}
-	LOG("listening on %s%s%s\n", l->id, loopback ? " (loopback)" : "", l->spec.secret[0] ? ", secret required" : "");
+	LOG("listening on %s%s%s%s%s\n", l->id, loopback ? " (loopback)" : "", l->spec.secret[0] ? ", secret required" : "",
+	    l->spec.params[0] ? ", Params1 as " : "", l->spec.params);
 	props_changed("Listeners", NULL);
 	return l;
 }
@@ -1389,6 +1854,14 @@ static int spec_from_json(json_object *o, struct ctl_listen_spec *s, char *err, 
 		else if (!strcmp(key, "max-rate")) s->max_rate = (uint32_t)json_object_get_int64(val);
 		else if (!strcmp(key, "max-clients")) s->max_clients = (uint32_t)json_object_get_int64(val);
 		else if (!strcmp(key, "max-size")) s->max_size = (uint32_t)json_object_get_int64(val);
+		else if (!strcmp(key, "params")) {
+			const char *r = json_object_get_string(val);
+			if (!r || (strcmp(r, "all") && strcmp(r, "read-only") && !prm_role_name_valid(r))) {
+				snprintf(err, n, "params is a role: all, read-only, or a role the program defined");
+				return -1;
+			}
+			snprintf(s->params, sizeof(s->params), "%s", r);
+		}
 		else { snprintf(err, n, "unknown listener key '%s'", key); return -1; }
 	}
 	return 0;
@@ -1425,6 +1898,8 @@ static json_object *spec_to_json(const struct listener *l, bool with_secret)
 	if (s->tcp)
 		json_object_object_add(o, "max-clients", json_object_new_int64(s->max_clients));
 	json_object_object_add(o, "max-size", json_object_new_int64(s->max_size));
+	if (s->params[0])
+		json_object_object_add(o, "params", json_object_new_string(s->params));
 	return o;
 }
 
@@ -1444,10 +1919,30 @@ static int follow_port(void *data, const struct bl_port *p)
 	return 0;
 }
 
+/* MIDI out: link controld's midi_out to every MIDI input port (a device's
+ * playback side) that matches the out regex. */
+static int out_follow_port(void *data, const struct bl_port *p)
+{
+	if (!D.out_on || D.midi_out_port_id == SPA_ID_INVALID || !p->midi || p->output || p->node_id == D.node_id)
+		return 0;
+	char hay[700];
+	snprintf(hay, sizeof(hay), "%s:%s | %s", p->node_name, p->name, p->alias);
+	if (regexec(&D.out_re, hay, 0, NULL, 0) == 0 && !bl_graph_is_linked(D.graph, D.midi_out_port_id, p->id)) {
+		LOG("midi-out: linking to %s\n", hay);
+		bl_graph_link(D.graph, D.midi_out_port_id, p->id);
+		if (D.n_out_linked < 64)
+			D.out_linked[D.n_out_linked++] = p->id;
+	}
+	return 0;
+}
+
 static int find_own_port(void *data, const struct bl_port *p)
 {
-	if (D.node_id != SPA_ID_INVALID && p->node_id == D.node_id && !p->output && p->midi) {
-		D.midi_port_id = p->id;
+	if (D.node_id != SPA_ID_INVALID && p->node_id == D.node_id && p->midi) {
+		if (!p->output)
+			D.midi_port_id = p->id;
+		else
+			D.midi_out_port_id = p->id;
 		return 1;
 	}
 	return 0;
@@ -1455,17 +1950,26 @@ static int find_own_port(void *data, const struct bl_port *p)
 
 static void on_port_added(void *data, const struct bl_port *p)
 {
-	if (D.midi_port_id == SPA_ID_INVALID && find_own_port(NULL, p)) {
+	if ((D.midi_port_id == SPA_ID_INVALID || D.midi_out_port_id == SPA_ID_INVALID) && find_own_port(NULL, p)) {
 		bl_graph_for_each_port(D.graph, follow_port, NULL);
+		bl_graph_for_each_port(D.graph, out_follow_port, NULL);
 		return;
 	}
 	follow_port(NULL, p);
+	out_follow_port(NULL, p);
 }
 
 static void on_port_removed(void *data, uint32_t id)
 {
 	if (id == D.midi_port_id)
 		D.midi_port_id = SPA_ID_INVALID;
+	if (id == D.midi_out_port_id)
+		D.midi_out_port_id = SPA_ID_INVALID;
+	for (int i = 0; i < D.n_out_linked; i++)
+		if (D.out_linked[i] == id) {
+			D.out_linked[i] = D.out_linked[--D.n_out_linked];
+			break;
+		}
 	for (int i = 0; i < D.n_followed; i++)
 		if (D.followed[i] == id) {
 			D.followed[i] = D.followed[--D.n_followed];
@@ -1502,6 +2006,32 @@ static int set_follow(const char *re, char *err, size_t n)
 		bl_graph_for_each_port(D.graph, follow_port, NULL);
 	}
 	props_changed("MidiFollow", NULL);
+	return 0;
+}
+
+static int set_out_follow(const char *re, char *err, size_t n)
+{
+	regex_t nr;
+	if (re && *re) {
+		int r = regcomp(&nr, re, REG_EXTENDED | REG_ICASE | REG_NOSUB);
+		if (r) {
+			regerror(r, &nr, err, n);
+			return -1;
+		}
+	}
+	for (int i = 0; i < D.n_out_linked; i++)
+		if (D.midi_out_port_id != SPA_ID_INVALID)
+			bl_graph_unlink(D.graph, D.midi_out_port_id, D.out_linked[i]);
+	D.n_out_linked = 0;
+	if (D.out_on)
+		regfree(&D.out_re);
+	D.out_on = re && *re;
+	snprintf(D.out_follow, sizeof(D.out_follow), "%s", re ? re : "");
+	if (D.out_on) {
+		D.out_re = nr;
+		bl_graph_for_each_port(D.graph, out_follow_port, NULL);
+	}
+	props_changed("MidiOut", NULL);
 	return 0;
 }
 
@@ -1557,6 +2087,9 @@ static void load_file(const char *path, const char *base)
 	if (json_object_object_get_ex(j, "midi-follow", &v) && json_object_get_string(v)[0] && !D.follow_on)
 		if (set_follow(json_object_get_string(v), err, sizeof(err)) < 0)
 			LOG("%s: midi-follow: %s\n", path, err);
+	if (json_object_object_get_ex(j, "midi-out", &v) && json_object_get_string(v)[0] && !D.out_on)
+		if (set_out_follow(json_object_get_string(v), err, sizeof(err)) < 0)
+			LOG("%s: midi-out: %s\n", path, err);
 	json_object_put(j);
 	LOG("loaded %s\n", path);
 }
@@ -1601,6 +2134,8 @@ static int save_config(char *path_out, size_t n, char *err, size_t en)
 	json_object_object_add(o, "schema", json_object_new_string(SCHEMA));
 	if (D.follow_on)
 		json_object_object_add(o, "midi-follow", json_object_new_string(D.follow));
+	if (D.out_on)
+		json_object_object_add(o, "midi-out", json_object_new_string(D.out_follow));
 	json_object *ls = json_object_new_array();
 	for (int i = 0; i < MAX_LISTENERS; i++)
 		if (D.lis[i].used && (!D.lis[i].origin[0] || !strcmp(D.lis[i].origin, "control.json")))
@@ -1684,6 +2219,41 @@ static int read_options(sd_bus_message *m, struct mapping *t, char *learn_from, 
 					snprintf(t->args[t->nargs++], sizeof(t->args[0]), "%s", s);
 			sd_bus_message_exit_container(m);
 			sd_bus_message_exit_container(m);
+		} else if (!strcmp(key, "encoding") || !strcmp(key, "takeover") || !strcmp(key, "gesture") || !strcmp(key, "role")) {
+			const char *sv;
+			if (!sig || strcmp(sig, "s"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s is a string (s)", key);
+			sd_bus_message_read(m, "v", "s", &sv);
+			if (!strcmp(key, "encoding") && ctl_parse_encoding(sv, &t->enc) < 0)
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "encoding is abs, rel-2c, rel-sm, rel-offset or rel-inc-dec");
+			if (!strcmp(key, "takeover") && ctl_parse_takeover(sv, &t->takeover) < 0)
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "takeover is jump, pickup or scale");
+			if (!strcmp(key, "gesture")) {
+				if (strcmp(sv, "auto") && strcmp(sv, "none"))
+					return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "gesture is auto or none");
+				t->gesture_auto = !strcmp(sv, "auto");
+			}
+			if (!strcmp(key, "role"))
+				snprintf(t->role, sizeof(t->role), "%s", sv);
+		} else if (!strcmp(key, "step") || !strcmp(key, "accel")) {
+			double d;
+			if (!sig || strcmp(sig, "d"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s is a double (d)", key);
+			sd_bus_message_read(m, "v", "d", &d);
+			if (key[0] == 's') { t->step = d; t->has_step = true; }
+			else t->accel = d;
+		} else if (!strcmp(key, "feedback")) {
+			int b;
+			if (!sig || strcmp(sig, "b"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "feedback is a boolean (b)");
+			sd_bus_message_read(m, "v", "b", &b);
+			t->feedback = b;
+		} else if (!strcmp(key, "bits")) {
+			uint32_t u;
+			if (!sig || strcmp(sig, "u"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "bits is a number (u)");
+			sd_bus_message_read(m, "v", "u", &u);
+			t->bits = (int)u;
 		} else if (learn_from && !strcmp(key, "from")) {
 			const char *s;
 			if (!sig || strcmp(sig, "s"))
@@ -1777,6 +2347,7 @@ static int m_mappings(sd_bus_message *m, void *ud, sd_bus_error *err)
 			json_object_array_add(ls, spec_to_json(&D.lis[i], false));
 	json_object_object_add(o, "listeners", ls);
 	json_object_object_add(o, "midi-follow", json_object_new_string(D.follow));
+	json_object_object_add(o, "midi-out", json_object_new_string(D.out_follow));
 	int r = sd_bus_reply_method_return(m, "s", json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
 	json_object_put(o);
 	return r;
@@ -1878,6 +2449,15 @@ static int m_listen(sd_bus_message *m, void *ud, sd_bus_error *err)
 				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "insecure-udp is a boolean (b)");
 			sd_bus_message_read(m, "v", "b", &b);
 			s.insecure_udp = b;
+		} else if (!strcmp(key, "params")) {
+			const char *v;
+			if (!sig || strcmp(sig, "s"))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "params is a string (s)");
+			sd_bus_message_read(m, "v", "s", &v);
+			if (strcmp(v, "all") && strcmp(v, "read-only") && !prm_role_name_valid(v))
+				return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+							 "params is a role: all, read-only, or a role the program defined");
+			snprintf(s.params, sizeof(s.params), "%s", v);
 		} else if (!strcmp(key, "max-rate") || !strcmp(key, "max-clients") || !strcmp(key, "max-size")) {
 			uint32_t u;
 			if (!sig || strcmp(sig, "u"))
@@ -1938,6 +2518,18 @@ static int m_set_follow(sd_bus_message *m, void *ud, sd_bus_error *err)
 	return sd_bus_reply_method_return(m, "");
 }
 
+static int m_set_out(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *re;
+	int r = sd_bus_message_read(m, "s", &re);
+	if (r < 0)
+		return r;
+	char e[300];
+	if (set_out_follow(re, e, sizeof(e)) < 0)
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "bad regular expression: %s", e);
+	return sd_bus_reply_method_return(m, "");
+}
+
 static int p_str(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply, void *ud,
 		 sd_bus_error *err)
 {
@@ -1945,6 +2537,8 @@ static int p_str(sd_bus *bus, const char *path, const char *iface, const char *p
 		return sd_bus_message_append(reply, "s", D.learning ? D.learn_target : "");
 	if (!strcmp(prop, "MidiFollow"))
 		return sd_bus_message_append(reply, "s", D.follow);
+	if (!strcmp(prop, "MidiOut"))
+		return sd_bus_message_append(reply, "s", D.out_follow);
 	if (!strcmp(prop, "Node"))
 		return sd_bus_message_append(reply, "s", D.node_name);
 	if (!strcmp(prop, "ConfigDir"))
@@ -1966,6 +2560,7 @@ static int p_num(sd_bus *bus, const char *path, const char *iface, const char *p
 	else if (!strcmp(prop, "Dispatched")) v = D.dispatched;
 	else if (!strcmp(prop, "TargetErrors")) v = D.target_errors;
 	else if (!strcmp(prop, "MidiDropped")) v = atomic_load(&D.midi_dropped);
+	else if (!strcmp(prop, "MidiSent")) v = D.midi_sent;
 	return sd_bus_message_append(reply, "t", v);
 }
 
@@ -1991,10 +2586,13 @@ static const sd_bus_vtable vtable[] = {
 	SD_BUS_METHOD_WITH_ARGS("Unlisten", SD_BUS_ARGS("s", id), SD_BUS_NO_RESULT, m_unlisten, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("SetMidiFollow", SD_BUS_ARGS("s", regex), SD_BUS_NO_RESULT, m_set_follow, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Save", SD_BUS_NO_ARGS, SD_BUS_RESULT("s", path), m_save, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("SetMidiOut", SD_BUS_ARGS("s", regex), SD_BUS_NO_RESULT, m_set_out, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_PROPERTY("MappingCount", "u", p_num, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("Listeners", "as", p_listeners, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("Learning", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("MidiFollow", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+	SD_BUS_PROPERTY("MidiOut", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+	SD_BUS_PROPERTY("MidiSent", "t", p_num, 0, 0),
 	SD_BUS_PROPERTY("Node", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_CONST),
 	SD_BUS_PROPERTY("ConfigDir", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_CONST),
 	SD_BUS_PROPERTY("Received", "t", p_num, 0, 0),
@@ -2033,7 +2631,8 @@ static void on_house(void *data, uint64_t exp)
 			}
 		}
 	}
-	bool busy = n_mappings() || n_listeners() || D.learning || D.follow_on;
+	pd_house(now);
+	bool busy = n_mappings() || n_listeners() || D.learning || D.follow_on || D.out_on || pd_busy();
 	if (busy || !D.idle_exit) {
 		D.idle_since = 0;
 	} else if (!D.idle_since) {
@@ -2092,7 +2691,7 @@ int main(int argc, char **argv)
 		}
 	}
 	default_config_dir();
-	D.node_id = D.midi_port_id = SPA_ID_INVALID;
+	D.node_id = D.midi_port_id = D.midi_out_port_id = SPA_ID_INVALID;
 
 	pw_init(&argc, &argv);
 	D.loop = pw_main_loop_new(NULL);
@@ -2121,6 +2720,16 @@ int main(int argc, char **argv)
 	D.midi_port = pw_filter_add_port(D.filter, PW_DIRECTION_INPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, 0,
 					 pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi", PW_KEY_PORT_NAME, "midi_in", NULL),
 					 NULL, 0);
+	/* MIDI out: feedback to controllers (motor faders, LED rings), linked by
+	 * SetMidiOut. The process callback drains a ring the main loop fills. */
+	if (bl_midi_ring_init(&D.out_ring, 1 << 16) < 0) {
+		fprintf(stderr, "backline-controld: out of memory\n");
+		return 1;
+	}
+	D.midi_out_port = pw_filter_add_port(D.filter, PW_DIRECTION_OUTPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, 0,
+					     pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi", PW_KEY_PORT_NAME, "midi_out", NULL),
+					     NULL, 0);
+	ctl_nrpn_init(&D.nrpn);
 	if (pw_filter_connect(D.filter, PW_FILTER_FLAG_RT_PROCESS, NULL, 0) < 0) {
 		fprintf(stderr, "backline-controld: pw_filter_connect failed\n");
 		return 1;
@@ -2136,6 +2745,13 @@ int main(int argc, char **argv)
 		fprintf(stderr, "backline-controld: %s\n", strerror(-r));
 		return 1;
 	}
+	struct pd_hooks ph = { .osc_send = pd_send, .changed = on_param_changed };
+	r = pd_init(D.bus, D.l, &ph, D.verbose);
+	if (r < 0) {
+		fprintf(stderr, "backline-controld: Params1: %s\n", strerror(-r));
+		return 1;
+	}
+	D.tick = pw_loop_add_timer(D.l, on_tick, NULL);
 	D.bus_io = pw_loop_add_io(D.l, sd_bus_get_fd(D.bus), SPA_IO_IN, false, on_bus_io, NULL);
 	D.learn_timer = pw_loop_add_timer(D.l, on_learn_timeout, NULL);
 	D.house_timer = pw_loop_add_timer(D.l, on_house, NULL);
@@ -2175,7 +2791,11 @@ int main(int argc, char **argv)
 			vnode_drop(&D.vnodes[i]);
 	if (D.follow_on)
 		regfree(&D.follow_re);
+	if (D.out_on)
+		regfree(&D.out_re);
+	pd_fini();
 	pw_filter_destroy(D.filter);
+	bl_midi_ring_free(&D.out_ring);
 	bl_graph_destroy(D.graph);
 	pw_proxy_destroy((struct pw_proxy *)D.registry);
 	sd_bus_flush_close_unref(D.bus);

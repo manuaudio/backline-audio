@@ -261,10 +261,12 @@ typedef struct bl_map_options {
 } bl_map_options;
 #define BL_MAP_OPTIONS_INIT { 0, 0, false, false, false, 0, 1, false, NULL, 0, NULL }
 
-/* source: midi:cc:CH:NUM, midi:note:CH:KEY, midi:pitchbend:CH,
- * midi:program:CH, osc:/ADDRESS. target: instance:NODE/PARAM,
+/* source: midi:cc:CH:NUM, midi:cc14:CH:MSB, midi:nrpn:CH:PARAM,
+ * midi:rpn:CH:PARAM, midi:note:CH:KEY, midi:pitchbend:CH, midi:program:CH,
+ * osc:/ADDRESS. target: instance:NODE/PARAM,
  * transport:play|stop|toggle|tempo|locate:POS, recorder:arm|record|stop|marker,
- * volume:NODE, mute:NODE, control:NODE/NAME. */
+ * volume:NODE, mute:NODE, control:NODE/NAME, param:PATH. The newer options
+ * (encoding, takeover, feedback, ...) go through bl_control_add_json. */
 int bl_control_map(bl_client *c, const char *source, const char *target, const bl_map_options *o, char *id, size_t n);
 int bl_control_add_json(bl_client *c, const char *json, char *id, size_t n);
 int bl_control_remove(bl_client *c, const char *id);
@@ -289,8 +291,14 @@ typedef struct bl_listen_options {
  * "udp:127.0.0.1:9000". */
 int bl_control_listen(bl_client *c, const char *proto, const char *address, uint16_t port, const bl_listen_options *o,
 		      char *id, size_t n);
+/* The same, also serving Params1 over OSC to its peers in params_role
+ * ("all", "read-only" or a role the program defined; NULL: not served). */
+int bl_control_listen_params(bl_client *c, const char *proto, const char *address, uint16_t port,
+			     const bl_listen_options *o, const char *params_role, char *id, size_t n);
 int bl_control_unlisten(bl_client *c, const char *id);
 int bl_control_set_midi_follow(bl_client *c, const char *regex);
+/* Link controld's MIDI output (feedback) to matching MIDI inputs ('' = none). */
+int bl_control_set_midi_out(bl_client *c, const char *regex);
 int bl_control_save(bl_client *c, char *path, size_t n);
 
 typedef struct bl_control_status {
