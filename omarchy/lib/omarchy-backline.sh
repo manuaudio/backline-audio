@@ -153,3 +153,27 @@ bl_recall() {
     echo "${2:-null}"
   fi
 }
+
+# bl_shell_has_panels: this Omarchy's shell has what Backline's bar panels are
+# built on (the Quattro shell: ShellIpc, Ui FilterInput, Commons I18n and
+# Translations). Omarchy 4.0.4's shell has none of them, and the panels won't
+# load there. BACKLINE_PANELS=yes|no overrides the check.
+bl_shell_has_panels() {
+  case ${BACKLINE_PANELS:-} in
+    yes) return 0 ;;
+    no) return 1 ;;
+  esac
+  local shell=${OMARCHY_PATH:-/usr/share/omarchy}/shell name
+  [[ -d $shell ]] || return 1
+  for name in ShellIpc FilterInput I18n Translations; do
+    [[ -n $(find "$shell" -name "$name.qml" -print -quit 2>/dev/null) ]] ||
+      grep -rqsw --include=qmldir --include='*.qml' --include='*.js' -e "$name" "$shell" || return 1
+  done
+}
+
+# bl_panels_available: the panels can open here, now: the shell can load them
+# and the bar plugin is installed.
+bl_panels_available() {
+  bl_shell_has_panels &&
+    [[ ${BACKLINE_PANELS:-} == yes || -f ${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/io.github.manuaudio.backline/manifest.json ]]
+}
