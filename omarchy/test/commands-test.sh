@@ -154,3 +154,18 @@ mkdir -p "$scratch/catalogs-root" && ln -s "$catalogs" "$scratch/catalogs-root/i
 [[ $(lookup record.busy) == "Stop the take first" ]] || fail "then English"
 [[ $(lookup no.such.key) == "no.such.key" ]] || fail "then the key"
 pass "notifications follow the Omarchy language: pt-BR, then pt, then English, with placeholders"
+
+# ---------------------------------------------------------------- --help
+# Every command answers -h/--help with its usage, and does nothing else: no
+# instrument named "--help", no bus call, no notification, no window.
+for command in "$ROOT"/bin/omarchy-backline-*; do
+  name=$(basename "$command")
+  for flag in --help -h; do
+    : >"$LOG"
+    out=$(RUNNING="Host Recorder Clock Registry" BACKLINE_MIXER=false "$command" "$flag" 2>&1) ||
+      fail "$name $flag exits 0" "$out"
+    [[ $out == "Usage: $name"* ]] || fail "$name $flag prints its usage" "$out"
+    [[ ! -s $LOG ]] || fail "$name $flag does nothing else" "$(cat "$LOG")"
+  done
+done
+pass "every command: -h and --help print the usage and do nothing else"

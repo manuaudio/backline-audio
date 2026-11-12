@@ -12,6 +12,7 @@
 
 set -uo pipefail
 source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+bl_help "$@"
 
 id=${1:-}
 match=${2:-}

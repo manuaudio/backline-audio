@@ -12,6 +12,7 @@
 
 set -uo pipefail
 source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+bl_help "$@"
 
 busctl --user monitor --json=short \
   --match "type='signal',path_namespace='$BL_PATH'" 2>/dev/null |

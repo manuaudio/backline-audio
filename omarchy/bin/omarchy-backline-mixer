@@ -8,6 +8,8 @@
 # so a second press focuses the open window instead of starting another.
 
 set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+bl_help "$@"
 
 mixer=${BACKLINE_MIXER:-backline-mixer}
 

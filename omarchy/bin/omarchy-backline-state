@@ -11,6 +11,7 @@
 
 set -uo pipefail
 source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+bl_help "$@"
 
 plugins_index() {
   bl_backline --json plugins list 2>/dev/null | jq -c '.plugins // []' || echo '[]'

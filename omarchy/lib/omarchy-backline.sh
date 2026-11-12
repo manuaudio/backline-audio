@@ -97,6 +97,23 @@ bl_midi_inputs() {
     | [{label: "", match: $all, all: true}] + .' --arg all "${BACKLINE_MIDI_ALL_MATCH:-^(?!Midi-Bridge:Midi Through)}" --arg filter "${BACKLINE_MIDI_FILTER:-}"
 }
 
+# bl_help "$@": when the first argument is -h or --help, print the calling
+# command's usage (its omarchy:summary, omarchy:args and omarchy:examples
+# lines) and exit, before the argument can be taken for a name or an action.
+bl_help() {
+  [[ ${1:-} == -h || ${1:-} == --help ]] || return 0
+  local self name summary args examples
+  self=$(readlink -f -- "$0")
+  name=$(basename -- "$0")
+  summary=$(sed -n 's/^# omarchy:summary=//p' "$self" | head -n1)
+  args=$(sed -n 's/^# omarchy:args=//p' "$self" | head -n1)
+  examples=$(sed -n 's/^# omarchy:examples=//p' "$self" | head -n1)
+  echo "Usage: $name${args:+ $args}"
+  [[ -n $summary ]] && echo "$summary"
+  [[ -n $examples ]] && echo "Examples: ${examples// | /; }"
+  exit 0
+}
+
 BL_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 # bl_t KEY [ARGS...]: one notification or prompt string in the language picked
