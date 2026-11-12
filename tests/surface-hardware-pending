@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# The surface layer on real hardware: pending until a device is on the bench.
+# ctest reports this test as skipped (exit 77). The checklist to run by hand
+# is docs/HARDWARE-TEST.md; everything that can be checked without hardware
+# is in tests/unit/test_surface.c and tests/surfaced-proof.
+echo "pending: no real control surface tested yet (see docs/HARDWARE-TEST.md)"
+exit 77

@@ -1,0 +1,30 @@
+{
+  "schema": "backline.surface/1",
+  "id": "mackie-mcu-xt",
+  "name": "Mackie MCU XT Pro",
+  "comment": "Port names, the serial in the device-query answer, the output pace and the printed labels are not verified on hardware yet: see docs/HARDWARE-TEST.md.",
+  "verified": false,
+  "driver": "mcu",
+  "unit": "extender",
+  "strips": 8,
+  "master-fader": false,
+  "model": 21,
+  "match": {
+    "port": [
+      "MCU ?XT",
+      "XT ?Pro",
+      "Mackie Control.*(XT|Extender)"
+    ]
+  },
+  "handshake": "mackie",
+  "display": {
+    "lcd": "2x56",
+    "colour": "none",
+    "assignment": false,
+    "timecode": false
+  },
+  "meters": "led",
+  "touch-sense": true,
+  "motor": true,
+  "bytes-per-second": 10000
+}

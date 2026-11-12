@@ -246,6 +246,13 @@ if(BACKLINE_CONTROL)
   add_subdirectory(control)
 endif()
 
+# Surface service: control surfaces (MCU family) for any program, through
+# Params1 and Surface1 (surface/, docs/api/Surface1.md).
+option(BACKLINE_SURFACE "Build the surface service (backline-surfaced)" ON)
+if(BACKLINE_SURFACE AND BACKLINE_CONTROL)
+  add_subdirectory(surface)
+endif()
+
 option(BACKLINE_REGISTRY "Build the plugin registry" ON)
 if(BACKLINE_REGISTRY)
   add_subdirectory(registry)
@@ -285,6 +292,9 @@ if(TARGET backline-playerd)
 endif()
 if(TARGET backline-controld)
   list(APPEND _svcs Control)
+endif()
+if(TARGET backline-surfaced)
+  list(APPEND _svcs Surface)
 endif()
 foreach(svc ${_svcs})
   configure_file(data/dbus/io.github.manuaudio.Backline.${svc}.service.in

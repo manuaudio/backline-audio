@@ -1,0 +1,7 @@
+# D-Bus activation for the Backline surface service (session bus).
+# Installed as /usr/share/dbus-1/services/io.github.manuaudio.Backline.Surface.service
+# with @bindir@ replaced (CMake does this at install time).
+# SPDX-License-Identifier: MIT
+[D-BUS Service]
+Name=io.github.manuaudio.Backline.Surface
+Exec=@bindir@/backline-surfaced

@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# surfaced-proof: the open control-surface layer, measured without hardware.
+#
+#  A. Isolation: a private PipeWire instance (its own socket, a dummy driver,
+#     no devices), a private D-Bus, an own network namespace. Manu's graph is
+#     checked before and after: nothing of this proof ever appears in it.
+#  B. Params1 over D-Bus: a stub mixer (tools/test-mixer.c) registers /mix
+#     with a meter table; List/Get; a Set reaches the mixer, which confirms
+#     with Update; refusals (an undefined role, read-only, a gesture on a
+#     parameter that isn't automatable).
+#  C. Params1 over OSC: get, set, /norm, /touch, subscriptions with echo,
+#     a rate-limited burst, meter streams, a read-only listener, errors.
+#  D. Control1's MIDI additions against a software generic controller:
+#     14-bit CC, NRPN, a relative encoder, soft takeover (pickup), automatic
+#     gestures, and feedback to the controller's MIDI input.
+#  E-R. backline-surfaced with two software devices (tools/mcu-sim.c: an
+#     X-Touch Extender and an X-Touch) as one 16-strip group: detection and
+#     handshake, names, colours, faders both ways with motor feedback, touch
+#     and gestures, banking, LEDs, meters, the 8 view layers, flip, pots,
+#     follow-selection with a strip pot mode, displays, hot-plug (unplugged
+#     while a fader is held), two groups and a locked view, a restart that
+#     restores the groups, and a clean shutdown (a 112-character LCD write
+#     through PipeWire).
+#
+# Real hardware is not used here: see docs/HARDWARE-TEST.md.
+set -euo pipefail
+if [[ -z ${BL_SURF_NS:-} ]]; then
+  BL_SURF_NS=1 exec unshare -rn bash -c 'ip link set lo up && exec dbus-run-session -- "$0" "$@"' "$0" "$@"
+fi
+here=$(cd "$(dirname "$0")" && pwd)
+BL_ROOT=$(cd "$here/.." && pwd)
+BL_BIN=${BL_BIN:-$BL_ROOT/build}
+out=$here/out/surfaced
+rm -rf "$out"; mkdir -p "$out/pw"
+exec > >(tee "$out/report.txt") 2>&1
+PIDS=()
+PASS=0; FAIL=0
+cleanup() {
+  for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || true; done
+  sleep 0.3
+  [[ -n ${PWPID:-} ]] && kill "$PWPID" 2>/dev/null || true
+  wait 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+export out
+check() { # description, then a command that must succeed
+  local d=$1; shift
+  if "$@" >/dev/null 2>&1; then PASS=$((PASS + 1)); echo "  PASS  $d"; else FAIL=$((FAIL + 1)); echo "  FAIL  $d"; fi
+}
+note() { echo "        $*"; }
+mono() { python3 -c 'import time; print(time.monotonic_ns())'; }
+
+# ---- the user's own graph: looked at, never touched
+real() { env -u PIPEWIRE_REMOTE -u PIPEWIRE_RUNTIME_DIR "$@"; }
+real_nodes() { real timeout 10 pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // ""' | sort; }
+
+echo "== surfaced-proof $(date -Is)"
+echo "pipewire $(pipewire --version | sed -n 's/.*libpipewire \(.*\)/\1/p' | tail -1), kernel $(uname -r), load $(cut -d' ' -f1-3 /proc/loadavg)"
+real_nodes >"$out/real-before.txt" || true
+echo "the user's graph: $(wc -l <"$out/real-before.txt") nodes (left alone)"
+
+########################################################################## A
+echo; echo "-- A. a private PipeWire instance"
+cat >"$out/pw.conf" <<'EOF'
+context.properties = { core.daemon = true core.name = pipewire-backline-surf default.clock.rate = 48000 default.clock.quantum = 256 mem.allow-mlock = false support.dbus = false }
+context.spa-libs = { support.* = support/libspa-support audio.convert.* = audioconvert/libspa-audioconvert }
+context.modules = [
+  { name = libpipewire-module-protocol-native }
+  { name = libpipewire-module-client-node }
+  { name = libpipewire-module-access args = { access.socket = { pipewire-backline-surf = "unrestricted" } } }
+  { name = libpipewire-module-adapter }
+  { name = libpipewire-module-link-factory }
+  { name = libpipewire-module-metadata }
+  { name = libpipewire-module-spa-node-factory }
+]
+context.objects = [
+  { factory = spa-node-factory args = { factory.name = support.node.driver node.name = backline-test.surf-driver node.group = backline-test.surf priority.driver = 200000 } }
+]
+EOF
+export PIPEWIRE_RUNTIME_DIR=$out/pw PIPEWIRE_REMOTE=pipewire-backline-surf
+pipewire -c "$out/pw.conf" >"$out/pipewire.log" 2>&1 &
+PWPID=$!
+for _ in $(seq 50); do timeout 2 pw-cli info 0 >/dev/null 2>&1 && break; sleep 0.1; done
+check "private PipeWire is up, with only its dummy driver" bash -c "[[ \$(timeout 5 pw-cli ls Node | grep -c 'node.name') == 1 ]]"
+
+C=(io.github.manuaudio.Backline.Control /io/github/manuaudio/Backline/Control io.github.manuaudio.Backline.Control1)
+P=(io.github.manuaudio.Backline.Control /io/github/manuaudio/Backline/Params io.github.manuaudio.Backline.Params1)
+S=(io.github.manuaudio.Backline.Surface /io/github/manuaudio/Backline/Surface io.github.manuaudio.Backline.Surface1)
+ctl() { busctl --user call -- "${C[@]}" "$@"; }
+prm() { busctl --user call -- "${P[@]}" "$@"; }
+srf() { busctl --user call -- "${S[@]}" "$@"; }
+srfj() { busctl --user --json=short call -- "${S[@]}" "$@"; }
+wait_name() { for _ in $(seq 100); do busctl --user status "$1" >/dev/null 2>&1 && return 0; sleep 0.05; done; return 1; }
+
+"$BL_BIN/control/backline-controld" --no-config --idle-exit 0 --name backline-test.surf-ctl --verbose 2>"$out/controld.log" &
+PIDS+=($!)
+wait_name io.github.manuaudio.Backline.Control
+
+mkfifo "$out/mixer.in"
+"$BL_BIN/surface/backline-test-mixer" --views --extra 64 --log "$out/mixer.jsonl" <"$out/mixer.in" >"$out/mixer.out" 2>&1 &
+PIDS+=($!)
+exec 7>"$out/mixer.in"
+mixer() { echo "$*" >&7; }
+for _ in $(seq 100); do grep -q registered "$out/mixer.out" 2>/dev/null && break; sleep 0.05; done
+mlog() { cat "$out/mixer.jsonl" 2>/dev/null || true; }
+mark() { wc -l <"$out/mixer.jsonl" 2>/dev/null || echo 0; }
+since() { tail -n +"$(($1 + 1))" "$out/mixer.jsonl"; }
+export -f mlog mark since
+
+########################################################################## B
+echo; echo "-- B. Params1 over D-Bus"
+check "the mixer registered /mix (24 channels and 64 extra: 285 parameters)" bash -c "busctl --user get-property ${P[*]} ParamCount | grep -q 'u 285'"
+check "List /mix/in.1/* returns its 9 parameters and the meter ids" bash -c "busctl --user --json=short call ${P[*]} List s '/mix/in.1/*' | jq -e '.data[0] | fromjson | (.params | length) == 9 and (.roots[0].meters | length) == 24 and .roots[0][\"meter-table\"]'"
+check "Get /mix/in.3/fader: -6 dB, text '-6.0 dB'" bash -c "prm() { busctl --user --json=short call ${P[*]} \"\$@\"; }; prm Get as 1 /mix/in.3/fader | jq -e '.data[0][0][1].data == -6 and .data[0][0][3] == \"-6.0 dB\"'"
+m=$(mark)
+prm Set 'sva{sv}' /mix/in.3/fader d -12 0 >/dev/null
+sleep 0.2
+check "Set reaches the mixer as a Set signal (role all) and it confirms with Update" bash -c "busctl --user --json=short call ${P[*]} Get as 1 /mix/in.3/fader | jq -e '.data[0][0][1].data == -12' && tail -n +$((m + 1)) $out/mixer.jsonl | grep -q '\"kind\":\"set\",\"path\":\"/mix/in.3/fader\"'"
+check "a Set in a role the program never defined is refused (read only)" bash -c "busctl --user call ${P[*]} Set 'sva{sv}' /mix/in.3/fader d 0 1 role s monitor 2>&1 | grep -q 'Access denied'"
+check "a Gesture on a parameter that isn't automatable is refused" bash -c "busctl --user call ${P[*]} Gesture 'sba{sv}' /mix/in.3/mute true 0 2>&1 | grep -q 'not automatable'"
+check "a Set of a string to a float is refused" bash -c "busctl --user call ${P[*]} Set 'sva{sv}' /mix/in.3/fader s loud 0 2>&1 | grep -qi 'not a value\|InvalidArgs'"
+check "a second program can't take /mix" bash -c "busctl --user call ${P[*]} Register ss /mix '{\"schema\":\"backline.params/1\"}' 2>&1 | grep -q 'registered by'"
+
+########################################################################## C
+echo; echo "-- C. Params1 over OSC"
+LALL=$(ctl Listen ssqa{sv} udp 127.0.0.1 0 1 params s all | sed 's/^s "\(.*\)"/\1/')
+LRO=$(ctl Listen ssqa{sv} udp 127.0.0.1 0 1 params s read-only | sed 's/^s "\(.*\)"/\1/')
+PALL=${LALL##*:}; PRO=${LRO##*:}
+note "listeners: $LALL (role all), $LRO (read-only); a third without params serves Control1 only"
+LNONE=$(ctl Listen ssqa{sv} udp 127.0.0.1 0 0 | sed 's/^s "\(.*\)"/\1/'); PNONE=${LNONE##*:}
+osc() { python3 -I "$here/oscparams.py" "$@"; }
+osc udp 127.0.0.1 "$PALL" --wait 0.3 /mix/in.1/fader "/backline/get /mix/in.2/*" >"$out/osc-get.json"
+check "get: /mix/in.1/fader replies 'f -2.0 s \"-2.0 dB\"'" jq -e '[.replies[] | select(.addr=="/mix/in.1/fader")][0].args == [-2.0, "-2.0 dB"]' "$out/osc-get.json"
+check "/backline/get /mix/in.2/* replies with its 9 parameters" jq -e '[.replies[] | select(.addr | startswith("/mix/in.2/"))] | length == 9' "$out/osc-get.json"
+m=$(mark)
+osc udp 127.0.0.1 "$PALL" --wait 0.5 "/backline/sub /mix/in.4/fader" "/mix/in.4/fader -20.0" "sleep 0.2" "/mix/in.4/fader/norm 0.75" >"$out/osc-sub.json"
+check "sub: the current value at once, then the echo of each set once the mixer confirms" \
+  jq -e '[.replies[] | select(.addr=="/mix/in.4/fader") | .args[0]] | (.[0] == -8 and (index(-20) != null) and (.[-1] | fabs) < 0.001)' "$out/osc-sub.json"
+check "the sets reached the mixer as osc:udp:127.0.0.1:* in role all" bash -c "since $m | grep -q '\"path\":\"/mix/in.4/fader\".*\"client\":\"osc:udp:127.0.0.1:[0-9]*\",\"role\":\"all\"'"
+echo_ms=$(jq -r '((.replies[] | select(.addr=="/mix/in.4/fader" and .args[0]==-20)) .t) as $r | ($r - .sent_t[1]) / 1e6' "$out/osc-sub.json" | head -1)
+note "OSC set -> mixer -> Update -> echo to the subscriber: ${echo_ms} ms"
+m=$(mark)
+osc udp 127.0.0.1 "$PALL" --wait 0.3 "/mix/in.5/fader/touch 1" "/mix/in.5/fader -3.0" "/mix/in.5/fader/touch 0" >/dev/null
+check "/touch 1 and 0 reach the mixer as Gesture begin and end" bash -c "since $m | grep -q 'gesture-begin.*in.5/fader' && since $m | grep -q 'gesture-end.*in.5/fader'"
+osc udp 127.0.0.1 "$PRO" --wait 0.3 "/mix/in.6/fader 0.0" /mix/in.6/fader >"$out/osc-ro.json"
+check "a read-only listener: the set is refused with /backline/error, a get still works" \
+  jq -e '([.replies[] | select(.addr=="/backline/error")] | length) == 1 and ([.replies[] | select(.addr=="/mix/in.6/fader")] | length) == 1' "$out/osc-ro.json"
+osc udp 127.0.0.1 "$PALL" --wait 0.3 "/mix/in.99/fader 0.0" "/mix/in.1/name/text" >"$out/osc-err.json"
+check "an unknown path under a registered root gets /backline/error" jq -e '[.replies[] | select(.addr=="/backline/error")] | length >= 1' "$out/osc-err.json"
+osc udp 127.0.0.1 "$PALL" --wait 0.5 "/backline/get /mix/**" >"$out/osc-all.json"
+check "over UDP one request answers at most 256 values, then /backline/error (no amplification)" \
+  jq -e '([.replies[] | select(.addr | startswith("/mix/"))] | length) == 256 and ([.replies[] | select(.addr=="/backline/error")] | length) == 1' "$out/osc-all.json"
+osc udp 127.0.0.1 "$PNONE" --wait 0.3 /mix/in.1/fader "/backline/get /mix/**" >"$out/osc-none.json"
+check "a listener without a params role answers nothing (Control1 rule 7 holds)" jq -e '.replies | length == 0' "$out/osc-none.json"
+# a burst of 200 changes in 1 s against a 30/s subscription: rate-limited, and the last value arrives
+( sleep 0.3; for i in $(seq 1 200); do echo "set /mix/in.7/pan $((i - 100))"; sleep 0.005; done >&7 ) &
+osc udp 127.0.0.1 "$PALL" --wait 2.5 "/backline/sub /mix/in.7/pan 30" >"$out/osc-burst.json"
+n_burst=$(jq '[.replies[] | select(.addr=="/mix/in.7/pan")] | length' "$out/osc-burst.json")
+last_burst=$(jq '[.replies[] | select(.addr=="/mix/in.7/pan")][-1].args[0]' "$out/osc-burst.json")
+note "200 changes in ~1.3 s: $n_burst replies at a 30/s cap, the last $last_burst"
+check "the burst is rate-limited (<= 30/s + the first) and ends on the final value 100" bash -c "(( $n_burst <= 50 && $n_burst >= 10 )) && [[ $last_burst == 100* ]]"
+mixer "meter 1 -6"; mixer "meter 2 3"
+osc udp 127.0.0.1 "$PALL" --wait 1.0 "/backline/meters /mix/in.? 15" >"$out/osc-meters.json"
+nm=$(jq '[.replies[] | select(.addr=="/mix/meter/in.1")] | length' "$out/osc-meters.json")
+check "meter stream: /mix/meter/in.1 at ~15/s with -6 dB, in.2 with clip" bash -c "(( $nm >= 10 && $nm <= 18 )) && jq -e '([.replies[] | select(.addr==\"/mix/meter/in.1\")][-1].args[0] | fabs - 6 | fabs) < 0.01 and [.replies[] | select(.addr==\"/mix/meter/in.2\")][-1].args[1] == 1' $out/osc-meters.json"
+note "meter frames for in.1 in 1 s: $nm"
+
+########################################################################## D
+echo; echo "-- D. Control1 MIDI additions, against a software generic controller"
+mkfifo "$out/gen.in"
+"$BL_BIN/surface/backline-test-mcu-sim" --model mcu-pro --serial GEN0001 --name backline-test.sim-gen --alias "Generic-sim:Generic-sim MIDI 1" --node-group backline-test.surf <"$out/gen.in" >"$out/gen.out" 2>&1 &
+PIDS+=($!)
+exec 6>"$out/gen.in"
+gen() { echo "$*" >&6; }
+gdump() { rm -f "$out/gen.json"; echo "dump $out/gen.json" >&6; for _ in $(seq 100); do [[ -s $out/gen.json ]] && break; sleep 0.02; done; cat "$out/gen.json"; }
+export -f gdump
+sleep 0.3
+ctl SetMidiFollow s '^backline-test\.sim-gen' >/dev/null
+ctl SetMidiOut s '^backline-test\.sim-gen' >/dev/null
+sleep 0.5
+ctl Map ssa{sv} midi:cc14:1:7 param:/mix/in.1/fader 2 feedback b true gesture s auto >/dev/null
+ctl Map ssa{sv} midi:nrpn:1:291 param:/mix/in.2/fader 1 feedback b true >/dev/null
+ctl Map ssa{sv} midi:cc:1:16 param:/mix/in.3/pan 3 encoding s rel-2c step d 0.01 feedback b true >/dev/null
+ctl Map ssa{sv} midi:cc:1:20 param:/mix/in.8/fader 1 takeover s pickup >/dev/null
+check "four mappings with the new options are accepted" bash -c "busctl --user get-property ${C[*]} MappingCount | grep -q 'u 4'"
+check "a relative encoder with takeover is refused (it never jumps)" bash -c "busctl --user call ${C[*]} Map 'ssa{sv}' midi:cc:1:21 param:/mix/in.5/pan 2 encoding s rel-2c takeover s pickup 2>&1 | grep -q 'takeover is for absolute'"
+m=$(mark)
+gen "raw b00740b02700"; sleep 0.6
+v=$(since $m | jq -r 'select(.kind=="set" and .path=="/mix/in.1/fader") | .value' | tail -1)
+note "cc14 7/39 = 64/0 -> in.1 fader $v dB"
+check "14-bit CC (MSB 64, LSB 0) sets the fader to the middle of the law: -10 dB" bash -c "awk -v v=$v 'BEGIN { exit !(v > -10.01 && v < -9.98) }'"
+check "gesture: auto opens before the value and ends 300 ms after the burst" bash -c "since $m | grep -q 'gesture-begin.*in.1/fader.*control:' && since $m | grep -q 'gesture-end.*in.1/fader'"
+check "feedback: the confirmed value goes back on the same 14-bit CC (b0 07 40, b0 27 00)" bash -c "gdump | jq -e '.rxlog | (index(\"b0 07 40\") != null) and (index(\"b0 27 00\") != null)'"
+m=$(mark)
+gen "raw b06302b06223b0067fb0267f"; sleep 0.4
+check "NRPN 291 (0x0123), data 127/127: in.2 fader to the top, +10 dB" bash -c "since $m | jq -e 'select(.kind==\"set\" and .path==\"/mix/in.2/fader\") | (.value | tonumber) > 9.99' | grep -q true"
+check "NRPN feedback: 4 CCs (99, 98, 6, 38) back to the controller" bash -c "gdump | jq -e '.rxlog | (index(\"b0 63 02\") != null) and (index(\"b0 62 23\") != null) and (index(\"b0 06 7f\") != null) and (index(\"b0 26 7f\") != null)'"
+m=$(mark)
+gen "raw b01003"; sleep 0.3; gen "raw b0107f"; sleep 0.3
+pans=$(since $m | jq -r 'select(.kind=="set" and .path=="/mix/in.3/pan") | .value' | tr '\n' ' ')
+note "relative encoder (two's complement): +3 then -1 ticks of 1 % -> pan $pans"
+check "relative encoder: +3 then -1 ticks of 1% move the pan 6 then 4 (of -100..100)" bash -c "set -- $pans; awk -v a=\$1 -v b=\$2 'BEGIN { exit !(a > 5.99 && a < 6.01 && b > 3.99 && b < 4.01) }'"
+m=$(mark)
+gen "raw b0140a"; sleep 0.15; gen "raw b01432"; sleep 0.15
+n_before=$(since $m | grep -c 'in.8/fader' || true)
+gen "raw b0143c"; sleep 0.3
+n_after=$(since $m | grep -c 'in.8/fader' || true)
+note "soft takeover (pickup): in.8 at -16 dB (0.425 of travel); CC 10 and 50 ignored ($n_before sets), CC 60 crosses it ($n_after)"
+check "pickup: no set until the control crosses the parameter, then it follows" bash -c "(( $n_before == 0 && $n_after == 1 ))"
+mixer "set /mix/in.3/pan 50"; sleep 0.4
+check "a change on the mixer's side is fed back to the encoder's LED ring (CC 16 = 95)" bash -c "gdump | jq -e '.rxlog | index(\"b0 10 5f\") != null'"
+ctl SetMidiFollow s '' >/dev/null; ctl SetMidiOut s '' >/dev/null
+gen quit
+
+########################################################################## E
+echo; echo "-- E. backline-surfaced and two software devices (X-Touch Extender, X-Touch)"
+"$BL_BIN/surface/backline-surfaced" --name backline-test.surf --state-file "$out/surfaces.json" --verbose 2>"$out/surfaced.log" &
+SURF=$!; PIDS+=($SURF)
+wait_name io.github.manuaudio.Backline.Surface
+sleep 0.3
+mkfifo "$out/ext.in" "$out/xt.in"
+"$BL_BIN/surface/backline-test-mcu-sim" --model xtouch-ext --serial EXT0001 --name backline-test.sim-ext --node-group backline-test.surf <"$out/ext.in" >"$out/ext.out" 2>&1 &
+PIDS+=($!); exec 8>"$out/ext.in"
+"$BL_BIN/surface/backline-test-mcu-sim" --model xtouch --serial XT00002 --name backline-test.sim-xt --node-group backline-test.surf <"$out/xt.in" >"$out/xt.out" 2>&1 &
+PIDS+=($!); exec 9>"$out/xt.in"
+ext() { echo "$*" >&8; }
+xt() { echo "$*" >&9; }
+dump() { # ext|xt -> json
+  local f=$out/$1.json; rm -f "$f"; echo "dump $f" >&"$([[ $1 == ext ]] && echo 8 || echo 9)"
+  for _ in $(seq 150); do [[ -s $f ]] && break; sleep 0.02; done; cat "$f"
+}
+q() { dump "$1" | jq -r "$2"; }
+export -f dump q
+for _ in $(seq 100); do [[ $(busctl --user get-property "${S[@]}" UnitCount) == "u 2" ]] && break; sleep 0.05; done
+check "both devices detected by port name, handshake answered (device query, serial)" bash -c "[[ \$(busctl --user get-property ${S[*]} UnitCount) == 'u 2' ]]"
+srfj Units >"$out/units.json"
+check "unit ids from profile and serial: behringer-xtouch-ext@EXT0001, behringer-xtouch@XT00002" jq -e '[.data[0][] | .id.data] | sort == ["behringer-xtouch-ext@EXT0001", "behringer-xtouch@XT00002"]' "$out/units.json"
+G=$(jq -r '.data[0][0].group.data' "$out/units.json")
+check "automatic grouping: the extender and the X-Touch in one group ($G)" jq -e "[.data[0][] | .group.data] | unique == [\"$G\"]" "$out/units.json"
+srf SetGroup sasa{sv} "$G" 2 behringer-xtouch-ext@EXT0001 behringer-xtouch@XT00002 0 >/dev/null
+sleep 1.5
+check "the group is 16 wide, extender on the left" bash -c "busctl --user --json=short call ${S[*]} Groups | jq -e '.data[0][0].width.data == 16 and .data[0][0].units.data == [\"behringer-xtouch-ext@EXT0001\", \"behringer-xtouch@XT00002\"]'"
+dump ext >"$out/e1.json"; dump xt >"$out/x1.json"
+note "extender LCD: $(jq -c '.lcd[0]' "$out/e1.json")"
+note "X-Touch   LCD: $(jq -c '.lcd[0]' "$out/x1.json")"
+check "scribble strips: inputs 1-8 on the extender, 9-16 on the X-Touch" bash -c "jq -e '.cells[0][0] == \"KickIn\" and .cells[0][7] == \"FlorTm\"' $out/e1.json && jq -e '.cells[0][0] == \"OH L\" and .cells[0][7] == \"Keys R\"' $out/x1.json"
+check "X-Touch colours from the mixer's #rrggbb: red, (orange->)yellow, green, blue, ..." jq -e '.colour[0:4] == ["red", "yellow", "green", "blue"]' "$out/e1.json"
+check "line 2: the pan value (pot mode pan)" jq -e '.cells[1][0] == "+0"' "$out/e1.json"
+check "faders where the mixer's values are (in.6 -12 dB = 0.475 of travel, main 0 dB = 0.75)" bash -c "jq -e '(.fader[5] - 7782 | fabs) <= 16' $out/e1.json && jq -e '.fader[8] == 12287' $out/x1.json"
+check "assignment display shows the view code (In)" jq -e '.assignment == "IN"' "$out/x1.json"
+check "meters reach the device (in.1 at -6 dB, in.2 clipping)" jq -e '.meter[0] == 9 and .clip[1] == true' "$out/e1.json"
+
+########################################################################## F
+echo; echo "-- F. faders both ways, touch, motor feedback"
+m=$(mark)
+xt "move 3 12000"; sleep 0.3
+check "an untouched fader move is never applied (motor overshoot rule)" bash -c "! since $m | grep -q 'in.11/fader'"
+t0=$(mono); xt "touch 3 1"; sleep 0.1
+for v in 9000 10000 11000 12000; do xt "move 3 $v"; sleep 0.03; done
+sleep 0.2
+t_sent=$(grep 'done move' "$out/xt.out" | tail -1 | sed 's/.*t=//')
+t_set=$(since $m | jq -r 'select(.kind=="set" and .path=="/mix/in.11/fader") | .t' | tail -1)
+check "touch -> Gesture begin on /mix/in.11/fader (from surface:behringer-xtouch@XT00002)" bash -c "since $m | grep -q 'gesture-begin.*in.11/fader.*surface:behringer-xtouch@XT00002'"
+v=$(since $m | jq -r 'select(.kind=="set" and .path=="/mix/in.11/fader") | .value' | tail -1)
+check "moves while touched set the parameter (12000/16383 = 0.7325 of travel -> $v dB)" bash -c "awk -v v=$v 'BEGIN { exit !(v > -0.75 && v < -0.65) }'"
+note "surface move -> the mixer's Set: $(( (t_set - t_sent) / 1000 )) us (sim -> PipeWire -> surfaced -> controld -> mixer)"
+check "the position is echoed while held (the servo holds)" bash -c "dump xt | jq -e '.\"host-fader\"[2] == 12000'"
+xt "touch 3 0"; sleep 0.3
+check "release -> Gesture end" bash -c "since $m | grep -q 'gesture-end.*in.11/fader'"
+check "after release the motor holds the confirmed value" bash -c "dump xt | jq -e '(.fader[2] - 12000 | fabs) <= 2'"
+mixer "set /mix/in.5/fader 0"; sleep 0.3
+check "the mixer moves in.5 to 0 dB: the extender's motor follows (0.75 of travel)" bash -c "dump ext | jq -e '(.fader[4] - 12287 | fabs) <= 1'"
+mixer "set /mix/in.5/name Lead Gtr"; sleep 0.3
+check "a renamed channel shows on the scribble strip" bash -c "dump ext | jq -e '.cells[0][4] == \"LedGtr\"'"
+
+########################################################################## G
+echo; echo "-- G. banking across both units"
+xt "tap bank-right"; sleep 0.4
+check "Bank > moves the 16-wide window to the last bank (offset 8 of 24)" bash -c "dump ext | jq -e '.cells[0][0] == \"OH L\"' && dump xt | jq -e '.cells[0][7] == \"Tlkbck\"'"
+check "the assignment display shows the bank (I2) for a second" bash -c "dump xt | jq -e '.assignment == \"I2\"'"
+xt "tap channel-left"; sleep 0.3
+check "Channel < moves by one (offset 7)" bash -c "dump ext | jq -e '.cells[0][0] == \"FlorTm\"'"
+xt "press shift"; xt "tap bank-left"; xt "release shift"; sleep 0.3
+check "Shift + Bank < goes to the first bank" bash -c "dump ext | jq -e '.cells[0][0] == \"KickIn\"'"
+
+########################################################################## H
+echo; echo "-- H. buttons and LEDs"
+m=$(mark)
+ext "tap mute-2"; sleep 0.3
+check "Mute 2 on the extender toggles /mix/in.2/mute; its LED lights" bash -c "since $m | grep -q '\"path\":\"/mix/in.2/mute\",\"value\":\"1' && dump ext | jq -e '.leds[\"mute-2\"] == \"on\"'"
+ext "tap mute-2"; sleep 0.3
+check "and off again" bash -c "dump ext | jq -e '.leds[\"mute-2\"] == null'"
+xt "tap solo-1"; sleep 0.3
+check "Solo 1 on the X-Touch is in.9's solo" bash -c "dump xt | jq -e '.leds[\"solo-1\"] == \"on\"'"
+xt "tap f1"; sleep 0.2
+check "an unbound global button reaches the program as an Action (f1)" bash -c "since $m | grep -q '\"kind\":\"action-down\",\"path\":\"f1\"'"
+
+########################################################################## I-J
+echo; echo "-- I/J. the 8 view layers and flip"
+xt "tap view-aux"; sleep 0.4
+check "the layer-5 button (AUX) shows the aux view; its LED is lit, INPUTS' is not" bash -c "dump xt | jq -e '.leds[\"view-aux\"] == \"on\" and .leds[\"view-inputs\"] == null and .assignment == \"AU\"' && dump ext | jq -e '.cells[0][0] == \"Wedge1\" and .cells[0][2] == \"\" and .fader[2] == 0'"
+xt "tap view-inputs"; sleep 0.4
+check "INPUTS (layer 2) brings the inputs back at the same window" bash -c "dump ext | jq -e '.cells[0][0] == \"KickIn\"'"
+xt "tap flip"; sleep 0.4
+check "Flip: the faders take the pots' function (pan; in.1 centre = half travel), Flip LED on" bash -c "dump ext | jq -e '(.fader[0] - 8192 | fabs) <= 1' && dump xt | jq -e '.leds.flip == \"on\"'"
+xt "tap flip"; sleep 0.4
+check "Flip again: the faders are faders" bash -c "dump ext | jq -e '(.fader[5] - 7782 | fabs) <= 16' && dump xt | jq -e '.leds.flip == null'"
+
+########################################################################## K-L
+echo; echo "-- K/L. pots, selection, a strip pot mode"
+m=$(mark)
+ext "pot 1 5"; sleep 0.5
+check "V-Pot 1 +5 ticks: in.1 pan +5 (of -100..100, 1 % a tick), a gesture around it" bash -c "since $m | grep -q '\"path\":\"/mix/in.1/pan\",\"value\":\"10.0' && since $m | grep -q 'gesture-begin.*in.1/pan' && since $m | grep -q 'gesture-end.*in.1/pan'"
+check "the ring follows (dot mode, position 6-7 of 11)" bash -c "dump ext | jq -e '.ring[0] == 7 or .ring[0] == 6'"
+m=$(mark)
+ext "tap select-3"; sleep 0.3
+check "Select 3 -> Action select:in.3 -> the mixer's SetSelected -> its LED" bash -c "since $m | grep -q 'select:in.3' && dump ext | jq -e '.leds[\"select-3\"] == \"on\"'"
+srf SetPotMode ssi "$G" eq 0 >/dev/null; sleep 0.4
+check "EQ (a strip mode on the selected channel): strip 1 'LF G', strip 2 'Pan'" bash -c "dump ext | jq -e '.cells[0][0] == \"LF G\" and .cells[0][1] == \"Pan\"'"
+m=$(mark)
+ext "pot 1 3"; sleep 0.3
+check "its pot 1 moves in.3's EQ low gain" bash -c "since $m | grep -q '/mix/in.3/eq.lf'"
+xt "tap assign-pan"; sleep 0.3
+check "Assign: Pan returns to the pan mode" bash -c "dump ext | jq -e '.cells[0][0] == \"KickIn\"'"
+
+########################################################################## M
+echo; echo "-- M. displays"
+srf Text sssu "$G" "" "LOCKED" 600 >/dev/null; sleep 0.2
+check "Text: a message across both units' displays" bash -c "dump ext | jq -e '.lcd[0] | startswith(\"LOCKED\")' && dump xt | jq -e '.lcd[0] | startswith(\"LOCKED\")'"
+sleep 0.7
+check "and it goes after its time" bash -c "dump ext | jq -e '.cells[0][0] == \"KickIn\"'"
+srf SetGlobalBinding sss "$G" timecode param:/mix/clock/tc >/dev/null
+mixer "set /mix/clock/tc 01:23:45:12"; sleep 0.3
+check "the timecode display bound to a string parameter" bash -c "dump xt | jq -e '.timecode | contains(\"01.23.45.12\")'"
+srf SetGlobalBinding sss "$G" f2 action:talkback >/dev/null
+xt "press f2"; sleep 0.2
+check "F2 bound to an action: the mixer's talkback goes on while held" bash -c "busctl --user --json=short call ${P[*]} Get as 1 /mix/talkback | jq -e '.data[0][0][1].data == true'"
+xt "release f2"; sleep 0.2
+
+########################################################################## N
+echo; echo "-- N. hot-plug: the X-Touch unplugged while a fader is held"
+m=$(mark)
+xt "touch 5 1"; sleep 0.2
+xt "unplug"; sleep 0.5
+t_unplug=$(grep 'done unplug' "$out/xt.out" | tail -1 | sed 's/.*t=//')
+t_end=$(since $m | jq -r 'select(.kind=="gesture-end" and .path=="/mix/in.13/fader") | .t' | tail -1)
+check "the held fader's gesture ends" test -n "$t_end"
+lat=$(( ${t_end:-0} - ${t_unplug:-0} ))
+note "unplug -> Gesture end at the mixer: $((lat / 1000)) us (node gone -> surfaced -> controld -> mixer)"
+check "within 50 ms of the unplug" bash -c "(( $lat > 0 && $lat < 50000000 ))"
+check "the unit is gone, its place kept; the window is dealt again over the extender (width 8)" bash -c "busctl --user --json=short call ${S[*]} Units | jq -e '[.data[0][] | select(.state.data==\"gone\")] | length == 1' && busctl --user --json=short call ${S[*]} Groups | jq -e '.data[0][0].width.data == 8'"
+t_plug=$(mono); xt "plug"
+for _ in $(seq 200); do
+  [[ $(dump xt | jq -r '.cells[0][0]') == "OH L" ]] && break; sleep 0.02
+done
+t_back=$(mono)
+note "plug -> redrawn (names on the strips): $(( (t_back - t_plug) / 1000000 )) ms (handshake + the 1 s greeting)"
+check "plugged back: online in the same group, same place, fully redrawn" bash -c "busctl --user --json=short call ${S[*]} Groups | jq -e '.data[0][0].width.data == 16' && dump xt | jq -e '.cells[0][0] == \"OH L\" and .colour[0] != \"off\" and .fader[8] == 12287 and .connected'"
+
+########################################################################## O-P
+echo; echo "-- O/P. two groups, a locked view; a restart restores them"
+srf SetGroup sasa{sv} mon 1 behringer-xtouch-ext@EXT0001 2 role s monitor lock-view s aux >/dev/null
+sleep 0.5
+check "the extender alone in 'mon', locked to the aux view; the X-Touch alone in $G" bash -c "dump ext | jq -e '.cells[0][0] == \"Wedge1\"' && dump xt | jq -e '.cells[0][0] == \"KickIn\"'"
+xt "tap bank-right"; sleep 0.3
+check "banking on the X-Touch doesn't move the locked extender" bash -c "dump ext | jq -e '.cells[0][0] == \"Wedge1\"'"
+m=$(mark)
+ext "touch 1 1"; ext "move 1 8000"; ext "touch 1 0"; sleep 0.3
+check "the extender's sets go out in the 'mon' group's role 'monitor': refused, the mixer defined no such role" bash -c "! since $m | grep -q 'aux.1/fader' && grep -q 'no role monitor is defined' $out/surfaced.log"
+kill "$SURF"; wait "$SURF" 2>/dev/null || true
+sleep 0.3
+check "clean shutdown: both devices dark, faders down, offline (a 112-character LCD write through PipeWire)" bash -c "dump xt | jq -e '.offline and (.lcd[0] | test(\"^ +\$\")) and (.lcd[1] | test(\"^ +\$\")) and .fader[8] == 0 and (.leds | length) == 0' && dump ext | jq -e '.offline'"
+check "the groups were saved" jq -e '[.groups[].id] | index("mon") != null' "$out/surfaces.json"
+"$BL_BIN/surface/backline-surfaced" --name backline-test.surf --state-file "$out/surfaces.json" 2>>"$out/surfaced.log" &
+SURF=$!; PIDS+=($SURF)
+wait_name io.github.manuaudio.Backline.Surface
+sleep 0.5
+xt "hello"; ext "hello"; sleep 1.8
+mixer views; sleep 1.5
+check "after a restart the units come back into their saved groups" bash -c "busctl --user --json=short call ${S[*]} Units | jq -e '[.data[0][] | select(.id.data==\"behringer-xtouch-ext@EXT0001\") | .group.data] == [\"mon\"]'"
+check "and the locked extender shows aux again" bash -c "dump ext | jq -e '.cells[0][0] == \"Wedge1\"'"
+
+########################################################################## end
+echo
+real_nodes >"$out/real-after.txt" || true
+check "the user's graph has no node of this proof, before or after" bash -c "! grep -q 'backline-test\\.\\|backline-surf' $out/real-before.txt $out/real-after.txt"
+echo "the user's graph: $(wc -l <"$out/real-after.txt") nodes after (was $(wc -l <"$out/real-before.txt"))"
+echo
+echo "RESULT: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
