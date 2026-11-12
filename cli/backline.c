@@ -29,6 +29,7 @@ static void usage(FILE *f)
 	      "  host load PLUGIN [--id ID] [--plugin-id ID] [--name NODE] [--target NODE]\n"
 	      "                   [--midi-follow REGEX] [--state FILE] [--memory-max SIZE]\n"
 	      "                   [--cpu-quota PCT] [--autoconnect|--no-autoconnect] [--no-restart]\n"
+	      "                   [--force]   (run it even if the registry grades it fail)\n"
 	      "  host unload ID         stop an instance\n"
 	      "  host restart ID        restart an instance (keeps its state)\n"
 	      "  host list              all instances\n"
@@ -151,7 +152,7 @@ static int cmd_host(int argc, char **argv)
 			{ "midi-follow", required_argument, NULL, 'm' }, { "state", required_argument, NULL, 's' },
 			{ "memory-max", required_argument, NULL, 'M' }, { "cpu-quota", required_argument, NULL, 'Q' },
 			{ "autoconnect", no_argument, NULL, 'a' }, { "no-autoconnect", no_argument, NULL, 'A' },
-			{ "no-restart", no_argument, NULL, 'R' }, { 0 } };
+			{ "no-restart", no_argument, NULL, 'R' }, { "force", no_argument, NULL, 'F' }, { 0 } };
 		bl_load_options o = BL_LOAD_OPTIONS_INIT;
 		int c;
 		optind = 1;
@@ -168,6 +169,7 @@ static int cmd_host(int argc, char **argv)
 			case 'a': o.autoconnect = 1; break;
 			case 'A': o.autoconnect = 0; break;
 			case 'R': o.restart = 0; break;
+			case 'F': o.force = 1; break;
 			default: return die_usage();
 			}
 		}
@@ -408,6 +410,9 @@ static int cmd_counter(int argc, char **argv)
 }
 
 /* --------------------------------------------------------------- plugins */
+static int plugins_fallback(int argc, char **argv);
+static bool no_service(void);
+
 static int print_plugins_table(const char *json)
 {
 	json_object *root = json_tokener_parse(json), *list;
@@ -464,6 +469,8 @@ static int cmd_plugins(int argc, char **argv)
 		}
 		int r = bl_plugins_query(C, json_object_to_json_string(f), &out);
 		json_object_put(f);
+		if (r < 0 && no_service())
+			return plugins_fallback(argc, argv);
 		if (r < 0)
 			return failed("plugins list");
 		if (g_json)
@@ -472,12 +479,12 @@ static int cmd_plugins(int argc, char **argv)
 			print_plugins_table(out);
 	} else if (!strcmp(argv[0], "show") && argc == 2) {
 		if (bl_plugins_show(C, argv[1], &out) < 0)
-			return failed("plugins show");
+			return no_service() ? plugins_fallback(argc, argv) : failed("plugins show");
 		puts(out);
 	} else if (!strcmp(argv[0], "scan")) {
 		bool validate = argc > 1 && !strcmp(argv[1], "--validate");
 		if (bl_plugins_scan(C, validate, &out) < 0)
-			return failed("plugins scan");
+			return no_service() ? plugins_fallback(argc, argv) : failed("plugins scan");
 		puts(out);
 	} else {
 		return die_usage();
@@ -486,27 +493,65 @@ static int cmd_plugins(int argc, char **argv)
 	return 0;
 }
 
-/* -------------------------------------------------------------------- rec */
-static int cmd_rec(int argc, char **argv)
+/* -------------------------------------------------------------- siblings */
+/* Run another Backline binary: next to this one, in the build tree's
+ * subdirectory, or from $PATH. Does not return on success. */
+static int exec_sibling(const char *name, const char *subdir, char **argv)
 {
-	char self[PATH_MAX], path[PATH_MAX];
+	char self[PATH_MAX], path[PATH_MAX + 64];
 	ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
-	snprintf(path, sizeof(path), "backline-recorder");
+	snprintf(path, sizeof(path), "%s", name);
 	if (n > 0) {
 		self[n] = 0;
 		char *slash = strrchr(self, '/');
 		if (slash) {
 			*slash = 0;
-			char cand[PATH_MAX + 32];
-			snprintf(cand, sizeof(cand), "%s/backline-recorder", self);
+			char cand[PATH_MAX + 64];
+			snprintf(cand, sizeof(cand), "%s/%s", self, name);
 			if (access(cand, X_OK) == 0)
 				snprintf(path, sizeof(path), "%s", cand);
+			else if (subdir) {
+				snprintf(cand, sizeof(cand), "%s/%s/%s", self, subdir, name);
+				if (access(cand, X_OK) == 0)
+					snprintf(path, sizeof(path), "%s", cand);
+			}
 		}
 	}
 	argv[0] = path;
+	fflush(stdout);
 	execvp(path, argv);
-	fprintf(stderr, "backline: rec: %s: %s\n", path, strerror(errno));
+	fprintf(stderr, "backline: %s: %s\n", path, strerror(errno));
 	return 1;
+}
+
+static int cmd_rec(int argc, char **argv)
+{
+	return exec_sibling("backline-recorder", NULL, argv);
+}
+
+/* No registry service on the bus: ask backline-registry directly (it reads
+ * the same index file). */
+static int plugins_fallback(int argc, char **argv)
+{
+	char *args[argc + 3];
+	int n = 0;
+	args[n++] = (char *)"backline-registry";
+	for (int i = 0; i < argc; i++) {
+		if (!strcmp(argv[i], "--validate") || !strcmp(argv[i], "--id"))
+			continue; /* scan validates by default; --id is a Query-only filter */
+		args[n++] = argv[i];
+	}
+	if (g_json)
+		args[n++] = (char *)"--json";
+	args[n] = NULL;
+	return exec_sibling("backline-registry", "registry", args);
+}
+
+static bool no_service(void)
+{
+	const char *e = bl_client_error(C);
+	return strstr(e, "not provided by any .service") || strstr(e, "ServiceUnknown") || strstr(e, "has no owner") ||
+	       strstr(e, "was not provided") || strstr(e, "not activatable");
 }
 
 int main(int argc, char **argv)

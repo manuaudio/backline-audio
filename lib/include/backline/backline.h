@@ -60,8 +60,9 @@ typedef struct bl_load_options {
 	const char *cpu_quota;   /* systemd CPUQuota (default none) */
 	int autoconnect;         /* -1 default (on unless target), 0, 1 */
 	int restart;             /* -1 default (on), 0 = leave it down after a crash */
+	int force;               /* -1/0: refuse a plugin the registry grades fail; 1: run it anyway */
 } bl_load_options;
-#define BL_LOAD_OPTIONS_INIT { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, -1, -1 }
+#define BL_LOAD_OPTIONS_INIT { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, -1, -1, -1 }
 
 typedef struct bl_instance {
 	char id[64];

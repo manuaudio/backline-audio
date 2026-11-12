@@ -12,6 +12,10 @@
 #     node name, OSC port and D-Bus name answer again.
 #  3. Crash loop: the worker is killed again and again; hostd backs off and
 #     gives up after 6 crashes in a minute, and says so (Failed).
+#  4. Registry gate: a plugin the registry grades fail (a test plugin that
+#     segfaults in process and leaves a helper process behind) is refused;
+#     with --force it runs, crash-loops into Failed, and every process it
+#     started dies with its scope.
 #
 # Throwaway only: a null sink owned by this script, nothing linked to real
 # devices, state in tests/out/hostd.
@@ -42,7 +46,11 @@ bl_foreign_nodes >"$out/foreign-before.txt"
 echo "default sink: $default_before"
 
 bl_testbed backline-test.sink-a
-bl_spawn "$BL_BIN/backline-hostd" --state-dir "$out/state" --log-dir "$out/logs" >"$out/hostd.json" 2>"$out/hostd.log"
+# a registry of the test plugins only (throwaway cache), for section 4
+BACKLINE_CACHE_DIR="$out/registry" "$BL_BIN/registry/backline-registry" scan --only-paths --timeout 2 \
+  --path "clap:$BL_BIN/test-plugins" >"$out/registry-scan.txt" 2>&1
+bl_spawn "$BL_BIN/backline-hostd" --state-dir "$out/state" --log-dir "$out/logs" \
+  --registry "$out/registry/plugins.json" >"$out/hostd.json" 2>"$out/hostd.log"
 wait_for "hostd on the bus" busctl --user status io.github.manuaudio.Backline.Host
 echo "hostd: $(cat "$out/hostd.json")"
 
@@ -192,6 +200,29 @@ EOF
 $B host restart synth
 wait_for "running after an explicit restart" running_new 0
 echo "  explicit 'backline host restart synth': $($B --json host show synth | jq -c '{state, restarts}'), Global Volume $($B get synth 'Global Volume')"
+
+# ---------------------------------------------------------- 4. registry gate
+echo; echo "-- 4. registry gate: a plugin graded fail is refused unless forced"
+crash="$BL_BIN/test-plugins/backline-test-crash.clap"
+echo "  registry: $(BACKLINE_CACHE_DIR="$out/registry" "$BL_BIN/registry/backline-registry" show backline.test.crash --json | jq -c '.plugins[0] | {name, grade, reasons}')"
+if $B host load "$crash" --id crashy 2>"$out/gate.err"; then echo "  load without --force: ACCEPTED"; gate=bad; else
+  echo "  load without --force: refused: $(cat "$out/gate.err")"; gate=ok; fi
+echo "  scopes for it: $(systemctl --user list-units 'backline-worker-crashy*' --no-legend | wc -l)"
+$B --json host watch --count 12 --timeout 20 >"$out/gate.jsonl" &
+watch=$!
+sleep 0.3
+$B --json host load "$crash" --id crashy --force --target backline-test.sink-a | jq -c '{id, state, pid, unit}' | sed 's/^/  load --force: /'
+wait_for "crash plugin failed" bash -c "[[ \$($B --json host show crashy | jq -r .state) == failed ]]"
+wait $watch 2>/dev/null || true
+sleep 0.3
+$B --json host show crashy | jq -c '{state, restarts, last_signal, fail_reason}' | sed 's/^/  /'
+echo "  Crashed signals: $(jq -r 'select(.event=="Crashed") | .signal' "$out/gate.jsonl" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')"
+left_units=$(systemctl --user list-units 'backline-worker-crashy*' --no-legend | wc -l)
+left_procs=$(pgrep -c -f 'backline-test-crash|plugin=.*backline-test-crash' || true)
+echo "  after Failed: crashy scopes left $left_units, its processes (worker or helpers) left $left_procs"
+$B host unload crashy
+[[ $gate == ok && $left_units == 0 && $left_procs == 0 ]] && echo "  RESULT: PASS (refused by grade; forced, it crash-loops to Failed and leaves nothing behind)" \
+  || echo "  RESULT: FAIL"
 
 # ---------------------------------------------------------------- cleanup
 echo; echo "-- clean up"

@@ -1,0 +1,7 @@
+# D-Bus activation for the Backline plugin registry (session bus).
+# Install as $XDG_DATA_HOME/dbus-1/services/io.github.manuaudio.Backline.Registry.service
+# (or /usr/share/dbus-1/services/) after replacing @bindir@.
+# SPDX-License-Identifier: MIT
+[D-BUS Service]
+Name=io.github.manuaudio.Backline.Registry
+Exec=@bindir@/backline-registry serve --idle 60

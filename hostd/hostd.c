@@ -37,6 +37,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <json-c/json.h>
 #include <systemd/sd-bus.h>
 #include <systemd/sd-event.h>
 
@@ -62,6 +63,7 @@ struct instance {
 	char midi_follow[512];
 	int autoconnect;          /* -1 default, 0, 1 */
 	bool restart;
+	bool force;               /* load even if the registry grades it fail */
 	char memory_max[32];
 	char cpu_quota[32];
 	char tasks_max[16];
@@ -106,6 +108,7 @@ static struct {
 	unsigned counter;
 	char default_memory_max[32];
 	uint64_t ready_timeout_ns;
+	char registry[PATH_MAX];  /* plugins.json of backline-registry ("" = none) */
 } H;
 
 static void logf_(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -214,6 +217,92 @@ static void emit(const char *signal, const char *types, ...)
 	sd_bus_message_unref(m);
 }
 
+/* --------------------------------------------------------------- registry */
+/* The worker's plugin lookup, mirrored: a path, or a name in ~/.clap or
+ * /usr/lib/clap. Returns the real path, or "" if not found. */
+static void resolve_plugin(const char *p, char *out, size_t n)
+{
+	char cand[PATH_MAX];
+	const char *home = getenv("HOME");
+	const char *dirs[] = { NULL, "/usr/lib/clap" };
+	char homeclap[PATH_MAX];
+	snprintf(homeclap, sizeof(homeclap), "%s/.clap", home ? home : "");
+	dirs[0] = homeclap;
+	out[0] = 0;
+	if (realpath(p, cand)) {
+		snprintf(out, n, "%s", cand);
+		return;
+	}
+	size_t l = strlen(p);
+	for (int i = 0; i < 2; i++) {
+		char c[PATH_MAX];
+		snprintf(c, sizeof(c), "%s/%s%s", dirs[i], p, l > 5 && !strcmp(p + l - 5, ".clap") ? "" : ".clap");
+		if (realpath(c, cand)) {
+			snprintf(out, n, "%s", cand);
+			return;
+		}
+	}
+}
+
+/* What the registry says about (path, id). id NULL: decided only if every
+ * plugin in the file has the same grade. Returns 1 found (grade/reasons
+ * filled), 0 unknown. */
+static int registry_grade(const char *path, const char *id, char *grade, size_t gn, char *reasons, size_t rn)
+{
+	if (!H.registry[0] || !path[0])
+		return 0;
+	struct json_object *root = json_object_from_file(H.registry), *list;
+	if (!root)
+		return 0;
+	int found = 0, matches = 0;
+	char first[16] = "";
+	bool mixed = false;
+	if (json_object_object_get_ex(root, "plugins", &list) && json_object_is_type(list, json_type_array)) {
+		size_t n = json_object_array_length(list);
+		for (size_t i = 0; i < n; i++) {
+			struct json_object *e = json_object_array_get_idx(list, i), *v;
+			if (!json_object_object_get_ex(e, "format", &v) || strcmp(json_object_get_string(v), "clap"))
+				continue;
+			if (!json_object_object_get_ex(e, "path", &v))
+				continue;
+			char rp[PATH_MAX];
+			if (!realpath(json_object_get_string(v), rp) || strcmp(rp, path))
+				continue;
+			if (id && (!json_object_object_get_ex(e, "id", &v) || strcmp(json_object_get_string(v), id)))
+				continue;
+			const char *g = json_object_object_get_ex(e, "grade", &v) ? json_object_get_string(v) : "";
+			if (!matches++)
+				snprintf(first, sizeof(first), "%s", g);
+			else if (strcmp(first, g))
+				mixed = true;
+			if (!found || !strcmp(g, "fail")) {
+				snprintf(grade, gn, "%s", g);
+				reasons[0] = 0;
+				struct json_object *rs;
+				if (json_object_object_get_ex(e, "reasons", &rs) && json_object_is_type(rs, json_type_array))
+					for (size_t k = 0; k < json_object_array_length(rs); k++)
+						snprintf(reasons + strlen(reasons), rn - strlen(reasons), "%s%s", k ? "; " : "",
+							 json_object_get_string(json_object_array_get_idx(rs, k)));
+				found = 1;
+			}
+		}
+	}
+	json_object_put(root);
+	return found && !mixed ? 1 : 0;
+}
+
+/* Kill whatever is left in a dead worker's scope (helper processes a plugin
+ * started), so a crash never leaves processes behind. */
+static void kill_scope(const struct instance *in)
+{
+	if (!H.use_scope || !H.bus || !in->unit[0])
+		return;
+	char unit[200];
+	snprintf(unit, sizeof(unit), "%s.scope", in->unit);
+	sd_bus_call_method_async(H.bus, NULL, "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+				 "org.freedesktop.systemd1.Manager", "KillUnit", NULL, NULL, "ssi", unit, "all", SIGKILL);
+}
+
 /* ---------------------------------------------------------------- workers */
 static int spawn(struct instance *in);
 static int on_child(sd_event_source *s, const siginfo_t *si, void *userdata);
@@ -265,8 +354,27 @@ static void arm_timer(struct instance *in, uint64_t delay_ns, sd_event_time_hand
 	sd_event_add_time_relative(H.event, &in->timer_src, CLOCK_MONOTONIC, delay_ns / 1000, 1000, cb, in);
 }
 
+static void stop_worker(struct instance *in);
+
 static void became_ready(struct instance *in, const struct bl_ready *r)
 {
+	if (!in->ever_ready && !in->force) {
+		char grade[16] = "", reasons[512] = "";
+		if (registry_grade(r->plugin_path, r->plugin, grade, sizeof(grade), reasons, sizeof(reasons)) == 1 &&
+		    !strcmp(grade, "fail")) {
+			logf_("%s: the registry grades %s fail (%s); stopping it (load with force to override)", in->id,
+			      r->plugin, reasons);
+			if (in->pending_load) {
+				sd_bus_reply_method_errorf(in->pending_load, ERR_PREFIX "GradedFail",
+							   "the registry grades %s fail: %s (load with force=true to run it anyway)",
+							   r->plugin, reasons);
+				in->pending_load = sd_bus_message_unref(in->pending_load);
+			}
+			in->unloading = true;
+			stop_worker(in);
+			return;
+		}
+	}
 	in->st = ST_RUNNING;
 	in->ready_ns = now_ns();
 	in->osc_port = r->osc_port;
@@ -429,6 +537,7 @@ static int on_child(sd_event_source *s, const siginfo_t *si, void *userdata)
 	in->pid = 0;
 	in->last_signal = sig;
 	in->last_status = status;
+	kill_scope(in);
 	/* drain anything left on the pipe (a ready line racing the exit) */
 	if (in->io_src) {
 		in->io_src = sd_event_source_disable_unref(in->io_src);
@@ -601,6 +710,8 @@ static int m_load(sd_bus_message *m, void *userdata, sd_bus_error *err)
 				in->autoconnect = v ? 1 : 0;
 			else if (!strcmp(key, "restart"))
 				in->restart = v;
+			else if (!strcmp(key, "force"))
+				in->force = v;
 			else {
 				sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "unknown option '%s'", key);
 				r = -EINVAL;
@@ -669,6 +780,18 @@ static int m_load(sd_bus_message *m, void *userdata, sd_bus_error *err)
 			fclose(dst);
 	}
 	unlink(in->log_path);
+
+	if (!in->force) {
+		char path[PATH_MAX], grade[16] = "", reasons[512] = "";
+		resolve_plugin(in->plugin, path, sizeof(path));
+		if (registry_grade(path, in->plugin_id[0] ? in->plugin_id : NULL, grade, sizeof(grade), reasons,
+				   sizeof(reasons)) == 1 && !strcmp(grade, "fail")) {
+			sd_bus_error_setf(err, ERR_PREFIX "GradedFail",
+					  "the registry grades %s fail: %s (load with force=true to run it anyway)", path, reasons);
+			r = -EPERM;
+			goto out;
+		}
+	}
 
 	in->next = H.instances;
 	H.instances = in;
@@ -839,6 +962,8 @@ static void usage(FILE *f)
 	      "  --no-scope           run workers as plain child processes, not systemd user scopes\n"
 	      "  --memory-max SIZE    default MemoryMax for each worker scope (default: 4G; '' for none)\n"
 	      "  --ready-timeout SECS how long a worker may take to come up (default: 20)\n"
+	      "  --registry FILE      backline-registry index to check grades against (default:\n"
+	      "                       $BACKLINE_CACHE_DIR or $XDG_CACHE_HOME/backline, plugins.json; '' = off)\n"
 	      "  --replace            take over the bus name from a running hostd\n",
 	      f);
 }
@@ -849,7 +974,8 @@ int main(int argc, char **argv)
 		{ "worker", required_argument, NULL, 'w' }, { "state-dir", required_argument, NULL, 's' },
 		{ "log-dir", required_argument, NULL, 'l' }, { "no-scope", no_argument, NULL, 'S' },
 		{ "memory-max", required_argument, NULL, 'm' }, { "ready-timeout", required_argument, NULL, 't' },
-		{ "replace", no_argument, NULL, 'r' }, { "help", no_argument, NULL, 'h' }, { 0 } };
+		{ "replace", no_argument, NULL, 'r' }, { "registry", required_argument, NULL, 'g' },
+		{ "help", no_argument, NULL, 'h' }, { 0 } };
 	bool replace = false;
 	int c;
 	H.use_scope = true;
@@ -864,6 +990,7 @@ int main(int argc, char **argv)
 		case 'm': snprintf(H.default_memory_max, sizeof(H.default_memory_max), "%s", optarg); break;
 		case 't': H.ready_timeout_ns = (uint64_t)(atof(optarg) * BL_NSEC); break;
 		case 'r': replace = true; break;
+		case 'g': snprintf(H.registry, sizeof(H.registry), "%s", optarg); break;
 		case 'h': usage(stdout); return 0;
 		default: usage(stderr); return 2;
 		}
@@ -883,6 +1010,18 @@ int main(int argc, char **argv)
 			snprintf(H.worker, sizeof(H.worker), "backline-plugin-worker");
 	}
 	const char *home = getenv("HOME");
+	bool registry_set = false;
+	for (int i = 1; i < argc; i++)
+		registry_set |= !strncmp(argv[i], "--registry", 10);
+	if (!registry_set) {
+		const char *cd = getenv("BACKLINE_CACHE_DIR"), *xc = getenv("XDG_CACHE_HOME");
+		if (cd && *cd)
+			snprintf(H.registry, sizeof(H.registry), "%s/plugins.json", cd);
+		else if (xc && *xc)
+			snprintf(H.registry, sizeof(H.registry), "%s/backline/plugins.json", xc);
+		else
+			snprintf(H.registry, sizeof(H.registry), "%s/.cache/backline/plugins.json", home ? home : "/tmp");
+	}
 	if (!H.state_dir[0]) {
 		const char *x = getenv("XDG_STATE_HOME");
 		if (x && *x)
@@ -932,8 +1071,9 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	sd_bus_attach_event(H.bus, H.event, 0);
-	printf("{\"bus\": \"%s\", \"pid\": %d, \"worker\": \"%s\", \"scopes\": %s, \"state_dir\": \"%s\"}\n", BUS_NAME,
-	       (int)getpid(), H.worker, H.use_scope ? "true" : "false", H.state_dir);
+	printf("{\"bus\": \"%s\", \"pid\": %d, \"worker\": \"%s\", \"scopes\": %s, \"state_dir\": \"%s\", \"registry\": \"%s\"}\n",
+	       BUS_NAME, (int)getpid(), H.worker, H.use_scope ? "true" : "false", H.state_dir,
+	       access(H.registry, R_OK) == 0 ? H.registry : "");
 	fflush(stdout);
 	logf_("ready on %s (workers %s)", BUS_NAME, H.use_scope ? "in systemd user scopes" : "as child processes");
 

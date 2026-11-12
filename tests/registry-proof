@@ -1,0 +1,154 @@
+#!/bin/bash
+# registry-proof: every installed plugin indexed and graded, crash-proof.
+#
+#  1. A cold scan of ~/.clap, ~/.vst3 and ~/.lv2 (plus the test plugins), each
+#     binary probed in its own sandboxed process (a systemd user scope with a
+#     memory, task and time limit), with a timing report.
+#  2. A warm rescan: everything from the cache.
+#  3. The cache key: a touched file (new mtime, same bytes) is a hash hit; a
+#     changed file is probed again.
+#  4. Containment: a plugin that crashes (and leaves a helper process behind)
+#     and one that hangs (with a detached child) are graded fail; the scan
+#     completes; no process, scope or scratch file is left; the plugin
+#     directories are unchanged.
+#  5. Queries: the CLI (--json) and the D-Bus service, which exits when idle.
+#
+# Throwaway only: the registry cache lives under tests/out/registry, not in
+# ~/.cache; nothing is copied into the plugin directories.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/.." && pwd)
+out=$here/out/registry
+rm -rf "$out"; mkdir -p "$out"
+exec > >(tee "$out/report.txt") 2>&1
+REG=$root/build/registry/backline-registry
+TP=$root/build/test-plugins
+export BACKLINE_CACHE_DIR=$out/cache
+serve_pid=
+cleanup() { [[ -n $serve_pid ]] && kill "$serve_pid" 2>/dev/null || true; }
+trap cleanup EXIT
+
+cat >"$out/report.py" <<'EOF'
+import json, sys
+cmd, args = sys.argv[1], sys.argv[2:]
+load = lambda f: json.load(open(f))
+if cmd == "cold":
+    d = load(args[0])
+    w = sorted((p for p in d["plugins"] if p.get("check")), key=lambda p: -p["check"].get("wall_ms", 0))[:5]
+    print("  slowest probes: " + "; ".join("%s %s %.2f s" % (p["format"], p["name"], p["check"]["wall_ms"] / 1000) for p in w))
+    print("  by kind:", d["summary"]["by_kind"], "| by grade:", d["summary"]["by_grade"])
+elif cmd == "same":
+    a, b = load(args[0]), load(args[1])
+    print("  grades identical to the cold scan:", [(p["id"], p["grade"]) for p in a["plugins"]] == [(p["id"], p["grade"]) for p in b["plugins"]])
+elif cmd == "key":
+    s = json.load(sys.stdin)["scan"]; c, p = s["cache"], s["probes"]
+    print("cache hit %d, hash hit %d, miss %d; probes run %d, reused %d" % (c["hit"], c["hash_hit"], c["miss"], p["run"], p["reused"]))
+elif cmd == "contain":
+    d = load(args[0])
+    for g in ("fail", "warn"):
+        for p in d["plugins"]:
+            if p["grade"] == g:
+                print("  %s %-4s %s: %s" % (g.upper() if g == "fail" else g, p["format"], p["name"], "; ".join(p["reasons"])))
+    c = {p["id"]: p for p in d["plugins"]}
+    crash, hang = c["backline.test.crash"], c["backline.test.hang"]
+    gain, sine = c["backline.test.gain"], c["backline.test.sine"]
+    ok = (crash["grade"] == "fail" and crash["check"]["status"] == "crashed" and crash["check"].get("signal_name") == "SIGSEGV"
+          and crash["check"].get("stray_processes") == 1 and hang["grade"] == "fail" and hang["check"]["status"] == "timeout"
+          and hang["check"].get("killed_processes") == 2 and gain["grade"] == "pass" and sine["grade"] == "pass")
+    print("  test plugins: crash -> %s %s, its helper process killed: %s; hang -> %s after %.1f s, processes killed with its scope: %s; gain %s, sine %s"
+          % (crash["check"]["status"], crash["check"].get("signal_name"), crash["check"].get("stray_processes"),
+             hang["check"]["status"], hang["check"]["seconds"], hang["check"].get("killed_processes"), gain["grade"], sine["grade"]))
+    print("  scan completed: %d plugins indexed, %d scan errors" % (d["summary"]["plugins"], len(d["errors"])))
+    print("  RESULT:", "PASS" if ok else "FAIL", "(crash and hang graded fail and contained; the good plugins pass)")
+elif cmd == "count":
+    print(len(json.load(sys.stdin)["plugins"]), "plugins")
+elif cmd == "show":
+    print(", ".join("%s %s%s" % (p["format"], p["grade"], " (preferred)" if p["preferred"] else "") for p in json.load(sys.stdin)))
+EOF
+R() { python3 -I "$out/report.py" "$@"; }
+snapshot() { find -L ~/.clap ~/.vst3 ~/.lv2 -printf '%p %s %T@\n' 2>/dev/null | sort; }
+leftovers() {
+  echo "probes running: $(pgrep -c -f 'backline-probe ' || true);" \
+       "probe scopes: $(systemctl --user list-units 'backline-probe-*' --all --no-legend | wc -l);" \
+       "scratch dirs: $(find "${XDG_RUNTIME_DIR:-/tmp}/backline/probe" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+}
+
+echo "== registry-proof $(date -Is)"
+echo "kernel $(uname -r), $(nproc) CPUs; plugin dirs: ~/.clap ~/.vst3 ~/.lv2 ($(du -shL ~/.clap ~/.vst3 ~/.lv2 2>/dev/null | awk '{print $1}' | paste -sd/))"
+echo "test plugins: $(cd "$TP" && ls *.clap | paste -sd' ')"
+snapshot >"$out/plugin-dirs-before.txt"
+user_cache_before=$(stat -c %Y ~/.cache/backline/plugins.json 2>/dev/null || echo none)
+echo "before: $(leftovers)"
+
+echo; echo "-- 1. cold scan (empty cache), validate on, timeout 10 s per probe"
+t0=$(date +%s.%N)
+"$REG" scan --path "clap:$TP" --timeout 10 | sed 's/^/  /'
+t1=$(date +%s.%N)
+cp "$BACKLINE_CACHE_DIR/plugins.json" "$out/plugins-cold.json"
+awk -v a="$t0" -v b="$t1" 'BEGIN { printf "  wall clock: %.2f s\n", b - a }'
+R cold "$out/plugins-cold.json"
+
+echo; echo "-- 2. warm rescan (nothing changed)"
+t0=$(date +%s.%N)
+"$REG" scan --path "clap:$TP" --timeout 10 | sed 's/^/  /'
+t1=$(date +%s.%N)
+awk -v a="$t0" -v b="$t1" 'BEGIN { printf "  wall clock: %.2f s\n", b - a }'
+R same "$out/plugins-cold.json" "$BACKLINE_CACHE_DIR/plugins.json"
+echo "  (timeouts are never cached, since they can depend on load: the hang plugin is probed again, which is the 10 s above)"
+echo "  warm rescan of the standard directories only (a copy of the same cache, without the test plugins):"
+cp -r "$BACKLINE_CACHE_DIR" "$out/cache-std"
+t0=$(date +%s.%N)
+BACKLINE_CACHE_DIR=$out/cache-std "$REG" scan | sed -n '1,4p' | sed 's/^/  /'
+t1=$(date +%s.%N)
+awk -v a="$t0" -v b="$t1" 'BEGIN { printf "    wall clock: %.2f s\n", b - a }'
+rm -rf "$out/cache-std"
+
+echo; echo "-- 3. cache key: size + mtime, then SHA-256 (a copy of the ok test plugin in a scratch dir)"
+pd=$out/plugdir; mkdir -p "$pd"; cp "$TP/backline-test-ok.clap" "$pd/"
+k() { BACKLINE_CACHE_DIR=$out/cache-key "$REG" scan --only-paths --path "clap:$pd" --json \
+      | R key; }
+echo "  first scan:                 $(k)"
+echo "  unchanged:                  $(k)"
+touch -d '2001-01-01 00:00:00' "$pd/backline-test-ok.clap"
+echo "  touched (mtime 2001):       $(k)"
+printf '\0' >>"$pd/backline-test-ok.clap"
+echo "  one byte appended:          $(k)"
+
+echo; echo "-- 4. containment"
+R contain "$out/plugins-cold.json"
+sleep 0.3
+echo "  after: $(leftovers)"
+snapshot >"$out/plugin-dirs-after.txt"
+echo "  plugin directories unchanged (paths, sizes, mtimes): $(cmp -s "$out/plugin-dirs-before.txt" "$out/plugin-dirs-after.txt" && echo yes || echo NO) ($(wc -l <"$out/plugin-dirs-after.txt") entries)"
+
+echo; echo "-- 5. queries"
+echo "  CLI: backline-registry list --kind instrument --grade pass --json -> $("$REG" list --kind instrument --grade pass --json | R count)"
+"$REG" list --kind instrument --format clap | sed 's/^/    /'
+echo "  CLI: backline-registry show 'Surge XT' -> $("$REG" show 'Surge XT' | R show)"
+"$REG" serve --idle 3 2>"$out/serve.log" &
+serve_pid=$!
+B=(busctl --user --json=short call io.github.manuaudio.Backline.Registry /io/github/manuaudio/Backline/Registry io.github.manuaudio.Backline.Registry1)
+for _ in $(seq 100); do busctl --user status io.github.manuaudio.Backline.Registry >/dev/null 2>&1 && break; sleep 0.05; done
+t0=$(date +%s%N)
+q=$("${B[@]}" Query s '{"kind":"effect","format":"lv2","grade":"pass","text":"reverb"}')
+t1=$(date +%s%N)
+echo "  D-Bus Query({kind:effect, format:lv2, grade:pass, text:reverb}) in $(( (t1 - t0) / 1000000 )) ms (incl. busctl start-up): $(jq -r '.data[0]' <<<"$q" | jq -r '[.plugins[].name] | join(", ")')"
+echo "  D-Bus List(\"instrument\", \"vst3\"): $("${B[@]}" List ss instrument vst3 | jq '.data[0] | length') rows; first: $("${B[@]}" List ss instrument vst3 | jq -c '.data[0][0]')"
+echo "  D-Bus Show(\"Backline Test Hang\"): $("${B[@]}" Show s 'Backline Test Hang' | jq -r '.data[0]' | jq -c '.plugins[0] | {grade, reasons}')"
+echo "  D-Bus Count: $(busctl --user get-property io.github.manuaudio.Backline.Registry /io/github/manuaudio/Backline/Registry io.github.manuaudio.Backline.Registry1 Count)"
+for _ in $(seq 100); do kill -0 "$serve_pid" 2>/dev/null || break; sleep 0.1; done
+echo "  service after 3 s idle: $(kill -0 "$serve_pid" 2>/dev/null && echo STILL RUNNING || echo exited) ($(tail -1 "$out/serve.log"))"
+serve_pid=
+
+echo; echo "-- unit tests"
+(cd "$root/build" && ctest -R registry --output-on-failure 2>&1 | grep -E "tests passed|Failed|failed" | sed 's/^/  /')
+
+echo; echo "-- clean up"
+rm -rf "$out/cache-key" "$pd"
+echo "  $(leftovers); registry service running: $(pgrep -c -f 'backline-registry serve' || true)"
+echo "  user's ~/.cache/backline/plugins.json untouched: $([[ $(stat -c %Y ~/.cache/backline/plugins.json 2>/dev/null || echo none) == "$user_cache_before" ]] && echo yes || echo NO)"
+
+# The published copy: home directory shown as ~.
+exec 1>&- 2>&-; exec >"$out/publish.log" 2>&1
+sleep 0.2
+sed "s|$HOME|~|g" "$out/report.txt" >"$root/docs/proofs/registry-proof.txt"

@@ -201,6 +201,7 @@ int bl_host_load(bl_client *c, const char *plugin, const bl_load_options *opt, c
 	if (r >= 0) r = append_s(m, "cpu-quota", opt->cpu_quota);
 	if (r >= 0) r = append_b(m, "autoconnect", opt->autoconnect);
 	if (r >= 0) r = append_b(m, "restart", opt->restart);
+	if (r >= 0) r = append_b(m, "force", opt->force);
 	if (r >= 0) r = sd_bus_message_close_container(m);
 	if (r < 0) {
 		sd_bus_message_unref(m);
