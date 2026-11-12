@@ -2,6 +2,7 @@
     <qresource prefix="/">
         <file>qml/Main.qml</file>
         <file>qml/TopBar.qml</file>
+        <file>qml/StatusLine.qml</file>
         <file>qml/ChannelStrip.qml</file>
         <file>qml/SidePanel.qml</file>
         <file>qml/HelpOverlay.qml</file>

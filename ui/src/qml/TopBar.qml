@@ -17,6 +17,18 @@ Rectangle {
   readonly property real rate: Number(clock.Rate || 48000)
   property real nowMs: Date.now()
 
+  // Narrow tiled windows: the blocks give way from the right instead of
+  // running into each other. The wordmark goes first, then tempo, meter and
+  // sync, then the timecode and the record block get smaller.
+  readonly property real gapTc: 28
+  readonly property real gapInfo: 36
+  readonly property real fixedRight: 16
+  readonly property bool compact: width < 640
+  readonly property real recWidth: compact ? Math.max(150, Math.min(220, width * 0.42)) : 300
+  readonly property real coreWidth: 10 + recWidth + gapTc + tcBlock.implicitWidth + fixedRight
+  readonly property bool showInfo: coreWidth + gapInfo + infoRow.implicitWidth <= width
+  readonly property bool showWordmark: showInfo && coreWidth + gapInfo + infoRow.implicitWidth + 24 + wordmark.implicitWidth <= width
+
   // The timecode moves at 25 Hz between the clock's 4 Hz reports, only while
   // rolling and on screen.
   Timer {
@@ -35,7 +47,7 @@ Rectangle {
   Rectangle {
     id: recBlock
     anchors { left: parent.left; top: parent.top; bottom: parent.bottom; margins: 10 }
-    width: 300
+    width: bar.recWidth
     radius: Math.min(4, theme.radius)
     color: bar.recording ? theme.alpha(theme.urgent, 0.16) : theme.raised
     border.width: 1
@@ -61,6 +73,8 @@ Rectangle {
         font.pixelSize: 10
         font.bold: true
         font.letterSpacing: 1.2
+        elide: Text.ElideRight
+        width: parent.width
       }
       Text {
         textFormat: Text.PlainText
@@ -84,13 +98,13 @@ Rectangle {
   // ---- Timecode ----
   Column {
     id: tcBlock
-    anchors { left: recBlock.right; leftMargin: 28; verticalCenter: parent.verticalCenter }
+    anchors { left: recBlock.right; leftMargin: bar.gapTc; verticalCenter: parent.verticalCenter }
     spacing: 0
     Text {
       textFormat: Text.PlainText
       text: services.clockRunning ? Strips.timecode(bar.frame, bar.rate, bar.fps) : "--:--:--:--"
       color: bar.report.rolling ? theme.foreground : theme.mix(theme.dim, theme.foreground, 0.5)
-      font.pixelSize: 38
+      font.pixelSize: bar.compact ? 26 : 38
       font.bold: true
       font.features: { "tnum": 1 }
     }
@@ -98,7 +112,7 @@ Rectangle {
       spacing: 18
       Text {
         textFormat: Text.PlainText
-        text: services.clockRunning ? String(bar.report.bbt || bar.clock.Bbt || "1|1|0") : qsTr("CLOCK STOPPED · p STARTS IT")
+        text: services.clockRunning ? String(bar.report.bbt || bar.clock.Bbt || "1|1|0") : (bar.compact ? qsTr("CLOCK STOPPED") : qsTr("CLOCK STOPPED · p STARTS IT"))
         color: theme.dim
         font.pixelSize: 11
         font.bold: true
@@ -110,7 +124,9 @@ Rectangle {
 
   // ---- Tempo, meter, sync ----
   Row {
-    anchors { left: tcBlock.right; leftMargin: 36; verticalCenter: parent.verticalCenter }
+    id: infoRow
+    visible: bar.showInfo
+    anchors { left: tcBlock.right; leftMargin: bar.gapInfo; verticalCenter: parent.verticalCenter }
     spacing: 28
 
     Column {
@@ -159,7 +175,9 @@ Rectangle {
   // DESIGN SLOT (wordmark): Manu's product wordmark replaces the BACKLINE text
   // here; see ui/DESIGN-LANGUAGE.md, "Where Manu's design slots in".
   Column {
-    anchors { right: parent.right; rightMargin: 16; verticalCenter: parent.verticalCenter }
+    id: wordmark
+    visible: bar.showWordmark
+    anchors { right: parent.right; rightMargin: bar.fixedRight; verticalCenter: parent.verticalCenter }
     spacing: 2
     Text {
       anchors.right: parent.right
