@@ -1,41 +1,41 @@
-== registry-proof 2026-11-11T18:07:27-08:00
+== registry-proof 2026-11-11T18:26:22-08:00
 kernel 7.2.5-3-omarchy, 16 CPUs; plugin dirs: ~/.clap ~/.vst3 ~/.lv2 (666M/1.2G/1.3G)
 test plugins: backline-test-crash.clap backline-test-hang.clap backline-test-ok.clap
-before: probes running: 0; probe scopes: 0; scratch dirs: 0
+before: probes running: 2; probe scopes: 0; scratch dirs: 0
 
 -- 1. cold scan (empty cache), validate on, timeout 10 s per probe
-  scanned 645 plugins (219 products) in 13.37 s [sandbox: systemd-scope, 16 jobs, timeout 10 s]
-    phases: discover 1.72 s, fingerprint 0.10 s, load 0.22 s, check 11.32 s, index 0.00 s
+  scanned 645 plugins (219 products) in 13.53 s [sandbox: systemd-scope, 16 jobs, timeout 10 s]
+    phases: discover 1.83 s, fingerprint 0.11 s, load 0.26 s, check 11.31 s, index 0.01 s
     cache: 53 binaries: 0 hit (size+mtime), 0 hash hit, 53 miss; 1190.0 MB hashed
     probes: 469 run, 0 reused from cache; 3 crashed, 1 timed out, 0 errors; processes left behind and killed: 1
            plugins   pass   warn   fail  unvalidated
     clap       218    215      0      3            0
     vst3       213    213      0      0            0
     lv2        214    212      1      1            0
-    -> ~/Developer-lab/backline/tests/out/registry/cache/plugins.json
-  wall clock: 13.38 s
-  slowest probes: clap Backline Test Hang 10.01 s; lv2 LSP Multi-Sampler x48 Stereo 0.62 s; lv2 LSP Multi-Sampler x48 DirectOut 0.57 s; clap Odin2 0.51 s; lv2 LSP Multi-Sampler x24 DirectOut 0.45 s
+    -> ./tests/out/registry/cache/plugins.json
+  wall clock: 13.54 s
+  slowest probes: clap Backline Test Hang 10.02 s; lv2 LSP Multi-Sampler x48 Stereo 0.67 s; lv2 LSP Multi-Sampler x48 DirectOut 0.58 s; clap Odin2 0.48 s; lv2 LSP Multi-Sampler x24 DirectOut 0.41 s
   by kind: {'effect': 583, 'instrument': 41, 'midi-effect': 2, 'analyzer': 27} | by grade: {'pass': 640, 'warn': 1, 'fail': 4, 'unvalidated': 0}
 
 -- 2. warm rescan (nothing changed)
-  scanned 645 plugins (219 products) in 11.81 s [sandbox: systemd-scope, 16 jobs, timeout 10 s]
-    phases: discover 1.78 s, fingerprint 0.01 s, load 0.00 s, check 10.01 s, index 0.01 s
+  scanned 645 plugins (219 products) in 11.62 s [sandbox: systemd-scope, 16 jobs, timeout 10 s]
+    phases: discover 1.60 s, fingerprint 0.00 s, load 0.00 s, check 10.01 s, index 0.01 s
     cache: 53 binaries: 53 hit (size+mtime), 0 hash hit, 0 miss; 0.0 MB hashed
     probes: 2 run, 467 reused from cache; 0 crashed, 1 timed out, 0 errors; processes left behind and killed: 0
            plugins   pass   warn   fail  unvalidated
     clap       218    215      0      3            0
     vst3       213    213      0      0            0
     lv2        214    212      1      1            0
-    -> ~/Developer-lab/backline/tests/out/registry/cache/plugins.json
-  wall clock: 11.82 s
+    -> ./tests/out/registry/cache/plugins.json
+  wall clock: 11.63 s
   grades identical to the cold scan: True
   (timeouts are never cached, since they can depend on load: the hang plugin is probed again, which is the 10 s above)
   warm rescan of the standard directories only (a copy of the same cache, without the test plugins):
-  scanned 641 plugins (215 products) in 1.61 s [sandbox: systemd-scope, 16 jobs, timeout 30 s]
-    phases: discover 1.59 s, fingerprint 0.00 s, load 0.00 s, check 0.00 s, index 0.01 s
+  scanned 641 plugins (215 products) in 1.62 s [sandbox: systemd-scope, 16 jobs, timeout 30 s]
+    phases: discover 1.61 s, fingerprint 0.00 s, load 0.00 s, check 0.00 s, index 0.00 s
     cache: 50 binaries: 50 hit (size+mtime), 0 hash hit, 0 miss; 0.0 MB hashed
     probes: 1 run, 461 reused from cache; 0 crashed, 0 timed out, 0 errors; processes left behind and killed: 0
-    wall clock: 1.62 s
+    wall clock: 1.63 s
 
 -- 3. cache key: size + mtime, then SHA-256 (a copy of the ok test plugin in a scratch dir)
   first scan:                 cache hit 0, hash hit 0, miss 1; probes run 3, reused 0
@@ -73,7 +73,7 @@ before: probes running: 0; probe scopes: 0; scratch dirs: 0
     * clap instrument         pass        Sampler Stereo                         LSP CLAP              
     * clap instrument         pass        Surge XT                               Surge Synth Team      
   CLI: backline-registry show 'Surge XT' -> clap pass (preferred), lv2 pass, vst3 pass
-  D-Bus Query({kind:effect, format:lv2, grade:pass, text:reverb}) in 3 ms (incl. busctl start-up): Dragonfly Hall Reverb, Dragonfly Plate Reverb, Dragonfly Room Reverb, LSP Impulse Reverb Mono, LSP Impulse Reverb Stereo
+  D-Bus Query({kind:effect, format:lv2, grade:pass, text:reverb}) in 4 ms (incl. busctl start-up): Dragonfly Hall Reverb, Dragonfly Plate Reverb, Dragonfly Room Reverb, LSP Impulse Reverb Mono, LSP Impulse Reverb Stereo
   D-Bus List("instrument", "vst3"): 14 rows; first: ["vst3","2046504473616C636E64436400000000","Cardinal","DISTRHO","instrument","pass","~/.vst3/Cardinal.vst3"]
   D-Bus Show("Backline Test Hang"): {"grade":"fail","reasons":["check timed out after 10 s; 2 processes killed with its cgroup"]}
   D-Bus Count: u 645

@@ -11,6 +11,18 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initi
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3>=1.4)
+
+# PipeWire 1.6 has a body-level pod parser and a stateful UMP converter; the
+# worker uses them when present and the older iteration API otherwise.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_INCLUDES ${PIPEWIRE_INCLUDE_DIRS})
+check_cxx_source_compiles("
+#include <spa/pod/parser.h>
+#include <spa/control/ump-utils.h>
+int main() { spa_pod_parser p; spa_pod_parser_init_from_data(&p, nullptr, 0, 0, 0);
+  const uint32_t *u = nullptr; size_t n = 0; uint64_t st = 0; uint8_t m[4];
+  return spa_ump_to_midi(&u, &n, m, 4, &st); }" BL_HAVE_SPA_PARSER_BODY)
+unset(CMAKE_REQUIRED_INCLUDES)
 pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 pkg_check_modules(SNDFILE REQUIRED IMPORTED_TARGET sndfile>=1.1)
 pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
@@ -27,6 +39,9 @@ target_link_libraries(bl_graph PUBLIC PkgConfig::PIPEWIRE)
 add_executable(backline-plugin-worker host/worker.cpp)
 target_include_directories(backline-plugin-worker PRIVATE third_party/clap/include)
 target_link_libraries(backline-plugin-worker PRIVATE bl_graph PkgConfig::PIPEWIRE PkgConfig::SYSTEMD ${CMAKE_DL_LIBS})
+if(BL_HAVE_SPA_PARSER_BODY)
+  target_compile_definitions(backline-plugin-worker PRIVATE BL_HAVE_SPA_PARSER_BODY=1)
+endif()
 
 # Recorder: N nodes into sample-aligned, timestamped files.
 add_library(bl_rec_align STATIC recorder/rec_align.c)

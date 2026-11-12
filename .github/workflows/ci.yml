@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.distro }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PipeWire >= 1.4 is required; Ubuntu 24.04 ships 1.0, so build in containers.
+          - distro: archlinux
+            image: archlinux:latest
+          - distro: debian-trixie
+            image: debian:trixie
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install build dependencies (Arch)
+        if: matrix.distro == 'archlinux'
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git cmake ninja pkgconf \
+            pipewire libpipewire systemd-libs libsndfile alsa-lib json-c lilv openssl
+      - name: Install build dependencies (Debian)
+        if: matrix.distro == 'debian-trixie'
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential git cmake ninja-build pkg-config ca-certificates \
+            libpipewire-0.3-dev libsystemd-dev libsndfile1-dev libasound2-dev \
+            libjson-c-dev liblilv-dev libssl-dev
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+      - name: Build
+        run: cmake --build build
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure

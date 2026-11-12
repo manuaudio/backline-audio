@@ -378,13 +378,37 @@ void silence(uint32_t n)
                 memset(b, 0, n * sizeof(float));
 }
 
+#ifdef BL_HAVE_SPA_PARSER_BODY
+// UMP packets in one control (PipeWire >= 1.6: the stateful converter).
+void push_ump(uint32_t t, const void *body, size_t size)
+{
+    const uint32_t *u = (const uint32_t *)body;
+    uint64_t state = 0;
+    while (size > 0) {
+        uint8_t midi[16];
+        int sz = spa_ump_to_midi(&u, &size, midi, sizeof(midi), &state);
+        if (sz < 0) break;
+        if (sz > 0) push_midi_event(t, midi, (size_t)sz);
+    }
+}
+#else
+// PipeWire < 1.6: one UMP message per control.
+void push_ump(uint32_t t, const void *body, size_t size)
+{
+    uint8_t midi[16];
+    int sz = spa_ump_to_midi((uint32_t *)body, size, midi, sizeof(midi));
+    if (sz > 0) push_midi_event(t, midi, (size_t)sz);
+}
+#endif
+
 void drain_midi_port(uint32_t n, bool deliver)
 {
     pw_buffer *b = pw_filter_dequeue_buffer(W->midi_port);
     if (!b)
         return;
     spa_data *d = &b->buffer->datas[0];
-    if (d->data && deliver) {
+    if (d->data && d->chunk && deliver) {
+#ifdef BL_HAVE_SPA_PARSER_BODY
         spa_pod_parser parser;
         spa_pod_frame frame;
         spa_pod_sequence seq;
@@ -394,21 +418,25 @@ void drain_midi_port(uint32_t n, bool deliver)
         if (spa_pod_parser_push_sequence_body(&parser, &frame, &seq, &seq_body) >= 0) {
             while (spa_pod_parser_get_control_body(&parser, &c, &c_body) >= 0) {
                 uint32_t t = std::min<uint32_t>(c.offset, n ? n - 1 : 0);
-                if (c.type == SPA_CONTROL_Midi) {
+                if (c.type == SPA_CONTROL_Midi)
                     push_midi_event(t, (const uint8_t *)c_body, c.value.size);
-                } else if (c.type == SPA_CONTROL_UMP) {
-                    const uint32_t *u = (const uint32_t *)c_body;
-                    size_t usize = c.value.size;
-                    uint64_t state = 0;
-                    while (usize > 0) {
-                        uint8_t midi[16];
-                        int sz = spa_ump_to_midi(&u, &usize, midi, sizeof(midi), &state);
-                        if (sz < 0) break;
-                        if (sz > 0) push_midi_event(t, midi, (size_t)sz);
-                    }
-                }
+                else if (c.type == SPA_CONTROL_UMP)
+                    push_ump(t, c_body, c.value.size);
             }
         }
+#else
+        auto *pod = (spa_pod *)spa_pod_from_data(d->data, d->maxsize, d->chunk->offset, d->chunk->size);
+        if (pod && spa_pod_is_sequence(pod)) {
+            spa_pod_control *c;
+            SPA_POD_SEQUENCE_FOREACH((spa_pod_sequence *)pod, c) {
+                uint32_t t = std::min<uint32_t>(c->offset, n ? n - 1 : 0);
+                if (c->type == SPA_CONTROL_Midi)
+                    push_midi_event(t, (const uint8_t *)SPA_POD_BODY(&c->value), SPA_POD_BODY_SIZE(&c->value));
+                else if (c->type == SPA_CONTROL_UMP)
+                    push_ump(t, SPA_POD_BODY(&c->value), SPA_POD_BODY_SIZE(&c->value));
+            }
+        }
+#endif
     }
     pw_filter_queue_buffer(W->midi_port, b);
 }

@@ -1,23 +1,23 @@
-== host-proof 2026-11-11T17:39:31-08:00
+== host-proof 2026-11-11T18:25:07-08:00
 pipewire 1.6.8, kernel 7.2.5-3-omarchy
 default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
 other nodes in the graph: 6; pipewire/wireplumber pids: 20756 20754 / 20755
 
 -- 1. virtual keyboard -> PipeWire MIDI bridge -> Surge XT (CLAP, own process) -> test sink
-worker A: pid 2809065, node 100, OSC 127.0.0.1:41273, D-Bus io.github.manuaudio.Backline.Instance.backline_surge_a
+worker A: pid 2959567, node 60, OSC 127.0.0.1:53774, D-Bus io.github.manuaudio.Backline.Instance.backline_surge_a
   backline-plugin-worker: midi-follow: linking Midi-Bridge:backline-test-kbd:keys (capture) | backline-test-kbd:keys
-  backline-plugin-worker: midi-follow: source port 91 went away; releasing held notes
-  recorded 360000 frames at 48000 Hz; take starts at graph frame 2816
+  backline-plugin-worker: midi-follow: source port 79 went away; releasing held notes
+  recorded 360000 frames at 48000 Hz; take starts at graph frame 2560
   note expect Hz    FFT Hz  cents     level  on->sound off->-60dB  gap peak
-  A4     440.000   440.020   0.08  -21.9 dB    1.94 ms    23.0 ms -138.3 dB
-  C4     261.626   261.607  -0.12  -21.9 dB    1.98 ms    24.0 ms -146.6 dB
-  E5     659.255   659.261   0.02  -22.0 dB    2.08 ms    25.0 ms -135.3 dB
+  A4     440.000   440.020   0.08  -21.9 dB    3.00 ms    24.0 ms -138.5 dB
+  C4     261.626   261.607  -0.12  -21.9 dB    2.00 ms    24.0 ms -141.5 dB
+  E5     659.255   659.261   0.02  -22.0 dB    2.12 ms    25.0 ms -135.6 dB
   RESULT: PASS (3 notes, pitch within 5 cents, sounding > -40 dBFS, gaps < -90 dBFS peak)
 
 -- 1b. keyboard unplugged while a key is down (its note-off never comes)
-  backline-plugin-worker: midi-follow: source port 91 went away; releasing held notes
+  backline-plugin-worker: midi-follow: source port 79 went away; releasing held notes
   worker A ReleasedNotes: 1
-  held note -21.9 dBFS; from 300 ms after unplug: peak -144.5 dBFS
+  held note -21.9 dBFS; from 300 ms after unplug: peak -148.5 dBFS
   RESULT: PASS (no stuck note)
 
 -- 2. live parameter change: Surge 'Global Volume' over OSC, read back and restored over D-Bus
@@ -25,19 +25,19 @@ worker A: pid 2809065, node 100, OSC 127.0.0.1:41273, D-Bus io.github.manuaudio.
   OSC  /backline/param/set "Global Volume" 0.5
   OSC  /backline/param/get reply: {"address": "/backline/param", "args": [-810883302, "/Global & FX//Global Volume", 0.5, 0.0, 1.0]}
   D-Bus SetParam("Global Volume", 0.9577969908714294433594); GetParam -> 0.9577969908714294433594
-  level before -21.93 dBFS | after OSC 0.5: -43.90 dBFS (-21.97 dB) | after D-Bus restore: -21.95 dBFS
-  OSC send -> level down by 6 dB: <= 24.0 ms (upper bound: 5 ms analysis window; includes the sender's start-up)
+  level before -21.92 dBFS | after OSC 0.5: -43.91 dBFS (-21.98 dB) | after D-Bus restore: -21.93 dBFS
+  OSC send -> level down by 6 dB: <= 27.0 ms (upper bound: 5 ms analysis window; includes the sender's start-up)
   RESULT: PASS (change > 6 dB while set, restored within 0.5 dB)
 
 -- 3. crash isolation: two instances playing; SIGKILL instance A mid-note
-  SIGKILL -> worker A (pid 2809065)
-tests/host-proof: line 200: 2809065 Killed                     "$@"
+  SIGKILL -> worker A (pid 2959567)
+tests/host-proof: line 200: 2959567 Killed                     "$@"
   worker A node present after kill: no
   worker A D-Bus name present: no
-  worker B: cycles 707 -> 899 across the kill; still answers D-Bus: 0.9577969908714294433594
+  worker B: cycles 730 -> 924 across the kill; still answers D-Bus: 0.9577969908714294433594
   other nodes (ids + names) unchanged across the crash: yes (6 nodes)
   pipewire/wireplumber pids: 20756 20754 / 20755 (before: 20756 20754 / 20755)
-  kill at 1.537 s into the take; recorder overruns: 0 frames
+  kill at 1.541 s into the take; recorder overruns: 0 frames
   track A (killed):   -21.93 dBFS before, peak -240.0 dBFS after (silent: PipeWire dropped the node)
   track B (survivor): -21.92 dBFS before, -21.92 dBFS after the kill
     20 ms windows: spread 0.480 dB over the whole take vs 0.480 dB before the kill; longest run of exact zeros: 0 samples (a dropped cycle would be >= 64)

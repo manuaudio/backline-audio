@@ -65,13 +65,13 @@ effect-insert component.
 
 | Component | One line | Language | Status |
 |---|---|---|---|
-| `backline-registry` | The system plugin index (CLAP, VST3, LV2), with crash-proof scanning and validation on install | C probe + C service | Prototype (641 plugins) |
-| `backline-hostd` + `backline-plugin-worker` | Out-of-process plugin host: each instance one process and one PipeWire node, with MIDI in, params and presets over D-Bus and OSC | C++ | **Worker slice built and measured** |
-| `backline-recorderd` | Records any set of nodes to sample-aligned, timestamped multitrack WAV/BWF or FLAC | C | **Recorder slice built and measured** |
+| `backline-registry` + `backline-probe` | The system plugin index (CLAP, VST3, LV2), with crash-proof scanning and validation on install | C | **Built and measured** (§4.4): sandboxed probes, grades, cache, `Registry1` |
+| `backline-hostd` + `backline-plugin-worker` | Out-of-process plugin host: each instance one process and one PipeWire node, with MIDI in, params and presets over D-Bus and OSC | C (hostd), C++ (worker) | **Built and measured** (§4.1, §4.3): supervisor with restart-with-state |
+| `backline-recorderd` | Records any set of nodes to sample-aligned, timestamped multitrack WAV/BWF or FLAC | C | **Recorder built and measured** (§4.2), with signal alignment and pre-roll; the D-Bus daemon is next |
 | `backline-playerd` | Plays files into the graph, locked to the shared timeline | C | Design |
 | `backline-clockd` | Transport, tempo and timecode: the PipeWire timeline owner, Ableton Link, LTC/MTC generation and chase | C++ (Link is C++) | Design |
 | `backline-controld` | Maps OSC and MIDI to any parameter in the system: Backline instances, filter-chain/clap-pipewire controls, volumes, transport | C | Design (the worker already speaks OSC) |
-| `libbackline` + `backline` CLI + `Backline` QML module | The client surface for apps and Omarchy panels | C (lib), C (CLI), C++/QML (module) | Design |
+| `libbackline` + `backline` CLI + `Backline` QML module | The client surface for apps and Omarchy panels | C (lib), C (CLI), C++/QML (module) | Library skeleton and CLI built (host, instance, plugins, rec); QML is design |
 | clap-pipewire (separate project) | CLAP effects inside filter-chain: device effects and virtual sinks, in-graph | C | v0.1, separate project |
 
 ## 2. Components
@@ -90,15 +90,30 @@ effect-insert component.
   - A probe always runs in a throwaway working directory (Cardinal writes
     into the cwd).
   - The registry itself is not a resident daemon. `backline-registry scan`
-    updates `$XDG_CACHE_HOME/backline/plugins.json`, cached by path, size
-    and mtime. A D-Bus activatable service, `io.github.manuaudio.Backline.Registry1`,
-    exists only to answer queries and emit `Changed`, and exits when idle.
+    updates `$XDG_CACHE_HOME/backline/plugins.json`. The probe cache is
+    keyed on path, size and mtime, then on the binary's SHA-256: a touched
+    but unchanged binary is not probed again. Timeouts are never cached.
+  - `backline-registry serve` is the D-Bus service
+    (`io.github.manuaudio.Backline.Registry1`). It answers `Query`, `Show`,
+    `List` and `Scan`, emits `Changed`, and exits when idle. An activation
+    file template is in `data/dbus/`.
+  - What is left in a probe's cgroup after it exits or times out (helper
+    processes) is killed with the scope. Without a user systemd (CI), the
+    registry falls back to a process group under a child subreaper.
+  - Grades: `fail` means a host would be hurt (a crash, a timeout, a load
+    or instantiate error, non-finite output). `warn` means findings a host
+    survives (a state round-trip mismatch, a slow load, files written into
+    the working directory). VST3 is graded on load only (`"checked":
+    "load"`) until the worker hosts VST3.
 - **Triggers.** A pacman hook for `/usr/lib/{clap,vst3,lv2}` (root,
   Omarchy-side), and a user `.path` unit on `~/.clap`, `~/.vst3` and
   `~/.lv2`.
 - **Interfaces.**
-  - `backline plugins list|show|scan [--validate] [--json]`.
-  - D-Bus `List(filter) → a{sv}[]`, `Show(id)`, `Scan(paths)`, signal `Changed`.
+  - `backline plugins list|show|scan [--json]` (through D-Bus, or straight
+    from the index when the service isn't running).
+  - D-Bus `Query(s filter_json) → s`, `Show(s) → s`,
+    `List(s kind, s format) → a(sssssss)`, `Scan(b) → s`, signal `Changed`,
+    properties `Generated` and `Count`.
   - The JSON schema is versioned (`backline.plugins/1`). It's the
     prototype's schema plus an optional `product-id`.
 - **Realtime.** None. Probing is offline by design.
@@ -128,16 +143,39 @@ effect-insert component.
     node.** It's a `pw_filter` with `midi_in` (for plugins with note
     ports), `in_*` and `out_*` DSP ports per CLAP audio port and channel, a
     D-Bus object and an OSC socket.
-  - **`backline-hostd` is the supervisor** (next to build). Its D-Bus API,
-    `io.github.manuaudio.Backline.Host1`, has `Load(plugin, options) → instance`,
-    `Unload`, `List`, a `Crashed(instance, signal)` signal and a restart
-    policy.
-  - hostd starts each worker as a transient systemd user unit
-    (`systemd-run --user --unit=backline-worker-<id> -p MemoryMax=… -p CPUQuota=…`).
-    That gives per-plugin resource limits, cgroup cleanup, journald logs
-    and `coredumpctl` attribution for free.
-  - After a crash, hostd restarts the worker and restores the last state.
-    It saves state on every preset change and on a timer while dirty.
+  - **`backline-hostd` is the supervisor** (built). Its D-Bus API is
+    `io.github.manuaudio.Backline.Host1`:
+    - `Load(s plugin, a{sv} options) → s id`. It replies once the node is
+      up. Options: `id`, `plugin-id`, `name`, `target`, `midi-follow`,
+      `state`, `memory-max`, `cpu-quota`, `autoconnect`, `restart`, `force`.
+    - `Unload(s)`, `Restart(s)`, `Get(s) → a{sv}`, `List() → aa{sv}`.
+    - Signals `Loaded`, `Unloaded`, `Crashed(s id, i signal, i exit_status)`,
+      `Restarted(s id, u pid, u restarts)` and `Failed(s id, s reason)`.
+  - hostd starts each worker in a transient systemd user scope
+    (`systemd-run --user --scope --unit=backline-worker-<id>-<generation>`,
+    `MemoryMax`, `TasksMax`, optionally `CPUQuota`). That gives per-plugin
+    resource limits, cgroup cleanup, journald attribution and `coredumpctl`
+    attribution for free. hostd is the worker's parent (a scope, not a
+    service), so it gets the exact exit status. Workers get
+    `PR_SET_PDEATHSIG` and never outlive hostd. When a worker dies, hostd
+    kills whatever is left in its scope.
+  - **State.** hostd gives each instance a state file
+    (`$XDG_STATE_HOME/backline/instances/<id>.clapstate`). The worker
+    restores it on start, and saves it atomically (temp file, fsync,
+    rename) whenever it changes: 100 ms after the last change, at least
+    once a second while changes continue, and *only once the audio thread
+    has handed every pending parameter event to the plugin*. The first
+    version saved on the next tick and lost the last of three quick
+    parameter moves; §4.3 caught it. The `StateSerial` and `StateSaved`
+    properties make "saved" observable.
+  - **Restart policy.** The first crash after a healthy run restarts at
+    once. Crashes in a row back off (250 ms, doubling to 5 s). Six crashes
+    within 60 s give up (`Failed`) until an explicit `Restart`. A worker
+    that never came up is a load error, not a crash loop. A restart keeps
+    the node name, OSC port and D-Bus name, and the worker re-makes its
+    links.
+  - **Registry gate.** hostd looks a plugin up in the registry index.
+    One graded `fail` is refused unless loaded with `force`.
   - The supervisor never loads plugin code itself.
 - **Threads (implemented in the worker).**
   - *Main* is the PipeWire main loop. It makes every CLAP `[main-thread]`
@@ -243,19 +281,31 @@ effect-insert component.
     - per-track node, channels and file.
 
     The clock service will add timecode and bar/beat to it.
+- **Pre-roll** (built). `-P SECONDS` arms the recorder and keeps the last
+  N seconds in the rings. SIGUSR1 (or `record` on stdin) starts the take,
+  with those seconds included and timestamped from the first kept frame.
+- **Signal alignment** (built, the default; `-a graph` turns it off).
+  - The problem, measured in §4.2. The driver runs first in each cycle,
+    before the nodes that feed it. So a sink that drives the graph delivers
+    on its monitor what it was fed in the *previous* cycle, one quantum
+    later than a follower sink's monitor of the same signal.
+  - The fix works per cycle. In each cycle, the recorder writes the driver
+    sink's monitor as it arrives and every other track from a one-cycle
+    copy (`rec_align.h`). Frame *j* is then the same input sample on every
+    track. It holds through quantum changes (a graph idles at 128 and jumps
+    to 2048 when a player joins) and through driver changes. A first
+    version that shifted by the quantum at take start broke on exactly
+    those two cases.
+  - The ports' reported `SPA_PARAM_Latency` can't drive the fix. A null
+    sink reports 1 quantum of playback latency whether it drives or
+    follows, and 0 until something feeds it. The recorder logs it in the
+    sidecar.
+  - Compensating capture latency of hardware sources (for "as heard in the
+    room" alignment) is a separate, later mode.
 - **Interfaces (next).**
   - D-Bus `Recorder1`: `Arm(sources, options)`, `Record`, `Stop`, `Takes`,
     and signals `Level`/`Overrun`.
-  - `backline rec <node>... [-d] [--format]`.
-  - Pre-roll: keep the ring running while armed and write the last N
-    seconds when Record arrives (the "never miss the take" feature).
-- **Known limit: graph latency.** §4.2 shows that a sink that is the graph
-  *driver* delivers its monitor one quantum later than a follower sink
-  (2048 frames at quantum 2048). That's a property of PipeWire's
-  scheduling, and the recorder records it faithfully. For signal-aligned
-  takes across devices, recorderd must compensate using the ports'
-  `SPA_PARAM_Latency` plus the driver/follower offset. That's the next
-  recorder task, and it's measured in the proof, so it can be tested.
+  - `backline rec` runs the recorder today with its own flags.
 - **Reuse.**
   - `pw-record` (one stream, no timestamps, so not alignable: −384 to −512
     frames apart in the control runs).
@@ -338,9 +388,12 @@ effect-insert component.
 
 ### 2.7 Client surface: `libbackline`, `backline`, QML module
 
-- **`libbackline`.** A C ABI, MIT, small. It's a typed wrapper over the
-  D-Bus interfaces (sd-bus) plus graph discovery through `backline.*` node
-  properties. Its versioned headers are the contract for applications.
+- **`libbackline`.** A C ABI, MIT, small (built as a skeleton:
+  `lib/include/backline/backline.h`). It's a typed wrapper over the D-Bus
+  interfaces (sd-bus) for `Host1`, `Instance1` and `Registry1`, plus a
+  signal watcher. Graph discovery through `backline.*` node properties
+  comes with the recorder daemon. Its versioned headers are the contract
+  for applications.
 - **`backline` CLI.** Thin, with `--json` everywhere:
   - `backline plugins ...`
   - `backline host load|unload|list|params|set|note`
@@ -397,12 +450,12 @@ effect-insert component.
 
 ## 4. Measured proofs (2026-11-11, development machine)
 
-Both proofs run on throwaway null sinks owned by the test script
+All proofs run on throwaway null sinks owned by the test script
 (`object.linger = false`). They never link to real devices, and they check
 the default sink and every other node before and after. Full reports are in
 `docs/proofs/`.
 
-### 4.1 Plugin host slice (`tests/host-proof`)
+### 4.1 Plugin worker (`tests/host-proof`)
 
 The path: Surge XT (CLAP), in `backline-plugin-worker`, as node
 `backline.surge-a` → test sink. The keyboard is `backline-test-keyboard`, an
@@ -443,39 +496,108 @@ PipeWire's `Midi-Bridge`, and the worker links it itself (`--midi-follow`).
     hardware DAC.
   - Rate re-activation is implemented but not exercised.
 
-### 4.2 Recorder slice (`tests/recorder-proof`)
+### 4.2 Recorder (`tests/recorder-proof`)
 
-One test signal (irregular impulses, noise, 1 kHz; R = −0.5 × L) is played
-by one player, fanned out to two different null sinks. Both sinks' monitors
-are recorded as two tracks in one take. Two `pw-record` processes record the
-same sinks at the same moment, as a control.
+One test signal is played by one player and fanned out to two different
+null sinks: irregular impulses, noise and a 1 kHz tone, with R = −0.5 × L.
+Both sinks' monitors are recorded as two tracks in one take. As a control,
+two `pw-record` processes record the same sinks at the same moment.
 
-| Topology | Lag, track 2 vs 1 | Difference at that lag | Lengths | BWF time ref | pw-record control |
-|---|---|---|---|---|---|
-| Both recorded sinks are followers (a dedicated driver) | **0 samples** | **0.0** (bit-identical, 240 000 frames, both channels) | equal | equal, and equal to the sidecar's UTC start | −384 samples apart, no timestamps |
-| One recorded sink is the graph driver | **−2048 = exactly one quantum** | 0.0 at that lag | equal | equal | −384 |
+| Topology | `-a graph` (raw cycle alignment) | `-a signal` (default) | pw-record control |
+|---|---|---|---|
+| Both recorded sinks are followers (a dedicated driver) | — | **lag 0**, bit-identical over 240 000 frames, both channels | −384 to −512 samples apart, no timestamps |
+| One recorded sink drives, quantum 2048 | **−2048 = exactly one quantum**, bit-identical at that lag | **lag 0**, bit-identical | −256 to −384 |
+| The same at quantum 256 | **−256**, bit-identical at that lag | **lag 0**, bit-identical | — |
 
-- The second row is a PipeWire property, not a recorder error: a driver
-  node's monitor carries the previous cycle. The proof checks it, so the
-  latency compensation in §2.3 can be tested against it.
-- FLAC (24-bit) takes carry the same reference in a Vorbis comment.
+- In every take, the quantum changes when the player joins (the graph
+  idles at 128). In the first row the driver also changes twice during the
+  take. The per-cycle pairing holds through both; the shift-at-start
+  version failed exactly here.
+- Equal lengths, and equal BWF time references that match the sidecar's UTC
+  start. FLAC (24-bit) takes carry the same reference in a Vorbis comment.
+- **Pre-roll.** A recorder stood by with 2 s of pre-roll and was triggered
+  (SIGUSR1) 1.4 s into playback. The take holds exactly 96 000 frames from
+  before the trigger. It is sample-for-sample identical to the matching
+  stretch of a reference take recorded from before the start, with 4 of the
+  6 impulses before the trigger, and its two tracks are aligned at lag 0.
+
+### 4.3 Supervisor (`tests/hostd-proof`)
+
+The path: `backline` CLI → libbackline → hostd → Surge XT in
+`backline-worker-synth-0.scope` (MemoryMax 4G, TasksMax 512). A virtual
+keyboard plays A4 every 0.45 s through PipeWire's MIDI bridge.
+
+- **SIGKILL while playing.** Three parameters had been moved away from
+  their defaults (Global Volume 0.5, A Pitch 0.6, Send FX 1 Return 0.25).
+  - `Crashed(signal 9)` arrived 3.4 ms after the kill, and
+    `Restarted(new pid, restarts 1)` 84 ms after it, in a new scope.
+  - **All 775 parameter values were identical before and after (exact
+    comparison).** The node name, OSC port and D-Bus name were the same,
+    and OSC answered on the old port.
+  - Notes: 7 before the kill, 10 after it, and all 10 sound. The level was
+    −43.90 → −43.92 dBFS and the pitch 477.12 → 477.12 Hz (+0.00 cent). The
+    defaults would give −21.9 dBFS at 440 Hz.
+  - The note held at the kill is cut. Sound returns with the first note-on
+    after the restart (315 ms of silence at this note spacing).
+  - The first run found a real bug: the autosave could run before the
+    audio thread had delivered the last parameter change, so Send FX 1
+    Return came back at its default. Fixed (§2.2), and checked by the exact
+    comparison.
+- **Crash loop.** Killed whenever it came back: crash to restart took 91,
+  351, 592, 1082 and 2102 ms, then the 6th crash gave `Failed` ("6
+  crashes in 60 s"). An explicit `Restart` brings it back with its state.
+- **Registry gate.** A test plugin graded `fail` (it segfaults in
+  `process` and leaves a helper process) is refused. With `--force` it
+  crash-loops to `Failed`, and no scope and no process of it is left.
+- Afterwards, there were no Backline nodes, processes or scopes. The other
+  nodes, the PipeWire/WirePlumber pids and the default sink were unchanged.
+
+### 4.4 Registry (`tests/registry-proof`)
+
+A full scan of `~/.clap`, `~/.vst3` and `~/.lv2`, plus three test plugins
+(ok, crash, hang), with 16 parallel probes and a 10 s timeout.
+
+| Format | Plugins | Pass | Warn | Fail |
+|---|---|---|---|---|
+| CLAP | 218 | 215 | 0 | 3 |
+| VST3 (load only) | 213 | 213 | 0 | 0 |
+| LV2 | 214 | 212 | 1 | 1 |
+
+- **Timing.** The cold scan took 13.5 s: 469 probes and 1.19 GB hashed in
+  0.1 s. Of that, 10 s is the hang plugin's timeout; the slowest real
+  plugin took 0.6 s. A warm rescan of the standard directories takes
+  1.6 s, almost all of it the LV2 TTL parse.
+- **Cache.** Unchanged → hit on size and mtime. Touched → hit on SHA-256,
+  with no probe. One byte appended → probed again.
+- **Containment.** The crash plugin was graded `fail` (SIGSEGV), and its
+  helper was killed with the scope. The hang plugin was graded `fail` by
+  timeout, and both of its processes were killed. The scan completed with
+  0 errors. No probes, scopes or scratch directories were left, and the
+  plugin directories were unchanged (50 453 entries compared).
+- **A real finding.** Cardinal Synth aborts (SIGABRT) as CLAP and as LV2
+  because of a corrupt settings file in the user's config, which a host
+  would hit too. Cardinal Mini writes into the working directory (`warn`).
+- **Queries.** A D-Bus `Query` takes about 3 ms, and the service exits
+  when idle.
 
 ## 5. Build order
 
-1. **Host supervisor and client skeleton.**
-   - `backline-hostd` (D-Bus `Host1`, a transient unit per worker, crash
-     signal, restart with restored state).
-   - The `backline` CLI and `libbackline` with just the host and recorder
-     calls.
-   - Parameter naming aligned with clap-pipewire.
-2. **Registry service.**
-   - Promote `plugprobe` into `backline-probe`. Add the scope-isolated
-     validation, `backline plugins --json` and the D-Bus query service.
-   - hostd resolves plugins through it and refuses `fail` grades unless
-     forced.
-3. **Recorder service.**
-   - `recorderd` with `Recorder1`, latency compensation (verified against
-     the §4.2 driver case), pre-roll and RF64.
+1. **Host supervisor and client skeleton.** *Done (§4.3).*
+   - `backline-hostd` (D-Bus `Host1`, a transient scope per worker, crash
+     signals, restart with restored state, backoff and give-up).
+   - The `backline` CLI and `libbackline` with the host, instance, plugin
+     and recorder calls.
+   - Still open: parameter naming aligned with clap-pipewire's sanitised
+     control names.
+2. **Registry service.** *Done (§4.4).*
+   - `backline-probe` (from the prototype's `plugprobe`), scope-isolated
+     probing and grading, the cache, `backline plugins --json` and the
+     D-Bus query service. hostd refuses `fail` grades unless forced.
+   - Still open: the pacman hook and the `.path` unit, the optional
+     clap-validator pass, VST3 run checks, caching `lv2-list`.
+3. **Recorder.** *Alignment and pre-roll done (§4.2).*
+   - Still open: `recorderd` with `Recorder1`, RF64 for takes over 4 GB,
+     and hardware capture-latency compensation.
 4. **Clock and transport.**
    - clockd as segment owner and JACK timebase master. Fill CLAP
      `transport` in the worker. Then Link, then LTC, then MTC, each with a

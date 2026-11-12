@@ -1,38 +1,91 @@
-== recorder-proof 2026-11-11T17:39:51-08:00
+== recorder-proof 2026-11-11T18:25:27-08:00
 default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
 signal: 151157 frames (3.15 s), stereo, R = -0.5 x L
 
 -- 1. two follower nodes (a dedicated driver runs the graph): the same signal on both
 ./tests/out/recorder/take-align-pw-record-a.wav
 ./tests/out/recorder/take-align-pw-record-b.wav
-  sidecar: start 2026-11-12T01:39:51.683608687Z, graph frame 1152, 240000 frames, quantum 128..2048, overruns 0
-  take-align-01-backline-test.rec-a.wav: 240000 frames, 2 ch float32, bext 2026-11-11 17:39:51 time_reference=3052400813
-  take-align-02-backline-test.rec-b.wav: 240000 frames, 2 ch float32, bext 2026-11-11 17:39:51 time_reference=3052400813
+  recorder: track 1: backline-test.rec-a monitor, node 102, drove 660 cycles of the take; reported playback latency 0.0 quantum + 0 frames + 0 ns
+  recorder: track 2: backline-test.rec-b monitor, node 167, drove 0 cycles of the take; reported playback latency 0.0 quantum + 0 frames + 0 ns
+  sidecar: start 2026-11-12T02:25:27.626680410Z, graph frame 1024, 240000 frames, quantum 128..2048, overruns 0
+  take-align-01-backline-test.rec-a.wav: 240000 frames, 2 ch float32, bext 2026-11-11 18:25:27 time_reference=3183726081
+  take-align-02-backline-test.rec-b.wav: 240000 frames, 2 ch float32, bext 2026-11-11 18:25:27 time_reference=3183726081
   lag track 2 vs track 1: 0 samples; max |difference| at that lag: L 0.0 R 0.0 over 240000 frames (47003 non-silent)
-  first impulses (sample index), track 1: [51968, 56769, 64102, 67005, 78122]
-                                 track 2: [51968, 56769, 64102, 67005, 78122]
+  first impulses (sample index), track 1: [54144, 58945, 66278, 69181, 80298]
+                                 track 2: [54144, 58945, 66278, 69181, 80298]
   channel map: max |R + 0.5 L| = 1.5e-05 on both tracks (R = -0.5 x L as played)
-  BWF time_reference: track 1 3052400813, track 2 3052400813; sidecar UTC start as samples since local midnight: 3052400813
-  control, two pw-record processes on the same nodes: lag -512 samples, lengths 240128 vs 239488, timestamps: none
+  BWF time_reference: track 1 3183726081, track 2 3183726081; sidecar UTC start as samples since local midnight: 3183726081
+  alignment: signal, one-cycle pairing: True; cycles each recorded sink drove: [660, 0]; driver changes 2, quantum changes 2
+  control, two pw-record processes on the same nodes: lag -384 samples, lengths 239744 vs 239232, timestamps: none
   RESULT: PASS (bit-identical at lag 0, equal length, equal timestamps, no overruns)
 
--- 2. same, but one of the two recorded sinks is the graph driver
-./tests/out/recorder/take-driver-pw-record-b.wav
+-- 2. one of the two recorded sinks is the graph driver
 ./tests/out/recorder/take-driver-pw-record-a.wav
-  sidecar: start 2026-11-12T01:39:59.094255044Z, graph frame 1280, 240000 frames, quantum 128..2048, overruns 0
-  take-driver-01-backline-test.rec-a.wav: 240000 frames, 2 ch float32, bext 2026-11-11 17:39:59 time_reference=3052756524
-  take-driver-02-backline-test.rec-b.wav: 240000 frames, 2 ch float32, bext 2026-11-11 17:39:59 time_reference=3052756524
+./tests/out/recorder/take-driver-pw-record-b.wav
+  recorder: track 1: backline-test.rec-a monitor, node 114, drove 735 cycles of the take; reported playback latency 0.0 quantum + 0 frames + 0 ns
+  recorder: track 2: backline-test.rec-b monitor, node 62, drove 0 cycles of the take; reported playback latency 0.0 quantum + 0 frames + 0 ns
+  [-a graph: no compensation]
+  sidecar: start 2026-11-12T02:25:34.984394208Z, graph frame 1024, 240000 frames, quantum 128..2048, overruns 0
+  take-driver-graph-01-backline-test.rec-a.wav: 240000 frames, 2 ch float32, bext 2026-11-11 18:25:34 time_reference=3184079251
+  take-driver-graph-02-backline-test.rec-b.wav: 240000 frames, 2 ch float32, bext 2026-11-11 18:25:34 time_reference=3184079251
   lag track 2 vs track 1: -2048 samples; max |difference| at that lag: L 0.0 R 0.0 over 237952 frames (47003 non-silent)
-  first impulses (sample index), track 1: [53760, 58561, 65894, 68797, 79914]
-                                 track 2: [51712, 56513, 63846, 66749, 77866]
+  first impulses (sample index), track 1: [55936, 60737, 68070, 70973, 82090]
+                                 track 2: [53888, 58689, 66022, 68925, 80042]
   channel map: max |R + 0.5 L| = 1.5e-05 on both tracks (R = -0.5 x L as played)
-  BWF time_reference: track 1 3052756524, track 2 3052756524; sidecar UTC start as samples since local midnight: 3052756524
-  control, two pw-record processes on the same nodes: lag -384 samples, lengths 240000 vs 239616, timestamps: none
-  RESULT: PASS (bit-identical, offset by exactly one quantum = 2048: the driver sink's monitor carries the previous cycle)
+  BWF time_reference: track 1 3184079251, track 2 3184079251; sidecar UTC start as samples since local midnight: 3184079251
+  alignment: graph, one-cycle pairing: False; cycles each recorded sink drove: [735, 0]; driver changes 0, quantum changes 0
+  RESULT: PASS (raw graph alignment: bit-identical, offset by exactly one quantum = 2048: the driver sink's monitor carries the previous cycle)
+  [-a signal (default): per cycle, the driver sink's monitor is paired with the others' previous cycle]
+  sidecar: start 2026-11-12T02:25:34.984394212Z, graph frame 1024, 240000 frames, quantum 128..2048, overruns 0
+  take-driver-01-backline-test.rec-a.wav: 240000 frames, 2 ch float32, bext 2026-11-11 18:25:34 time_reference=3184079251
+  take-driver-02-backline-test.rec-b.wav: 240000 frames, 2 ch float32, bext 2026-11-11 18:25:34 time_reference=3184079251
+  lag track 2 vs track 1: 0 samples; max |difference| at that lag: L 0.0 R 0.0 over 240000 frames (47003 non-silent)
+  first impulses (sample index), track 1: [53888, 58689, 66022, 68925, 80042]
+                                 track 2: [53888, 58689, 66022, 68925, 80042]
+  channel map: max |R + 0.5 L| = 1.5e-05 on both tracks (R = -0.5 x L as played)
+  BWF time_reference: track 1 3184079251, track 2 3184079251; sidecar UTC start as samples since local midnight: 3184079251
+  alignment: signal, one-cycle pairing: True; cycles each recorded sink drove: [735, 0]; driver changes 0, quantum changes 2
+  control, two pw-record processes on the same nodes: lag -384 samples, lengths 239872 vs 239360, timestamps: none
+  RESULT: PASS (bit-identical at lag 0, equal length, equal timestamps, no overruns)
+
+-- 3. the same at quantum 256 (forced on the test graph only)
+  recorder: track 1: backline-test.rec-a monitor, node 103, drove 1283 cycles of the take; reported playback latency 0.0 quantum + 0 frames + 0 ns
+  recorder: track 2: backline-test.rec-b monitor, node 84, drove 0 cycles of the take; reported playback latency 0.0 quantum + 0 frames + 0 ns
+  [-a graph]
+  sidecar: start 2026-11-12T02:25:43.423969523Z, graph frame 1152, 240000 frames, quantum 128..256, overruns 0
+  take-q256-graph-01-backline-test.rec-a.wav: 240000 frames, 2 ch float32, bext 2026-11-11 18:25:43 time_reference=3184484351
+  take-q256-graph-02-backline-test.rec-b.wav: 240000 frames, 2 ch float32, bext 2026-11-11 18:25:43 time_reference=3184484351
+  lag track 2 vs track 1: -256 samples; max |difference| at that lag: L 0.0 R 0.0 over 239744 frames (47003 non-silent)
+  first impulses (sample index), track 1: [50560, 55361, 62694, 65597, 76714]
+                                 track 2: [50304, 55105, 62438, 65341, 76458]
+  channel map: max |R + 0.5 L| = 1.5e-05 on both tracks (R = -0.5 x L as played)
+  BWF time_reference: track 1 3184484351, track 2 3184484351; sidecar UTC start as samples since local midnight: 3184484351
+  alignment: graph, one-cycle pairing: False; cycles each recorded sink drove: [1283, 0]; driver changes 0, quantum changes 0
+  RESULT: PASS (raw graph alignment: bit-identical, offset by exactly one quantum = 256: the driver sink's monitor carries the previous cycle)
+  [-a signal]
+  sidecar: start 2026-11-12T02:25:43.421302852Z, graph frame 1024, 240000 frames, quantum 128..256, overruns 0
+  take-q256-01-backline-test.rec-a.wav: 240000 frames, 2 ch float32, bext 2026-11-11 18:25:43 time_reference=3184484223
+  take-q256-02-backline-test.rec-b.wav: 240000 frames, 2 ch float32, bext 2026-11-11 18:25:43 time_reference=3184484223
+  lag track 2 vs track 1: 0 samples; max |difference| at that lag: L 0.0 R 0.0 over 240000 frames (47003 non-silent)
+  first impulses (sample index), track 1: [50432, 55233, 62566, 65469, 76586]
+                                 track 2: [50432, 55233, 62566, 65469, 76586]
+  channel map: max |R + 0.5 L| = 1.5e-05 on both tracks (R = -0.5 x L as played)
+  BWF time_reference: track 1 3184484223, track 2 3184484223; sidecar UTC start as samples since local midnight: 3184484223
+  alignment: signal, one-cycle pairing: True; cycles each recorded sink drove: [1283, 0]; driver changes 0, quantum changes 2
+  RESULT: PASS (bit-identical at lag 0, equal length, equal timestamps, no overruns)
+
+-- 4. pre-roll: stand by with 2 s, trigger 1.4 s into playback; compare with a reference take
+  SIGUSR1 -> pre-roll recorder 1.4 s after the player started
+  pre-roll take: 168000 frames; pre-roll 96000 frames (asked 96000) = 2.000 s before the trigger
+  trigger at graph frame 128640, take starts at 32640 (trigger - pre-roll: 32640); reference starts at 1024
+  track 1: 168000 frames == reference frames [31616, 199616) on both channels: yes; impulses before the trigger: 4 of 6 (first at frame 78464)
+  track 2: 168000 frames == reference frames [31616, 199616) on both channels: yes; impulses before the trigger: 4 of 6 (first at frame 78464)
+  the two tracks of the pre-roll take: lag 0, max |difference| 0.0 (cycles each sink drove: [36, 0])
+  RESULT: PASS (pre-roll exact, take identical to the reference stretch, tracks aligned)
 
 -- FLAC: same recorder, -f flac
   take-flac-01-backline-test.rec-a.flac: 48000 2 24 48000 
-  comment=BACKLINE_TIME_REFERENCE=3053103855 BACKLINE_GRAPH_POSITION=1280
+  comment=BACKLINE_TIME_REFERENCE=3185203791 BACKLINE_GRAPH_POSITION=1152
 
 -- clean up
 backline nodes left: 0; processes left: 0

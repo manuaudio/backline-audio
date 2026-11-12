@@ -1,0 +1,58 @@
+== hostd-proof 2026-11-11T18:25:59-08:00
+pipewire 1.6.8, kernel 7.2.5-3-omarchy, systemd 261
+default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
+hostd: {"bus": "io.github.manuaudio.Backline.Host", "pid": 2965699, "worker": "./build/backline-plugin-worker", "scopes": true, "state_dir": "./tests/out/hostd/state", "registry": "./tests/out/hostd/registry/plugins.json"}
+
+-- 1. load through the CLI, move three parameters, state saved
+  {"id":"synth","node":"backline.synth","dbus":"io.github.manuaudio.Backline.Instance.backline_synth","pid":2965710,"osc_port":36149,"unit":"backline-worker-synth-0.scope","state_file":"./tests/out/hostd/state/synth.clapstate"}
+  scope: ActiveState=active ControlGroup=/user.slice/user-1000.slice/user@1000.service/app.slice/backline-worker-synth-0.scope MemoryMax=4294967296 TasksMax=512 
+  backline set synth "Global Volume" 0.5 -> 0.5
+  backline set synth "A Pitch" 0.6 -> 0.59999999999999998
+  backline set synth "Send FX 1 Return" 0.25 -> 0.25
+  StateSerial 3 = StateSaved 3 (autosaves: 1), 50322 bytes
+
+-- 2. SIGKILL the worker while the keyboard plays
+  SIGKILL -> worker pid 2965710
+  {"state":"running","pid":2965945,"restarts":1,"last_signal":9,"osc_port":36149,"node":"backline.synth","dbus":"io.github.manuaudio.Backline.Instance.backline_synth","unit":"backline-worker-synth-1.scope"}
+  old scope backline-worker-synth-0.scope: inactive; new scope backline-worker-synth-1.scope: active
+  OSC on the same port 36149: {"address": "/backline/param", "args": [-810883302, "/Global & FX//Global Volume", 0.5, 0.0, 1.0]}
+  worker: backline-plugin-worker: midi-follow: linking Midi-Bridge:backline-test-kbd:keys (capture) | backline-test-kbd:keys
+  worker: backline-plugin-worker: restored state from ./tests/out/hostd/state/synth.clapstate (50322 bytes, 775 params)
+  worker: backline-plugin-worker: midi-follow: linking Midi-Bridge:backline-test-kbd:keys (capture) | backline-test-kbd:keys
+  parameters: 775 before, 775 after; values that differ: 0 (exact comparison)
+    Send FX 1 Return   before 0.25  after 0.25
+    Global Volume      before 0.5  after 0.5
+    A Pitch            before 0.6  after 0.6
+  signals: Crashed(signal 9) +3.4 ms, Restarted(pid 2965945, restarts 1) +83.8 ms after the kill
+  notes (A4 = 440 Hz played; A Pitch moved): 7 before the kill, 10 after the restart, 10/10 of those sound
+    before: -43.90 dBFS, 477.12 Hz (spread 0.00 Hz)
+    after:  -43.92 dBFS, 477.12 Hz -> level -0.01 dB, pitch +0.00 cents
+    (defaults would give about -21.9 dBFS at 440 Hz: the moved parameters were restored, not reset)
+  silence after the kill: 315 ms. Sound returns with the first note-on sent after the restart (onset within 0.5 ms of it); the note held at the kill is cut. Notes are 0.45 s apart.
+  RESULT: PASS (same 775 parameter values, same level and pitch, every note after the restart sounds)
+
+-- 3. crash loop: kill it whenever it comes back; hostd backs off, then gives up
+  'backline host restart synth' -> {"state":"running","pid":2966422,"restarts":2}
+  {"state":"failed","restarts":7,"pid":0,"fail_reason":"6 crashes in 60 s; giving up"}
+  6 crashes; crash -> restarted (ms): [91, 351, 592, 1082, 2102, None]
+  Failed: 6 crashes in 60 s; giving up
+  RESULT: PASS (immediate first restart, then backoff, then it stays down)
+  explicit 'backline host restart synth': {"state":"running","restarts":8}, Global Volume 0.5
+
+-- 4. registry gate: a plugin graded fail is refused unless forced
+  registry: {"name":"Backline Test Crash","grade":"fail","reasons":["check crashed (SIGSEGV, signal 11)","left 1 process running in its cgroup (killed)"]}
+  load without --force: refused: backline: host load: Load: the registry grades ./build/test-plugins/backline-test-crash.clap fail: check crashed (SIGSEGV, signal 11); left 1 process running in its cgroup (killed) (load with force=true to run it anyway)
+  scopes for it: 0
+  load --force: {"id":"crashy","state":"running","pid":2967649,"unit":"backline-worker-crashy-0.scope"}
+  {"state":"failed","restarts":5,"last_signal":11,"fail_reason":"6 crashes in 60 s; giving up"}
+  Crashed signals:  6 11 
+  after Failed: crashy scopes left 0, its processes (worker or helpers) left 0
+  RESULT: PASS (refused by grade; forced, it crash-loops to Failed and leaves nothing behind)
+
+-- clean up
+  {"id":"synth","unloaded":true}
+  after unload: instances 0, node present: no
+backline nodes left: 0; processes left: 0; scopes left: 0
+other nodes same as at start: yes (6 nodes)
+pipewire/wireplumber pids: 20756 20754 / 20755 (before: 20756 20754 / 20755)
+default sink after: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} (unchanged)
