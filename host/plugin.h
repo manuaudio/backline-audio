@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -153,6 +154,9 @@ std::unique_ptr<PluginInstance> load_lv2(Host *h, const std::string &uri_or_bund
 #endif
 
 // Shared helpers
+// The worker's real stdout (machine-readable output: --list, the ready line).
+// fd 1 itself goes to stderr, so a plugin that prints can't corrupt it.
+extern FILE *out;
 std::string slug(const std::string &s);         // "Surge XT" -> "surge-xt"
 std::string json_str(const std::string &v);
 [[noreturn]] void die(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

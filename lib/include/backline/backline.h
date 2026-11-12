@@ -88,8 +88,13 @@ typedef struct bl_instance {
 	char fail_reason[256];
 } bl_instance;
 
-/* Start a plugin instance; returns when its node is up. `id_out` may be NULL. */
+/* Start a plugin instance; returns when its node is up. `id_out` may be NULL.
+ * `plugin`: a .clap file, a .vst3 bundle, an LV2 URI or .lv2 bundle, or a
+ * name in the standard directories (CLAP first, then VST3, then LV2). */
 int bl_host_load(bl_client *c, const char *plugin, const bl_load_options *opt, char *id_out, size_t id_size);
+/* The same, looking only for `format` ("clap", "vst3", "lv2"; NULL = any). */
+int bl_host_load_format(bl_client *c, const char *plugin, const char *format, const bl_load_options *opt,
+			char *id_out, size_t id_size);
 int bl_host_unload(bl_client *c, const char *id);
 int bl_host_restart(bl_client *c, const char *id);
 int bl_host_get(bl_client *c, const char *id, bl_instance *out);
@@ -141,6 +146,19 @@ int bl_instance_set_param(bl_client *c, const char *instance, const char *key, d
 int bl_instance_note(bl_client *c, const char *instance, bool on, uint8_t channel, uint8_t key, uint8_t velocity);
 int bl_instance_save_state(bl_client *c, const char *instance, const char *path);
 int bl_instance_load_state(bl_client *c, const char *instance, const char *path);
+/* Presets: what the plugin offers (CLAP preset-discovery, .vstpreset files
+ * and VST3 program lists, LV2 pset:Preset). `id` is what load_preset takes;
+ * an exact name or a unique part of one works too. */
+typedef struct bl_preset {
+	char id[1024];
+	char name[256];
+	char location[1024];     /* a file, or where inside the plugin it lives */
+} bl_preset;
+int bl_instance_presets(bl_client *c, const char *instance, bl_preset **out, size_t *n);
+int bl_instance_load_preset(bl_client *c, const char *instance, const char *id);
+/* Saves the current state as a preset file (VST3: .vstpreset in the standard
+ * user directory, or at `name_or_path` if it has a '/'). */
+int bl_instance_save_preset(bl_client *c, const char *instance, const char *name_or_path, char *path_out, size_t n);
 /* Counters: "Cycles", "MidiEvents", "DroppedEvents", "ReleasedNotes",
  * "StateSerial", "StateSaved", "StateSaves". */
 int bl_instance_counter(bl_client *c, const char *instance, const char *name, uint64_t *out);

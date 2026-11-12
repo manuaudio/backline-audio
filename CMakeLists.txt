@@ -96,6 +96,7 @@ if(BACKLINE_VST3)
     ${_s}/base/thread/source/flock.cpp
     ${_s}/public.sdk/source/common/commonstringconvert.cpp
     ${_s}/public.sdk/source/common/memorystream.cpp
+    ${_s}/public.sdk/source/common/threadchecker_linux.cpp
     ${_s}/public.sdk/source/vst/hosting/connectionproxy.cpp
     ${_s}/public.sdk/source/vst/hosting/eventlist.cpp
     ${_s}/public.sdk/source/vst/hosting/hostclasses.cpp

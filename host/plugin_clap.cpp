@@ -596,16 +596,17 @@ std::unique_ptr<PluginInstance> load_clap(Host *h, const std::string &path, cons
         die("no plugin factory");
     uint32_t n = f->get_plugin_count(f);
     if (list_only) {
-        printf("[\n");
+        fprintf(out, "[\n");
         for (uint32_t i = 0; i < n; i++) {
             auto *d = f->get_plugin_descriptor(f, i);
-            printf("  {\"format\": \"clap\", \"id\": %s, \"name\": %s, \"vendor\": %s, \"features\": [", json_str(d->id).c_str(),
+            fprintf(out, "  {\"format\": \"clap\", \"id\": %s, \"name\": %s, \"vendor\": %s, \"features\": [", json_str(d->id).c_str(),
                    json_str(d->name).c_str(), json_str(d->vendor ? d->vendor : "").c_str());
             for (auto *x = d->features; x && *x; x++)
-                printf("%s%s", x == d->features ? "" : ", ", json_str(*x).c_str());
-            printf("]}%s\n", i + 1 < n ? "," : "");
+                fprintf(out, "%s%s", x == d->features ? "" : ", ", json_str(*x).c_str());
+            fprintf(out, "]}%s\n", i + 1 < n ? "," : "");
         }
-        printf("]\n");
+        fprintf(out, "]\n");
+        fflush(out);
         exit(0);
     }
     const clap_plugin_descriptor *chosen = nullptr;

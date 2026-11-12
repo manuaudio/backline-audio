@@ -9,7 +9,8 @@
  *
  * When a worker dies without being asked to, hostd emits Crashed(), then
  * starts it again with the same options and the same state file. The worker
- * saves its CLAP state to that file atomically whenever it changes, and loads
+ * saves the plugin's state (CLAP, VST3 or LV2) to that file atomically
+ * whenever it changes, and loads
  * it on start, so the new process comes back with the parameters the old one
  * had: same node name, same OSC port, same D-Bus name, same links.
  *
@@ -58,6 +59,7 @@ struct instance {
 	char id[64];
 	char plugin[1024];
 	char plugin_id[256];
+	char format[8];           /* "clap", "vst3", "lv2", or "" = from the plugin argument */
 	char node[256];
 	char target[256];
 	char midi_follow[512];
@@ -82,7 +84,8 @@ struct instance {
 	char unit[160];
 	char dbus[256];
 	char plugin_path[1024];
-	char plugin_clap_id[256];
+	char plugin_clap_id[256];  /* the plugin's id as the worker reports it (any format) */
+	char plugin_format[8];     /* as the worker reports it */
 	unsigned osc_port;
 	uint64_t started_ns, ready_ns, crashed_ns;
 	char fail_reason[256];
@@ -218,27 +221,55 @@ static void emit(const char *signal, const char *types, ...)
 }
 
 /* --------------------------------------------------------------- registry */
-/* The worker's plugin lookup, mirrored: a path, or a name in ~/.clap or
- * /usr/lib/clap. Returns the real path, or "" if not found. */
-static void resolve_plugin(const char *p, char *out, size_t n)
+static bool ends_with(const char *s, const char *suf)
 {
-	char cand[PATH_MAX];
+	size_t a = strlen(s), b = strlen(suf);
+	return a >= b && !strcasecmp(s + a - b, suf);
+}
+
+static bool is_uri(const char *s)
+{
+	return strstr(s, "://") || !strncmp(s, "urn:", 4);
+}
+
+/* The worker's plugin lookup, mirrored: a path (.clap file, .vst3 or .lv2
+ * bundle), an LV2 URI, or a name in the standard directories (CLAP, then
+ * VST3, then LV2; or only `format`'s). Fills the real path ("" for an LV2
+ * URI or when not found) and the format. */
+static void resolve_plugin(const char *p, const char *format, char *out, size_t n, char *fmt_out, size_t fn)
+{
+	char cand[PATH_MAX], c[PATH_MAX];
 	const char *home = getenv("HOME");
-	const char *dirs[] = { NULL, "/usr/lib/clap" };
-	char homeclap[PATH_MAX];
-	snprintf(homeclap, sizeof(homeclap), "%s/.clap", home ? home : "");
-	dirs[0] = homeclap;
 	out[0] = 0;
+	snprintf(fmt_out, fn, "%s", format && format[0] ? format : "clap");
 	if (realpath(p, cand)) {
+		struct stat st;
 		snprintf(out, n, "%s", cand);
+		if (!format || !format[0]) {
+			bool dir = stat(cand, &st) == 0 && S_ISDIR(st.st_mode);
+			snprintf(fmt_out, fn, "%s", ends_with(cand, ".vst3") ? "vst3" : ends_with(cand, ".lv2") && dir ? "lv2" : "clap");
+		}
 		return;
 	}
-	size_t l = strlen(p);
-	for (int i = 0; i < 2; i++) {
-		char c[PATH_MAX];
-		snprintf(c, sizeof(c), "%s/%s%s", dirs[i], p, l > 5 && !strcmp(p + l - 5, ".clap") ? "" : ".clap");
+	if (is_uri(p) && (!format || !format[0] || !strcmp(format, "lv2"))) {
+		snprintf(fmt_out, fn, "lv2");
+		return;
+	}
+	struct { const char *fmt, *base, *dir, *suffix; } dirs[] = {
+		{ "clap", home, "/.clap", ".clap" }, { "clap", "", "/usr/lib/clap", ".clap" },
+		{ "clap", "", "/usr/local/lib/clap", ".clap" },
+		{ "vst3", home, "/.vst3", ".vst3" }, { "vst3", "", "/usr/lib/vst3", ".vst3" },
+		{ "vst3", "", "/usr/local/lib/vst3", ".vst3" },
+		{ "lv2", home, "/.lv2", ".lv2" }, { "lv2", "", "/usr/lib/lv2", ".lv2" }, { "lv2", "", "/usr/local/lib/lv2", ".lv2" },
+	};
+	for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+		if (format && format[0] && strcmp(format, dirs[i].fmt))
+			continue;
+		snprintf(c, sizeof(c), "%s%s/%s%s", dirs[i].base ? dirs[i].base : "", dirs[i].dir, p,
+			 ends_with(p, dirs[i].suffix) ? "" : dirs[i].suffix);
 		if (realpath(c, cand)) {
 			snprintf(out, n, "%s", cand);
+			snprintf(fmt_out, fn, "%s", dirs[i].fmt);
 			return;
 		}
 	}
@@ -247,10 +278,14 @@ static void resolve_plugin(const char *p, char *out, size_t n)
 /* What the registry says about (path, id). id NULL: decided only if every
  * plugin in the file has the same grade. Returns 1 found (grade/reasons
  * filled), 0 unknown. */
-static int registry_grade(const char *path, const char *id, char *grade, size_t gn, char *reasons, size_t rn)
+static int registry_grade(const char *format, const char *path, const char *id, char *grade, size_t gn, char *reasons,
+			  size_t rn)
 {
-	if (!H.registry[0] || !path[0])
+	if (!H.registry[0] || (!path[0] && !(id && id[0])))
 		return 0;
+	char want[PATH_MAX] = "";
+	if (path[0] && !realpath(path, want))
+		snprintf(want, sizeof(want), "%s", path);
 	struct json_object *root = json_object_from_file(H.registry), *list;
 	if (!root)
 		return 0;
@@ -261,13 +296,14 @@ static int registry_grade(const char *path, const char *id, char *grade, size_t 
 		size_t n = json_object_array_length(list);
 		for (size_t i = 0; i < n; i++) {
 			struct json_object *e = json_object_array_get_idx(list, i), *v;
-			if (!json_object_object_get_ex(e, "format", &v) || strcmp(json_object_get_string(v), "clap"))
+			if (!json_object_object_get_ex(e, "format", &v) || strcmp(json_object_get_string(v), format))
 				continue;
-			if (!json_object_object_get_ex(e, "path", &v))
-				continue;
-			char rp[PATH_MAX];
-			if (!realpath(json_object_get_string(v), rp) || strcmp(rp, path))
-				continue;
+			if (want[0]) {
+				char rp[PATH_MAX];
+				if (!json_object_object_get_ex(e, "path", &v) || !realpath(json_object_get_string(v), rp) ||
+				    strcmp(rp, want))
+					continue;
+			}
 			if (id && (!json_object_object_get_ex(e, "id", &v) || strcmp(json_object_get_string(v), id)))
 				continue;
 			const char *g = json_object_object_get_ex(e, "grade", &v) ? json_object_get_string(v) : "";
@@ -360,7 +396,8 @@ static void became_ready(struct instance *in, const struct bl_ready *r)
 {
 	if (!in->ever_ready && !in->force) {
 		char grade[16] = "", reasons[512] = "";
-		if (registry_grade(r->plugin_path, r->plugin, grade, sizeof(grade), reasons, sizeof(reasons)) == 1 &&
+		if (registry_grade(r->format[0] ? r->format : "clap", r->plugin_path, r->plugin, grade, sizeof(grade), reasons,
+				   sizeof(reasons)) == 1 &&
 		    !strcmp(grade, "fail")) {
 			logf_("%s: the registry grades %s fail (%s); stopping it (load with force to override)", in->id,
 			      r->plugin, reasons);
@@ -381,6 +418,7 @@ static void became_ready(struct instance *in, const struct bl_ready *r)
 	snprintf(in->dbus, sizeof(in->dbus), "%s", r->dbus);
 	snprintf(in->plugin_path, sizeof(in->plugin_path), "%s", r->plugin_path);
 	snprintf(in->plugin_clap_id, sizeof(in->plugin_clap_id), "%s", r->plugin);
+	snprintf(in->plugin_format, sizeof(in->plugin_format), "%s", r->format[0] ? r->format : "clap");
 	in->timer_src = sd_event_source_disable_unref(in->timer_src);
 	double ms = (double)(in->ready_ns - (in->generation ? in->crashed_ns : in->started_ns)) / 1e6;
 	if (in->generation == 0) {
@@ -449,6 +487,8 @@ static void build_argv(struct instance *in, char **argv, int max, char store[][1
 	}
 	ARG("%s", H.worker);
 	ARG("--plugin=%s", in->plugin);
+	if (in->format[0])
+		ARG("--format=%s", in->format);
 	if (in->plugin_id[0])
 		ARG("--id=%s", in->plugin_id);
 	ARG("--name=%s", in->node);
@@ -627,6 +667,7 @@ static int append_info(sd_bus_message *r, const struct instance *in)
 	KV("plugin", "s", in->plugin);
 	KV("plugin-path", "s", in->plugin_path);
 	KV("plugin-id", "s", in->plugin_clap_id[0] ? in->plugin_clap_id : in->plugin_id);
+	KV("format", "s", in->plugin_format[0] ? in->plugin_format : in->format);
 	KV("node", "s", in->node);
 	KV("dbus", "s", in->dbus);
 	KV("target", "s", in->target);
@@ -696,6 +737,7 @@ static int m_load(sd_bus_message *m, void *userdata, sd_bus_error *err)
 			else if (!strcmp(key, "memory-max")) { dst = in->memory_max; n = sizeof(in->memory_max); }
 			else if (!strcmp(key, "cpu-quota")) { dst = in->cpu_quota; n = sizeof(in->cpu_quota); }
 			else if (!strcmp(key, "state")) { dst = initial_state; n = sizeof(initial_state); }
+			else if (!strcmp(key, "format")) { dst = in->format; n = sizeof(in->format); }
 			if (!dst) {
 				sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "unknown option '%s'", key);
 				r = -EINVAL;
@@ -729,6 +771,14 @@ static int m_load(sd_bus_message *m, void *userdata, sd_bus_error *err)
 		goto bad;
 	sd_bus_message_exit_container(m);
 
+	if (in->format[0] && strcmp(in->format, "clap") && strcmp(in->format, "vst3") && strcmp(in->format, "lv2")) {
+		sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "format '%s' is not clap, vst3 or lv2", in->format);
+		r = -EINVAL;
+		goto out;
+	}
+	char rpath[PATH_MAX], rfmt[8];
+	resolve_plugin(in->plugin, in->format, rpath, sizeof(rpath), rfmt, sizeof(rfmt));
+
 	/* id: given, or <plugin slug>-<n> */
 	if (in->id[0]) {
 		char slug[64];
@@ -738,12 +788,18 @@ static int m_load(sd_bus_message *m, void *userdata, sd_bus_error *err)
 			goto out;
 		}
 	} else {
-		const char *base = strrchr(plugin, '/');
+		char trimmed[1024];
+		snprintf(trimmed, sizeof(trimmed), "%s", plugin);
+		for (size_t tl = strlen(trimmed); tl > 1 && trimmed[tl - 1] == '/'; tl--)
+			trimmed[tl - 1] = 0;
+		const char *base = strrchr(trimmed, '/');
 		char slug[40];
-		bl_slug(base ? base + 1 : plugin, slug, sizeof(slug));
+		bl_slug(base && base[1] ? base + 1 : trimmed, slug, sizeof(slug));
 		size_t sl = strlen(slug);
-		if (sl > 5 && !strcmp(slug + sl - 5, "-clap"))
+		if (sl > 5 && (!strcmp(slug + sl - 5, "-clap") || !strcmp(slug + sl - 5, "-vst3")))
 			slug[sl - 5] = 0;
+		else if (sl > 4 && !strcmp(slug + sl - 4, "-lv2"))
+			slug[sl - 4] = 0;
 		if (!slug[0])
 			snprintf(slug, sizeof(slug), "plugin");
 		do
@@ -757,7 +813,9 @@ static int m_load(sd_bus_message *m, void *userdata, sd_bus_error *err)
 	}
 	if (!in->node[0])
 		snprintf(in->node, sizeof(in->node), "backline.%s", in->id);
-	snprintf(in->state_path, sizeof(in->state_path), "%s/%s.clapstate", H.state_dir, in->id);
+	/* <id>.clapstate, <id>.vst3state (a .vstpreset image) or <id>.lv2state (LV2 state, Turtle) */
+	snprintf(in->state_path, sizeof(in->state_path), "%s/%s.%sstate", H.state_dir, in->id, rfmt);
+	snprintf(in->plugin_format, sizeof(in->plugin_format), "%s", rfmt);
 	snprintf(in->log_path, sizeof(in->log_path), "%s/%s.log", H.log_dir, in->id);
 
 	/* A new instance starts from defaults, or from the state it was given;
@@ -782,12 +840,14 @@ static int m_load(sd_bus_message *m, void *userdata, sd_bus_error *err)
 	unlink(in->log_path);
 
 	if (!in->force) {
-		char path[PATH_MAX], grade[16] = "", reasons[512] = "";
-		resolve_plugin(in->plugin, path, sizeof(path));
-		if (registry_grade(path, in->plugin_id[0] ? in->plugin_id : NULL, grade, sizeof(grade), reasons,
-				   sizeof(reasons)) == 1 && !strcmp(grade, "fail")) {
+		char grade[16] = "", reasons[512] = "";
+		/* an LV2 URI is its own id; a bundle names the plugin with plugin-id */
+		const char *gid = in->plugin_id[0] ? in->plugin_id : !rpath[0] && !strcmp(rfmt, "lv2") ? in->plugin : NULL;
+		if (registry_grade(rfmt, rpath, gid, grade, sizeof(grade), reasons, sizeof(reasons)) == 1 &&
+		    !strcmp(grade, "fail")) {
 			sd_bus_error_setf(err, ERR_PREFIX "GradedFail",
-					  "the registry grades %s fail: %s (load with force=true to run it anyway)", path, reasons);
+					  "the registry grades %s fail: %s (load with force=true to run it anyway)",
+					  rpath[0] ? rpath : in->plugin, reasons);
 			r = -EPERM;
 			goto out;
 		}
@@ -957,7 +1017,7 @@ static void usage(FILE *f)
 {
 	fputs("usage: backline-hostd [options]\n"
 	      "  --worker PATH        backline-plugin-worker to run (default: next to this binary, then $PATH)\n"
-	      "  --state-dir DIR      per-instance CLAP state (default: $XDG_STATE_HOME/backline/instances)\n"
+	      "  --state-dir DIR      per-instance plugin state (default: $XDG_STATE_HOME/backline/instances)\n"
 	      "  --log-dir DIR        per-instance worker logs (default: $XDG_RUNTIME_DIR/backline/workers)\n"
 	      "  --no-scope           run workers as plain child processes, not systemd user scopes\n"
 	      "  --memory-max SIZE    default MemoryMax for each worker scope (default: 4G; '' for none)\n"

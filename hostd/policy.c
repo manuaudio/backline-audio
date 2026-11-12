@@ -113,6 +113,7 @@ int bl_parse_ready(const char *line, struct bl_ready *out)
 	get_str(o, "plugin", out->plugin, sizeof(out->plugin), false);
 	get_str(o, "plugin_path", out->plugin_path, sizeof(out->plugin_path), false);
 	get_str(o, "dbus", out->dbus, sizeof(out->dbus), false);
+	get_str(o, "format", out->format, sizeof(out->format), false);
 	if (!json_object_object_get_ex(o, "osc_port", &v) || !json_object_is_type(v, json_type_int))
 		goto done;
 	out->osc_port = (unsigned)json_object_get_int(v);

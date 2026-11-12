@@ -61,6 +61,7 @@ struct bl_ready {
 	char dbus[256];
 	unsigned osc_port;
 	int pid;
+	char format[8];          /* "clap", "vst3", "lv2" ("" from an older worker) */
 };
 int bl_parse_ready(const char *line, struct bl_ready *out);
 

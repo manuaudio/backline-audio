@@ -187,7 +187,22 @@ static int append_b(sd_bus_message *m, const char *k, int v)
 }
 
 /* ------------------------------------------------------------------ Host1 */
+static int host_load(bl_client *c, const char *plugin, const char *format, const bl_load_options *opt, char *id_out,
+		     size_t id_size);
+
 int bl_host_load(bl_client *c, const char *plugin, const bl_load_options *opt, char *id_out, size_t id_size)
+{
+	return host_load(c, plugin, NULL, opt, id_out, id_size);
+}
+
+int bl_host_load_format(bl_client *c, const char *plugin, const char *format, const bl_load_options *opt,
+			char *id_out, size_t id_size)
+{
+	return host_load(c, plugin, format, opt, id_out, id_size);
+}
+
+static int host_load(bl_client *c, const char *plugin, const char *format, const bl_load_options *opt, char *id_out,
+		     size_t id_size)
 {
 	bl_load_options def = BL_LOAD_OPTIONS_INIT;
 	if (!opt)
@@ -205,6 +220,7 @@ int bl_host_load(bl_client *c, const char *plugin, const bl_load_options *opt, c
 	if (r >= 0) r = append_s(m, "state", opt->state);
 	if (r >= 0) r = append_s(m, "memory-max", opt->memory_max);
 	if (r >= 0) r = append_s(m, "cpu-quota", opt->cpu_quota);
+	if (r >= 0) r = append_s(m, "format", format);
 	if (r >= 0) r = append_b(m, "autoconnect", opt->autoconnect);
 	if (r >= 0) r = append_b(m, "restart", opt->restart);
 	if (r >= 0) r = append_b(m, "force", opt->force);
@@ -530,6 +546,68 @@ int bl_instance_load_state(bl_client *c, const char *instance, const char *path)
 	int r = inst_call(c, instance, "LoadState", &reply, "s", path);
 	sd_bus_message_unref(reply);
 	return r < 0 ? r : 0;
+}
+
+int bl_instance_presets(bl_client *c, const char *instance, bl_preset **out, size_t *n)
+{
+	sd_bus_message *reply = NULL;
+	*out = NULL;
+	*n = 0;
+	int r = inst_call(c, instance, "ListPresets", &reply, NULL);
+	if (r < 0)
+		return r;
+	size_t cap = 0;
+	bl_preset *v = NULL;
+	r = sd_bus_message_enter_container(reply, 'a', "(sss)");
+	while (r >= 0) {
+		const char *id, *name, *loc;
+		r = sd_bus_message_read(reply, "(sss)", &id, &name, &loc);
+		if (r <= 0)
+			break;
+		if (*n == cap) {
+			cap = cap ? cap * 2 : 64;
+			bl_preset *nv = realloc(v, cap * sizeof(*v));
+			if (!nv) {
+				r = -ENOMEM;
+				break;
+			}
+			v = nv;
+		}
+		bl_preset *p = &v[(*n)++];
+		copy(p->id, sizeof(p->id), id);
+		copy(p->name, sizeof(p->name), name);
+		copy(p->location, sizeof(p->location), loc);
+	}
+	sd_bus_message_unref(reply);
+	if (r < 0) {
+		free(v);
+		*n = 0;
+		return fail(c, r, "ListPresets: bad reply");
+	}
+	*out = v;
+	return 0;
+}
+
+int bl_instance_load_preset(bl_client *c, const char *instance, const char *id)
+{
+	sd_bus_message *reply = NULL;
+	int r = inst_call(c, instance, "LoadPreset", &reply, "s", id);
+	sd_bus_message_unref(reply);
+	return r < 0 ? r : 0;
+}
+
+int bl_instance_save_preset(bl_client *c, const char *instance, const char *name_or_path, char *path_out, size_t n)
+{
+	sd_bus_message *reply = NULL;
+	int r = inst_call(c, instance, "SavePreset", &reply, "s", name_or_path);
+	if (r < 0)
+		return r;
+	const char *path;
+	r = sd_bus_message_read(reply, "s", &path);
+	if (r >= 0 && path_out)
+		copy(path_out, n, path);
+	sd_bus_message_unref(reply);
+	return r < 0 ? fail(c, r, "SavePreset: bad reply") : 0;
 }
 
 int bl_instance_counter(bl_client *c, const char *instance, const char *name, uint64_t *out)

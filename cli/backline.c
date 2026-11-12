@@ -27,7 +27,7 @@ static void usage(FILE *f)
 {
 	fputs("usage: backline [--json] COMMAND ...\n"
 	      "\n"
-	      "  host load PLUGIN [--id ID] [--plugin-id ID] [--name NODE] [--target NODE]\n"
+	      "  host load PLUGIN [--id ID] [--plugin-id ID] [--format clap|vst3|lv2] [--name NODE] [--target NODE]\n"
 	      "                   [--midi-follow REGEX] [--state FILE] [--memory-max SIZE]\n"
 	      "                   [--cpu-quota PCT] [--autoconnect|--no-autoconnect] [--no-restart]\n"
 	      "                   [--force]   (run it even if the registry grades it fail)\n"
@@ -36,12 +36,16 @@ static void usage(FILE *f)
 	      "  host list              all instances\n"
 	      "  host show ID           one instance\n"
 	      "  host watch [--count N] [--timeout SECS]   print Loaded/Crashed/Restarted/... signals\n"
+	      "  host presets INSTANCE  the plugin's presets (id, name, location)\n"
+	      "  host preset INSTANCE ID|NAME   load a preset\n"
+	      "  host save-preset INSTANCE NAME|PATH   save the current state as a preset (VST3)\n"
+	      "     PLUGIN: a .clap file, a .vst3 bundle, an LV2 URI or .lv2 bundle, or a name\n"
 	      "\n"
 	      "  params INSTANCE [FILTER]        parameters (name substring filter)\n"
 	      "  get INSTANCE KEY                one parameter value\n"
 	      "  set INSTANCE KEY VALUE          set a parameter (clamped; prints the applied value)\n"
 	      "  note INSTANCE on|off KEY [VELOCITY] [--channel N]\n"
-	      "  state save|load INSTANCE PATH   CLAP state to or from a file\n"
+	      "  state save|load INSTANCE PATH   plugin state to or from a file\n"
 	      "  counter INSTANCE NAME           Cycles, MidiEvents, StateSerial, StateSaved, ...\n"
 	      "     INSTANCE: a host instance id, a worker's node name, or its D-Bus name\n"
 	      "\n"
@@ -158,8 +162,10 @@ static int cmd_host(int argc, char **argv)
 			{ "midi-follow", required_argument, NULL, 'm' }, { "state", required_argument, NULL, 's' },
 			{ "memory-max", required_argument, NULL, 'M' }, { "cpu-quota", required_argument, NULL, 'Q' },
 			{ "autoconnect", no_argument, NULL, 'a' }, { "no-autoconnect", no_argument, NULL, 'A' },
-			{ "no-restart", no_argument, NULL, 'R' }, { "force", no_argument, NULL, 'F' }, { 0 } };
+			{ "no-restart", no_argument, NULL, 'R' }, { "force", no_argument, NULL, 'F' },
+			{ "format", required_argument, NULL, 'f' }, { 0 } };
 		bl_load_options o = BL_LOAD_OPTIONS_INIT;
+		const char *format = NULL;
 		int c;
 		optind = 1;
 		while ((c = getopt_long(argc, argv, "", opts, NULL)) != -1) {
@@ -176,6 +182,7 @@ static int cmd_host(int argc, char **argv)
 			case 'A': o.autoconnect = 0; break;
 			case 'R': o.restart = 0; break;
 			case 'F': o.force = 1; break;
+			case 'f': format = optarg; break;
 			default: return die_usage();
 			}
 		}
@@ -185,7 +192,7 @@ static int cmd_host(int argc, char **argv)
 		if (o.state && realpath(o.state, state_abs))
 			o.state = state_abs; /* hostd resolves paths in its own cwd */
 		char id[64];
-		if (bl_host_load(C, argv[optind], &o, id, sizeof(id)) < 0)
+		if (bl_host_load_format(C, argv[optind], format, &o, id, sizeof(id)) < 0)
 			return failed("host load");
 		bl_instance in;
 		if (bl_host_get(C, id, &in) < 0)
@@ -242,6 +249,57 @@ static int cmd_host(int argc, char **argv)
 		else {
 			json_object_object_foreach(o, k, v) printf("%-18s %s\n", k, json_object_get_string(v));
 			json_object_put(o);
+		}
+		return 0;
+	}
+	if (!strcmp(sub, "presets")) {
+		if (argc != 2)
+			return die_usage();
+		bl_preset *v;
+		size_t n;
+		if (bl_instance_presets(C, argv[1], &v, &n) < 0)
+			return failed("host presets");
+		if (g_json) {
+			json_object *a = json_object_new_array();
+			for (size_t i = 0; i < n; i++) {
+				json_object *o = json_object_new_object();
+				json_object_object_add(o, "id", json_object_new_string(v[i].id));
+				json_object_object_add(o, "name", json_object_new_string(v[i].name));
+				json_object_object_add(o, "location", json_object_new_string(v[i].location));
+				json_object_array_add(a, o);
+			}
+			print_json(a);
+		} else {
+			for (size_t i = 0; i < n; i++)
+				printf("%-32s %s\n", v[i].name, v[i].id);
+		}
+		bl_free(v);
+		return 0;
+	}
+	if (!strcmp(sub, "preset") || !strcmp(sub, "save-preset")) {
+		if (argc != 3)
+			return die_usage();
+		char path[PATH_MAX] = "";
+		const char *arg = argv[2];
+		char abs[PATH_MAX];
+		if (strchr(arg, '/') && arg[0] != '/' && getcwd(abs, sizeof(abs)) &&
+		    strlen(abs) + strlen(arg) + 2 < sizeof(abs)) { /* the worker resolves paths in its own cwd */
+			strcat(abs, "/");
+			strcat(abs, arg);
+			arg = abs;
+		}
+		bool save = sub[0] == 's';
+		int r = save ? bl_instance_save_preset(C, argv[1], arg, path, sizeof(path))
+			     : bl_instance_load_preset(C, argv[1], arg);
+		if (r < 0)
+			return failed(save ? "host save-preset" : "host preset");
+		if (g_json) {
+			json_object *o = json_object_new_object();
+			json_object_object_add(o, "instance", json_object_new_string(argv[1]));
+			json_object_object_add(o, save ? "saved" : "loaded", json_object_new_string(save ? path : argv[2]));
+			print_json(o);
+		} else if (save) {
+			printf("%s\n", path);
 		}
 		return 0;
 	}

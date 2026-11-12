@@ -40,6 +40,7 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -65,6 +66,8 @@ using bl::ParamInfo;
 using bl::PresetInfo;
 
 namespace bl {
+
+FILE *out = stdout;
 
 void die(const char *fmt, ...)
 {
@@ -166,7 +169,7 @@ public:
 
 struct Worker {
     // ---- options
-    std::string plugin_arg, plugin_id, node_name, midi_follow, audio_target, state_file;
+    std::string plugin_arg, plugin_id, node_name, midi_follow, audio_target, audio_source, state_file;
     std::vector<std::string> preset_dirs;
     Fmt fmt = Fmt::Auto;
     int osc_port = 0;
@@ -710,6 +713,24 @@ int reconcile_port(void *, const bl_port *p)
             if (match && !bl_graph_is_linked(w->graph, own->second, p->id)) {
                 LOG("audio-target: linking %s -> %s:%s\n", g.names[c].c_str(), p->node_name, p->name);
                 bl_graph_link(w->graph, own->second, p->id);
+            }
+        }
+    }
+    // Audio source: its outputs (a sink's monitor, a source's capture) into
+    // our main inputs, by channel.
+    if (!w->audio_source.empty() && p->output && !p->midi && !strcmp(p->node_name, w->audio_source.c_str()) &&
+        !w->ins.empty()) {
+        auto &g = w->ins[0];
+        for (size_t c = 0; c < g.names.size(); c++) {
+            auto own = w->own_ports.find(g.names[c]);
+            if (own == w->own_ports.end())
+                continue;
+            bool match = !strcmp(p->channel, g.pos[c].c_str()) ||
+                         (g.channels == 1 && !strcmp(p->channel, "FL")) ||
+                         (!strcmp(p->channel, "MONO") && g.channels <= 2);
+            if (match && !bl_graph_is_linked(w->graph, p->id, own->second)) {
+                LOG("audio-source: linking %s:%s -> %s\n", p->node_name, p->name, g.names[c].c_str());
+                bl_graph_link(w->graph, p->id, own->second);
             }
         }
     }
@@ -1354,6 +1375,7 @@ void usage(FILE *f)
           "  -n, --name NODE          node.name (default: backline.<plugin id>)\n"
           "  -m, --midi-follow REGEX  link every MIDI source matching REGEX, now and when hotplugged\n"
           "  -t, --audio-target NODE  link the main output to NODE's playback ports\n"
+          "  -S, --audio-source NODE  link NODE's outputs (a sink's monitor, a source) to the main input\n"
           "  -o, --osc-port PORT      OSC on 127.0.0.1:PORT (default: any free port)\n"
           "  -a, --autoconnect        let the session manager link the output to the default\n"
           "                           output (the default unless --audio-target is given)\n"
@@ -1370,6 +1392,12 @@ void usage(FILE *f)
 
 int main(int argc, char **argv)
 {
+    // Plugins print banners to stdout; keep it for our own JSON only.
+    if (int fd = dup(STDOUT_FILENO); fd >= 0) {
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+        dup2(STDERR_FILENO, STDOUT_FILENO);
+        bl::out = fdopen(fd, "w");
+    }
     Worker w;
     W = &w;
     w.main_tid = std::this_thread::get_id();
@@ -1377,13 +1405,14 @@ int main(int argc, char **argv)
         {"plugin", required_argument, nullptr, 'p'}, {"id", required_argument, nullptr, 'i'},
         {"format", required_argument, nullptr, 'f'},
         {"name", required_argument, nullptr, 'n'}, {"midi-follow", required_argument, nullptr, 'm'},
-        {"audio-target", required_argument, nullptr, 't'}, {"osc-port", required_argument, nullptr, 'o'},
+        {"audio-target", required_argument, nullptr, 't'}, {"audio-source", required_argument, nullptr, 'S'},
+        {"osc-port", required_argument, nullptr, 'o'},
         {"autoconnect", no_argument, nullptr, 'a'}, {"no-autoconnect", no_argument, nullptr, 'A'},
         {"state-file", required_argument, nullptr, 's'}, {"no-dbus", no_argument, nullptr, 'D'},
         {"preset-dir", required_argument, nullptr, 'P'},
         {"list", no_argument, nullptr, 'l'}, {"help", no_argument, nullptr, 'h'}, {}};
     int c;
-    while ((c = getopt_long(argc, argv, "p:i:f:n:m:t:o:aAs:lh", opts, nullptr)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:i:f:n:m:t:S:o:aAs:lh", opts, nullptr)) != -1) {
         switch (c) {
         case 'p': w.plugin_arg = optarg; break;
         case 'i': w.plugin_id = optarg; break;
@@ -1396,6 +1425,7 @@ int main(int argc, char **argv)
         case 'n': w.node_name = optarg; break;
         case 'm': w.midi_follow = optarg; break;
         case 't': w.audio_target = optarg; break;
+        case 'S': w.audio_source = optarg; break;
         case 'o': w.osc_port = atoi(optarg); break;
         case 'a': w.autoconnect = 1; break;
         case 'A': w.autoconnect = 0; break;
@@ -1403,7 +1433,7 @@ int main(int argc, char **argv)
         case 'D': w.use_dbus = false; break;
         case 'P': w.preset_dirs.push_back(optarg); break;
         case 'l': w.list_only = true; break;
-        case 'h': usage(stdout); return 0;
+        case 'h': usage(bl::out); return 0;
         default: usage(stderr); return 2;
         }
     }
@@ -1495,10 +1525,10 @@ int main(int argc, char **argv)
     timespec hk{0, 20 * 1000000L};
     pw_loop_update_timer(l, w.housekeeping, &hk, &hk, false);
 
-    printf("{\"node\": %s, \"plugin\": %s, \"format\": \"%s\", \"plugin_path\": %s, \"osc_port\": %d, \"dbus\": %s, \"pid\": %d}\n",
+    fprintf(bl::out, "{\"node\": %s, \"plugin\": %s, \"format\": \"%s\", \"plugin_path\": %s, \"osc_port\": %d, \"dbus\": %s, \"pid\": %d}\n",
            json_str(w.node_name).c_str(), json_str(I->id).c_str(), I->format(), json_str(I->path).c_str(),
            w.osc_port, json_str(w.bus_name).c_str(), getpid());
-    fflush(stdout);
+    fflush(bl::out);
 
     pw_main_loop_run(w.loop);
 
