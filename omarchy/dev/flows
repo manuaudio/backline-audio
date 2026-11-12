@@ -5,7 +5,7 @@
 # the real services (host, plugin worker, recorder, registry) on the bench's
 # throwaway devices. Every step is timed from the key press to the moment the
 # service or the graph shows the result, and screenshots are taken for the
-# README. The hotkeys themselves (Super+Ctrl+I, ...) belong to Hyprland, which
+# README. The hotkeys themselves (Super+Ctrl+U, ...) belong to Hyprland, which
 # can't run headless; each hotkey step makes the same call its binding makes
 # (omarchy-shell -q backline.<panel> toggle opens the panel; here the same IPC call on the staged shell), and is timed the same way.
 #
@@ -111,7 +111,7 @@ start_shell || exit 1
 
 # ------------------------------------------------------------------ flow 1
 flow_start "1. Play an instrument from a keyboard (first time)"
-step "Super+Ctrl+I: Instruments opens, cursor on Add" "ipc:backline.instruments open" 1 \
+step "Super+Ctrl+U: Instruments opens, cursor on Add" "ipc:backline.instruments open" 1 \
   bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r ".opened and .selectedIndex == 0") == true ]]'
 shot 1-instruments-empty "$PANEL_GEOMETRY"
 step "Enter: the picker opens" "Return" 1 \
@@ -159,7 +159,7 @@ shot 4-instruments-midi "$PANEL_GEOMETRY"
 flow_start "1c. Again, from the desktop (last used first)"
 key Escape
 sleep 0.3
-step "Super+Ctrl+I" "ipc:backline.instruments open" 1 \
+step "Super+Ctrl+U" "ipc:backline.instruments open" 1 \
   bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r .opened) == true ]]'
 step "a: the picker, Surge XT first" "a" 1 \
   bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r "[.mode, .picker[0]] | join(\",\")") == "picker,Surge XT" ]]'
@@ -242,7 +242,7 @@ sleep 0.3
 
 # ------------------------------------------------------------------ flow 4
 flow_start "4. Check a plugin"
-step "Super+Ctrl+I" "ipc:backline.instruments open" 1 \
+step "Super+Ctrl+U" "ipc:backline.instruments open" 1 \
   bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r .opened) == true ]]'
 step "Tab: Plugins, with the grades of everything installed" "Tab" 1 \
   bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.plugins state | jq -r ".opened and .total > 0") == true ]]'
@@ -329,7 +329,7 @@ fi
 
 # ------------------------------------------------------------------ flow 6
 flow_start "6. Open the mixer"
-step "Super+Ctrl+I" "ipc:backline.instruments open" 1 \
+step "Super+Ctrl+U" "ipc:backline.instruments open" 1 \
   bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r .opened) == true ]]'
 step "o: the mixer window is mapped" "o" 1 \
   bash -c 'swaymsg -t get_tree | jq -e "[.. | objects | select(.app_id? == \"backline-mixer\" and .visible == true)] | length == 1"'

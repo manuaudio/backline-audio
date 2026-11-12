@@ -4,6 +4,40 @@ Backline's D-Bus interfaces are 0.x: within an interface (`Player1`,
 `Clock1`, …) methods, properties and signals are only ever added. Measured
 evidence for every item is in [docs/proofs/](docs/proofs/).
 
+## Unreleased
+
+Fixes from the first real install (Omarchy 4.0.4, PipeWire 1.6.8,
+WirePlumber 0.5.17).
+
+### Fixed
+
+- **Instruments play to the default output again** (DECISIONS D2).
+  WirePlumber rejected the node ("no usable format found"), so an instrument
+  loaded without `--target` stayed silent. The node now shows its main
+  output's format as an app stream does and answers WirePlumber's port
+  configuration; it is linked like any app and follows a change of default
+  output. Proof: `tests/autolink-proof` (a ctest, on a private PipeWire and
+  WirePlumber).
+- **"Follow every keyboard" follows controllers only**: never Backline's own
+  clock (its MTC output was followed), Midi Through, or an app's MIDI output.
+- **`omarchy-backline-setup`** backs each file up before changing it
+  (`<file>.bak.backline-<date>-<time>`), changes nothing when run again, and
+  `--uninstall` restores both files byte for byte (it left a blank line,
+  one more per run). Each hotkey is checked against what is bound on the
+  system, and a taken key isn't bound. The Instruments panel moves to
+  `Super + Ctrl + U` (`Super + Ctrl + I` is Omarchy's Toggle locking on
+  idle). Where the panels can't load (Omarchy 4.0.4's shell, or no bar
+  plugin), no key or menu row points at one, and `Super + Ctrl + M` opens
+  the Backline Mixer.
+- **`backline-registry serve --idle 0`** stays up instead of exiting at once.
+- **User units** install where systemd reads them for a `~/.local` prefix
+  (`$XDG_DATA_HOME/systemd/user`), and the pacman hook only under `/usr`.
+- **Mixer**: no overlapping text in a narrow tiled window.
+- **`--help`** on every `omarchy-backline-*` command prints its usage
+  (`instrument-remove --help` tried to remove an instrument called `--help`).
+- **Registry**: a crash reason quotes the plugin's own error (Cardinal Synth
+  aborts on a corrupt settings file and is graded fail, correctly).
+
 ## 0.4.0 (2026-11-12)
 
 Mac-style pro audio for Omarchy Linux: files on the shared timeline,

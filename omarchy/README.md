@@ -10,12 +10,12 @@ The jobs, and the fewest keystrokes for each (measured), are in [`ui/UX-FLOWS.md
 
 | Job | Keys |
 |---|---|
-| play an instrument from a keyboard, first time | `Super+Ctrl+I` `Enter` `s u r` `Enter`: 6 |
-| the same, again | `Super+Ctrl+I` `a` `Enter`: 3 |
+| play an instrument from a keyboard, first time | `Super+Ctrl+U` `Enter` `s u r` `Enter`: 6 |
+| the same, again | `Super+Ctrl+U` `a` `Enter`: 3 |
 | record a set, first time (two sources) | `Super+Ctrl+M` `Space` `j Space` `r`: 5 |
 | record, from anywhere, again | `Super+Ctrl+Alt+M` to start, and again to stop: 1 each |
 | virtual soundcheck: one input on playback | `Super+Ctrl+M` `p` `l`: 3 |
-| check a plugin | `Super+Ctrl+I` `Tab` `/` `c a r`: 6, with no `Enter`; the grade and the finding are on the row |
+| check a plugin | `Super+Ctrl+U` `Tab` `/` `c a r`: 6, with no `Enter`; the grade and the finding are on the row |
 | lock to timecode, first time | `Super+Ctrl+G` `l l` `Enter` `j` `l`: 6 |
 | lock to timecode, again | `Super+Ctrl+G` `l l` `Enter`: 4 |
 | open the mixer | `o` in any Backline panel |
@@ -72,9 +72,11 @@ The rules are from Omarchy's `AGENTS.md`, `agents/skills/shell-dev.md`, `docs/me
 
 **Hotkeys.**
 
-- `Super + Ctrl + I`, `M`, `G` open panels, on the panels plane.
-- `Super + Ctrl + Alt + M`, `G` are their quick-action variants (record or stop; play or stop), as `Super + Ctrl + Alt + C` is to the capture menu.
-- All five keys are free in Omarchy's defaults.
+- `Super + Ctrl + U`, `M`, `G` open the Instruments, Record and Transport panels, on the panels plane. (`Super + Ctrl + I` is Omarchy's "Toggle locking on idle".)
+- `Super + Ctrl + Alt + M`, `G` are the quick-action variants of `M` and `G` (record or stop; play or stop), as `Super + Ctrl + Alt + C` is to the capture menu.
+- Where the panels can't open (a shell before Quattro, such as Omarchy 4.0.4's, or no bar plugin), setup leaves out every key and menu row that would open one, and `Super + Ctrl + M` opens the Backline Mixer instead. The quick actions and the command rows stay.
+- Setup checks each key against what is already bound on the system (`hyprctl binds -j`, or Omarchy's default bindings and the user's files without Hyprland) and doesn't bind a key that is taken; it says which and why.
+- Setup backs each file up before it changes it (`<file>.bak.backline-<date>-<time>`), changes nothing when run again, and `--uninstall` restores both files byte for byte.
 
 **Third-party, not first-party.** This installs as a third-party plugin under `~/.config/omarchy/plugins/io.github.manuaudio.backline`, with its own commands and catalogs from the `backline-audio` package. The `backline` command group isn't in Omarchy's `GROUP_DESCRIPTIONS`. Proposing any of it to Omarchy itself would follow `ARCHITECTURE.md` §5.8: one problem per PR, with the measured evidence.
 

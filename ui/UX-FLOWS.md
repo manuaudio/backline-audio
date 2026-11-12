@@ -2,7 +2,7 @@
 
 The four jobs come first. For each one, this is the shortest path through Omarchy's own workflow: a `Super + Ctrl` hotkey or the bar opens a panel, `j`/`k`/`h`/`l` move, `Enter`/`Space` act, `Esc` closes, `Tab` goes to the next panel, and the Omarchy menu (`Super + Space`) finds everything by name. The screens are built around these paths. The mixer window is for sitting down and working, and none of the four jobs needs it.
 
-Counting rules: a chord such as `Super + Ctrl + I` counts as one keystroke. Typed filter letters count one each. A mouse path counts clicks. "From the desktop" means no Backline panel is open.
+Counting rules: a chord such as `Super + Ctrl + U` counts as one keystroke. Typed filter letters count one each. A mouse path counts clicks. "From the desktop" means no Backline panel is open.
 
 Every count below is the measured one. [`omarchy/dev/flows`](../omarchy/dev/flows) runs each flow with real key presses into the real panels. It uses the real services (host, plugin worker, recorder, clock, registry) on the bench's throwaway devices, in a private headless compositor. It times each step from the key press to the moment the service or the graph shows the result. The report is [`omarchy/test/flows-report.txt`](../omarchy/test/flows-report.txt). Every step lands in 44 to 550 ms. That includes about 120 ms per key press, the harness's typing gap; the slowest steps are the ones with three or four keys. A single key lands in under 300 ms, the system's own work included.
 
@@ -23,7 +23,7 @@ These are optional. `omarchy-backline-setup` (or `omarchy/install` from a checko
 
 | Hotkey | Plane | Opens or does |
 |---|---|---|
-| `Super + Ctrl + I` | panels | Instruments panel |
+| `Super + Ctrl + U` | panels | Instruments panel (`I` is Omarchy's Toggle locking on idle) |
 | `Super + Ctrl + M` | panels | Record panel |
 | `Super + Ctrl + G` | panels | Transport panel |
 | `Super + Ctrl + Alt + M` | quick action, the `Alt` variant of M | Record or stop the remembered set |
@@ -37,12 +37,12 @@ The Plugins panel has no hotkey. It sits beside Instruments in the bar, one `Tab
 
 | # | Keys | What happens |
 |---|---|---|
-| 1 | `Super + Ctrl + I` | The Instruments panel opens. With nothing loaded, the cursor is already on **Add instrument**. |
+| 1 | `Super + Ctrl + U` | The Instruments panel opens. With nothing loaded, the cursor is already on **Add instrument**. |
 | 2 | `Enter` | The picker opens in place with its filter focused. It lists the registry's instruments with their grades. |
 | 3–5 | `s` `u` `r` | The list narrows to Surge XT. |
 | 6 | `Enter` | The instrument is loaded, following every MIDI keyboard and playing to the default output. The row shows `STARTING`, then `RUNNING`, with a live level meter. Play the keyboard. |
 
-- **Again, from the desktop: 3 keystrokes.** `Super + Ctrl + I`, `Enter`, `Enter`. The last-used instrument is first in the picker.
+- **Again, from the desktop: 3 keystrokes.** `Super + Ctrl + U`, `Enter`, `Enter`. The last-used instrument is first in the picker.
 - **Mouse: 3 clicks.** The bar icon, **Add instrument**, then the instrument.
 - **Through the Omarchy menu.** `Super + Space`, then type `instr`, then `Enter` on **Add Instrument**. The same picker opens as a menu-select list.
 - **Choosing one keyboard (optional): 3 keystrokes or more in the open panel.** `j` to the instrument row, then `h`/`l` along its MIDI pills (**All keyboards**, then each connected input), then `Enter`. The instrument restarts with its state, so its sound is kept.
@@ -86,7 +86,7 @@ The Plugins panel has no hotkey. It sits beside Instruments in the bar, one `Tab
 
 | # | Keys | What happens |
 |---|---|---|
-| 1 | `Super + Ctrl + I` | The Instruments panel opens. |
+| 1 | `Super + Ctrl + U` | The Instruments panel opens. |
 | 2 | `Tab` | Goes to the Plugins panel beside it. It shows `pass`/`warn`/`fail` counts for the whole system. |
 | 3 | `/` | Focuses the filter. |
 | 4–6 | `d` `e` `x` | The list narrows to Dexed. The row under the cursor shows its grade, its formats, and the finding behind a `warn` or `fail` (for example `SIGABRT in process` or `writes into the working directory`). |
