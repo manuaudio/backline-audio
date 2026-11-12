@@ -29,8 +29,10 @@ target_include_directories(backline-plugin-worker PRIVATE third_party/clap/inclu
 target_link_libraries(backline-plugin-worker PRIVATE bl_graph PkgConfig::PIPEWIRE PkgConfig::SYSTEMD ${CMAKE_DL_LIBS})
 
 # Recorder: N nodes into sample-aligned, timestamped files.
+add_library(bl_rec_align STATIC recorder/rec_align.c)
+target_include_directories(bl_rec_align PUBLIC recorder)
 add_executable(backline-recorder recorder/recorder.c)
-target_link_libraries(backline-recorder PRIVATE bl_graph PkgConfig::PIPEWIRE PkgConfig::SNDFILE m)
+target_link_libraries(backline-recorder PRIVATE bl_graph bl_rec_align PkgConfig::PIPEWIRE PkgConfig::SNDFILE m)
 
 # Test tool: a virtual MIDI keyboard on the ALSA sequencer (what a USB
 # keyboard looks like to PipeWire's MIDI bridge).
@@ -43,7 +45,7 @@ add_library(bl_hostd_policy STATIC hostd/policy.c)
 target_include_directories(bl_hostd_policy PUBLIC hostd)
 target_link_libraries(bl_hostd_policy PUBLIC PkgConfig::JSONC)
 add_executable(backline-hostd hostd/hostd.c)
-target_link_libraries(backline-hostd PRIVATE bl_hostd_policy PkgConfig::SYSTEMD)
+target_link_libraries(backline-hostd PRIVATE bl_hostd_policy PkgConfig::SYSTEMD PkgConfig::JSONC)
 
 # libbackline: the MIT C client library (D-Bus only), and the backline CLI.
 add_library(backline SHARED lib/backline.c)
@@ -67,6 +69,9 @@ if(BUILD_TESTING)
   add_executable(test_libbackline tests/unit/test_libbackline.c)
   target_link_libraries(test_libbackline PRIVATE backline bl_hostd_policy)
   add_test(NAME libbackline COMMAND test_libbackline)
+  add_executable(test_rec_align tests/unit/test_rec_align.c)
+  target_link_libraries(test_rec_align PRIVATE bl_rec_align)
+  add_test(NAME rec_align COMMAND test_rec_align)
 endif()
 
 # Plugin registry: sandboxed probes, grades, cache, D-Bus query service.

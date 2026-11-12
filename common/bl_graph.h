@@ -18,6 +18,16 @@
 extern "C" {
 #endif
 
+/* One direction of a port's SPA_PARAM_Latency (PipeWire's latency model:
+ * the INPUT direction is capture latency, the OUTPUT direction is playback
+ * latency). Total = quantum x graph quantum + rate frames + ns. */
+struct bl_latency {
+	bool valid;
+	float min_quantum, max_quantum;
+	int32_t min_rate, max_rate;
+	int64_t min_ns, max_ns;
+};
+
 struct bl_port {
 	uint32_t id;
 	uint32_t node_id;
@@ -29,6 +39,10 @@ struct bl_port {
 	char alias[256];      /* port.alias */
 	char channel[16];     /* audio.channel */
 	char node_name[256];  /* node.name of the owning node, if known */
+	/* Filled only for ports passed to bl_graph_watch_latency, once the
+	 * server has answered: [0] = SPA_DIRECTION_INPUT, [1] = OUTPUT. */
+	struct bl_latency latency[2];
+	bool latency_known;
 };
 
 struct bl_node {
@@ -62,6 +76,16 @@ int bl_graph_link(struct bl_graph *g, uint32_t out_port, uint32_t in_port);
 bool bl_graph_is_linked(struct bl_graph *g, uint32_t out_port, uint32_t in_port);
 /* Number of links created by bl_graph_link that the server has confirmed. */
 int bl_graph_links_ready(struct bl_graph *g);
+
+/* Look a port up by global id (NULL if unknown). */
+const struct bl_port *bl_graph_port(struct bl_graph *g, uint32_t id);
+/* Subscribe to a port's SPA_PARAM_Latency; results land in its bl_port.
+ * Idempotent. Returns 0 or -errno. */
+int bl_graph_watch_latency(struct bl_graph *g, uint32_t port_id);
+
+/* Frames of latency for one direction at the given graph quantum and rate
+ * (max values: the conservative figure). */
+int64_t bl_latency_frames(const struct bl_latency *l, uint32_t quantum, uint32_t rate);
 
 #ifdef __cplusplus
 }

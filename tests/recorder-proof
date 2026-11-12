@@ -3,10 +3,24 @@
 #
 # One test signal (1 s silence, then irregular impulses, a noise burst and a
 # 1 kHz tone; R = -0.5 x L) is played into TWO different null sinks at once.
-# backline-recorder records both sinks' monitors as two tracks. The tracks must
-# be identical sample for sample (lag 0), the same length, and carry the same
-# BWF time reference. As a control, two pw-record processes record the same two
-# sinks at the same time; they start on different cycles and carry no timestamp.
+# backline-recorder records both sinks' monitors as two tracks.
+#
+#  1. Both sinks are followers (a third sink drives): the tracks must be
+#     identical sample for sample (lag 0), the same length, with the same BWF
+#     time reference. Control: two pw-record processes on the same sinks.
+#  2. One recorded sink drives the graph. Two recorders run side by side:
+#     -a graph shows PipeWire's raw behaviour (the driver's monitor is one
+#     quantum late); -a signal (the default) pairs, in every cycle, the
+#     driver sink's monitor with the other tracks' previous cycle, and the
+#     tracks must be bit-identical at lag 0.
+#  3. The same at quantum 256 (node.force-quantum on the test player, which
+#     only affects this test graph). In every take the quantum also changes
+#     when the player joins (the graph idles at 128), so alignment must hold
+#     across a quantum change; in case 1 the driver changes too.
+#  4. Pre-roll: a recorder stands by with 2 s pre-roll and is triggered
+#     (SIGUSR1) 1.4 s into playback. Its take must be exactly the matching
+#     stretch of a reference take recorded from before the start, sample for
+#     sample, including the 2 s before the trigger.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 source "$here/lib.sh"
@@ -39,8 +53,9 @@ EOF
 # take NAME DRIVER: DRIVER=dedicated -> a third sink with a higher driver
 # priority drives the graph, so both recorded sinks are followers.
 # DRIVER=recorded -> one of the two recorded sinks is the graph driver.
-take() {
-  local name=$1 mode=$2 x
+take() { # NAME DRIVER [QUANTUM] [CONTROL]
+  local name=$1 mode=$2 quantum=${3:-} control=${4:-yes} x force=""
+  [[ -n $quantum ]] && force="node.force-quantum = $quantum"
   if [[ $mode == dedicated ]]; then
     bl_testbed backline-test.rec-a backline-test.rec-b backline-test.clock@1000
   else
@@ -50,17 +65,24 @@ take() {
   "$BL_BIN/backline-recorder" -s backline-test.rec-a -s backline-test.rec-b -o "$out" -n "$name" -d 5.0 \
     >/dev/null 2>"$out/rec-$name.log" &
   local rec=$!
-  for x in a b; do
-    bl_spawn pw-record -P "{ node.autoconnect = false node.name = backline-test.pwrec-$x }" \
-      --rate 48000 --channels 2 --format f32 "$out/$name-pw-record-$x.wav" >/dev/null
-  done
-  bl_wait_node backline-test.pwrec-a; bl_wait_node backline-test.pwrec-b
-  wait_log "$out/rec-$name.log" armed
-  for x in a b; do
-    pw-link "backline-test.rec-$x:monitor_FL" "backline-test.pwrec-$x:input_FL"
-    pw-link "backline-test.rec-$x:monitor_FR" "backline-test.pwrec-$x:input_FR"
-  done
-  bl_spawn pw-play -P '{ node.autoconnect = false node.name = backline-test.player node.dont-fallback = true }' "$out/signal.wav"
+  "$BL_BIN/backline-recorder" -a graph -s backline-test.rec-a -s backline-test.rec-b -o "$out" -n "$name-graph" -d 5.0 \
+    >/dev/null 2>"$out/rec-$name-graph.log" &
+  local recg=$!
+  if [[ $control == yes ]]; then
+    for x in a b; do
+      bl_spawn pw-record -P "{ node.autoconnect = false node.name = backline-test.pwrec-$x }" \
+        --rate 48000 --channels 2 --format f32 "$out/$name-pw-record-$x.wav" >/dev/null
+    done
+    bl_wait_node backline-test.pwrec-a; bl_wait_node backline-test.pwrec-b
+  fi
+  wait_log "$out/rec-$name.log" armed; wait_log "$out/rec-$name-graph.log" armed
+  if [[ $control == yes ]]; then
+    for x in a b; do
+      pw-link "backline-test.rec-$x:monitor_FL" "backline-test.pwrec-$x:input_FL"
+      pw-link "backline-test.rec-$x:monitor_FR" "backline-test.pwrec-$x:input_FR"
+    done
+  fi
+  bl_spawn pw-play -P "{ node.autoconnect = false node.name = backline-test.player node.dont-fallback = true $force }" "$out/signal.wav"
   bl_wait_node backline-test.player
   local sinks="backline-test.rec-a backline-test.rec-b"
   [[ $mode == dedicated ]] && sinks+=" backline-test.clock"
@@ -68,7 +90,8 @@ take() {
     pw-link backline-test.player:output_FL "$x:playback_FL"
     pw-link backline-test.player:output_FR "$x:playback_FR"
   done
-  wait $rec
+  wait $rec; wait $recg
+  grep "reported playback latency" "$out/rec-$name.log" | sed 's/^backline-recorder: /  recorder: /'
   bl_cleanup
   sleep 0.3
 }
@@ -105,18 +128,26 @@ b1, b2 = (A.cmd_info(f)["bext"]["time_reference"] for f in (t1, t2))
 print(f"  BWF time_reference: track 1 {b1}, track 2 {b2}; sidecar UTC start as samples since local midnight: {tref}")
 same = al["max_abs_diff_at_lag"] == 0 and rdiff == 0 and wa["frames"] == wb["frames"] and b1 == b2 == tref \
     and take["overrun_frames"] == 0 and chmap < 1e-4 and al["nonzero_samples"] > 40000
-c = A.cmd_align(f"{out}/{name}-pw-record-a.wav", f"{out}/{name}-pw-record-b.wav")
-ia, ib = A.cmd_info(f"{out}/{name}-pw-record-a.wav"), A.cmd_info(f"{out}/{name}-pw-record-b.wav")
-print(f"  control, two pw-record processes on the same nodes: lag {c['lag_samples']} samples, "
-      f"lengths {ia['frames']} vs {ib['frames']}, timestamps: {'bext' if ia['bext'] else 'none'}")
+al_info = take.get("alignment", {})
+cyc = [t.get("driver_cycles", 0) for t in take["tracks"]]
+print(f"  alignment: {al_info.get('mode', '?')}, one-cycle pairing: {al_info.get('one_cycle_pairing')}; "
+      f"cycles each recorded sink drove: {cyc}; driver changes {al_info.get('driver_changes')}, "
+      f"quantum changes {al_info.get('quantum_changes')}")
+import os
+c = {"lag_samples": None}
+if os.path.exists(f"{out}/{name}-pw-record-a.wav"):
+    c = A.cmd_align(f"{out}/{name}-pw-record-a.wav", f"{out}/{name}-pw-record-b.wav")
+    ia, ib = A.cmd_info(f"{out}/{name}-pw-record-a.wav"), A.cmd_info(f"{out}/{name}-pw-record-b.wav")
+    print(f"  control, two pw-record processes on the same nodes: lag {c['lag_samples']} samples, "
+          f"lengths {ia['frames']} vs {ib['frames']}, timestamps: {'bext' if ia['bext'] else 'none'}")
 if expect == "zero":
     ok = same and lag == 0
     print(f"  RESULT: {'PASS' if ok else 'FAIL'} (bit-identical at lag 0, equal length, equal timestamps, no overruns)")
 else:
     q = take["quantum_range"][1]
     ok = same and abs(lag) == q
-    print(f"  RESULT: {'PASS' if ok else 'FAIL'} (bit-identical, offset by exactly one quantum = {q}: the driver sink's "
-          f"monitor carries the previous cycle)")
+    print(f"  RESULT: {'PASS' if ok else 'FAIL'} (raw graph alignment: bit-identical, offset by exactly one quantum = {q}: "
+          f"the driver sink's monitor carries the previous cycle)")
 json.dump({"take": name, "lag": lag, "l_diff": al["max_abs_diff_at_lag"], "r_diff": rdiff, "bext": [b1, b2],
            "expected_bext": tref, "control_lag": c["lag_samples"], "pass": ok}, open(f"{out}/result-{name}.json", "w"), indent=1)
 EOF2
@@ -126,9 +157,70 @@ echo; echo "-- 1. two follower nodes (a dedicated driver runs the graph): the sa
 take take-align dedicated
 evaluate take-align zero
 
-echo; echo "-- 2. same, but one of the two recorded sinks is the graph driver"
+echo; echo "-- 2. one of the two recorded sinks is the graph driver"
 take take-driver recorded
-evaluate take-driver quantum
+echo "  [-a graph: no compensation]"
+evaluate take-driver-graph quantum
+echo "  [-a signal (default): per cycle, the driver sink's monitor is paired with the others' previous cycle]"
+evaluate take-driver zero
+
+echo; echo "-- 3. the same at quantum 256 (forced on the test graph only)"
+take take-q256 recorded 256 no
+echo "  [-a graph]"
+evaluate take-q256-graph quantum
+echo "  [-a signal]"
+evaluate take-q256 zero
+
+echo; echo "-- 4. pre-roll: stand by with 2 s, trigger 1.4 s into playback; compare with a reference take"
+bl_testbed backline-test.rec-a backline-test.rec-b
+"$BL_BIN/backline-recorder" -s backline-test.rec-a -s backline-test.rec-b -o "$out" -n take-ref -d 6.0 \
+  >/dev/null 2>"$out/rec-take-ref.log" &
+ref=$!
+"$BL_BIN/backline-recorder" -P 2.0 -s backline-test.rec-a -s backline-test.rec-b -o "$out" -n take-preroll -d 3.5 \
+  >/dev/null 2>"$out/rec-take-preroll.log" </dev/null &
+pre=$!
+wait_log "$out/rec-take-ref.log" armed; wait_log "$out/rec-take-preroll.log" "standing by"
+sleep 1.2   # standby longer than the pre-roll, so all of it is available
+bl_spawn pw-play -P '{ node.autoconnect = false node.name = backline-test.player node.dont-fallback = true }' "$out/signal.wav"
+bl_wait_node backline-test.player
+for x in backline-test.rec-a backline-test.rec-b; do
+  pw-link backline-test.player:output_FL "$x:playback_FL"; pw-link backline-test.player:output_FR "$x:playback_FR"
+done
+sleep 1.4
+kill -USR1 $pre
+echo "  SIGUSR1 -> pre-roll recorder 1.4 s after the player started"
+wait $pre; wait $ref
+bl_cleanup
+sleep 0.3
+python3 -I - "$here" "$out" <<'EOF3'
+import json, sys
+here, out = sys.argv[1:3]
+sys.path.insert(0, here)
+import analyze as A
+ref = json.load(open(f"{out}/take-ref.json")); pre = json.load(open(f"{out}/take-preroll.json"))
+off = pre["start"]["graph_position"] - ref["start"]["graph_position"]
+trig = pre["trigger"]
+print(f"  pre-roll take: {pre['frames']} frames; pre-roll {trig['pre_roll_frames']} frames "
+      f"(asked {trig['pre_roll_requested_frames']}) = {trig['pre_roll_frames'] / pre['rate']:.3f} s before the trigger")
+print(f"  trigger at graph frame {trig['graph_position']}, take starts at {pre['start']['graph_position']} "
+      f"(trigger - pre-roll: {trig['graph_position'] - trig['pre_roll_frames']}); reference starts at {ref['start']['graph_position']}")
+ok = trig["pre_roll_frames"] == trig["pre_roll_requested_frames"] == 96000 and \
+     pre["start"]["graph_position"] == trig["graph_position"] - trig["pre_roll_frames"] and off > 0
+for k in range(2):
+    a = A.read_wav(pre["tracks"][k]["file"]); r = A.read_wav(ref["tracks"][k]["file"])
+    n = a["frames"]
+    same = all(a["data"][c][i] == r["data"][c][off + i] for c in range(2) for i in range(n))
+    hits = A.onsets(a["data"][0])
+    before = [i for i in hits if i < trig["pre_roll_frames"]]
+    print(f"  track {k + 1}: {n} frames == reference frames [{off}, {off + n}) on both channels: {'yes' if same else 'NO'}; "
+          f"impulses before the trigger: {len(before)} of {len(hits)} (first at frame {hits[0] if hits else None})")
+    ok = ok and same and len(before) >= 3 and n == pre["frames"]
+al = A.cmd_align(pre["tracks"][0]["file"], pre["tracks"][1]["file"])
+print(f"  the two tracks of the pre-roll take: lag {al['lag_samples']}, max |difference| {al['max_abs_diff_at_lag']} "
+      f"(cycles each sink drove: {[t['driver_cycles'] for t in pre['tracks']]})")
+ok = ok and al["lag_samples"] == 0 and al["max_abs_diff_at_lag"] == 0
+print(f"  RESULT: {'PASS' if ok else 'FAIL'} (pre-roll exact, take identical to the reference stretch, tracks aligned)")
+EOF3
 
 # A FLAC take too (24-bit), with the timestamp in the Vorbis comment.
 echo; echo "-- FLAC: same recorder, -f flac"

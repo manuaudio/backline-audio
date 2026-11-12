@@ -8,10 +8,15 @@
 #include <spa/utils/list.h>
 #include <spa/utils/string.h>
 #include <pipewire/extensions/metadata.h>
+#include <spa/param/latency-utils.h>
+#include <spa/param/param.h>
 
 struct gport {
 	struct spa_list link;
 	struct bl_port info;
+	struct pw_proxy *proxy;          /* bound only for latency watching */
+	struct spa_hook proxy_listener, object_listener;
+	struct bl_graph *g;
 };
 
 struct gnode {
@@ -42,6 +47,16 @@ struct bl_graph {
 static void copy(char *dst, size_t n, const char *src)
 {
 	snprintf(dst, n, "%s", src ? src : "");
+}
+
+static void port_free(struct gport *p)
+{
+	if (p->proxy) {
+		spa_hook_remove(&p->object_listener);
+		spa_hook_remove(&p->proxy_listener);
+		pw_proxy_destroy(p->proxy);
+	}
+	free(p);
 }
 
 static void on_global(void *data, uint32_t id, uint32_t permissions,
@@ -96,7 +111,7 @@ static void on_global_remove(void *data, uint32_t id)
 			spa_list_remove(&p->link);
 			if (g->events && g->events->port_removed)
 				g->events->port_removed(g->data, id);
-			free(p);
+			port_free(p);
 			return;
 		}
 	}
@@ -152,7 +167,7 @@ void bl_graph_destroy(struct bl_graph *g)
 	spa_list_for_each_safe(l, tl, &g->links, link)
 		link_free(l);
 	spa_list_for_each_safe(p, tp, &g->ports, link)
-		free(p);
+		port_free(p);
 	spa_list_for_each_safe(n, tn, &g->nodes, link)
 		free(n);
 	spa_hook_remove(&g->registry_listener);
@@ -266,4 +281,82 @@ int bl_graph_link(struct bl_graph *g, uint32_t out_port, uint32_t in_port)
 	pw_proxy_add_listener(l->proxy, &l->proxy_listener, &link_proxy_events, l);
 	spa_list_append(&g->links, &l->link);
 	return 0;
+}
+
+const struct bl_port *bl_graph_port(struct bl_graph *g, uint32_t id)
+{
+	struct gport *p;
+	spa_list_for_each(p, &g->ports, link)
+		if (p->info.id == id)
+			return &p->info;
+	return NULL;
+}
+
+static void port_param(void *data, int seq, uint32_t id, uint32_t index, uint32_t next,
+		const struct spa_pod *param)
+{
+	struct gport *p = data;
+	struct spa_latency_info info;
+	(void)seq; (void)index; (void)next;
+	if (id != SPA_PARAM_Latency || param == NULL || spa_latency_parse(param, &info) < 0)
+		return;
+	if (info.direction > SPA_DIRECTION_OUTPUT)
+		return;
+	struct bl_latency *l = &p->info.latency[info.direction];
+	l->valid = true;
+	l->min_quantum = info.min_quantum;
+	l->max_quantum = info.max_quantum;
+	l->min_rate = info.min_rate;
+	l->max_rate = info.max_rate;
+	l->min_ns = info.min_ns;
+	l->max_ns = info.max_ns;
+	p->info.latency_known = true;
+}
+
+static const struct pw_port_events port_events = {
+	PW_VERSION_PORT_EVENTS,
+	.param = port_param,
+};
+
+static void port_proxy_removed(void *data)
+{
+	struct gport *p = data;
+	spa_hook_remove(&p->object_listener);
+	spa_hook_remove(&p->proxy_listener);
+	pw_proxy_destroy(p->proxy);
+	p->proxy = NULL;
+}
+
+static const struct pw_proxy_events port_proxy_events = {
+	PW_VERSION_PROXY_EVENTS,
+	.removed = port_proxy_removed,
+};
+
+int bl_graph_watch_latency(struct bl_graph *g, uint32_t port_id)
+{
+	struct gport *p;
+	spa_list_for_each(p, &g->ports, link) {
+		if (p->info.id != port_id)
+			continue;
+		if (p->proxy)
+			return 0;
+		p->g = g;
+		p->proxy = pw_registry_bind(g->registry, port_id, PW_TYPE_INTERFACE_Port, PW_VERSION_PORT, 0);
+		if (!p->proxy)
+			return -errno;
+		pw_proxy_add_listener(p->proxy, &p->proxy_listener, &port_proxy_events, p);
+		pw_proxy_add_object_listener(p->proxy, &p->object_listener, &port_events, p);
+		uint32_t ids[] = { SPA_PARAM_Latency };
+		pw_port_subscribe_params((struct pw_port *)p->proxy, ids, 1);
+		return 0;
+	}
+	return -ENOENT;
+}
+
+int64_t bl_latency_frames(const struct bl_latency *l, uint32_t quantum, uint32_t rate)
+{
+	if (!l || !l->valid)
+		return 0;
+	double f = (double)l->max_quantum * quantum + l->max_rate + (double)l->max_ns * rate / 1e9;
+	return (int64_t)(f + (f >= 0 ? 0.5 : -0.5));
 }
