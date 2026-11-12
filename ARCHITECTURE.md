@@ -54,7 +54,7 @@ effect-insert component.
  backline-registry   backline-hostd ──spawns──► backline-plugin-worker (1 per instance)  │
  (plugin index,      (supervisor)                ├ PipeWire node: midi_in, in_*, out_*  │
   validation)              │                     ├ D-Bus Instance1 · OSC 127.0.0.1      │
-                           │                     └ CLAP now; VST3, LV2 next              │
+                           │                     └ CLAP, VST3, LV2 behind one interface  │
  backline-recorderd   backline-playerd     backline-clockd                backline-controld
  (N nodes → aligned   (files → nodes,      (transport + tempo = the       (OSC/MIDI → any
   BWF/FLAC takes)      on the timeline)     PipeWire segment owner;         parameter, volume,
@@ -66,7 +66,7 @@ effect-insert component.
 | Component | One line | Language | Status |
 |---|---|---|---|
 | `backline-registry` + `backline-probe` | The system plugin index (CLAP, VST3, LV2), with crash-proof scanning and validation on install | C | **Built and measured** (§4.4): sandboxed probes, grades, cache, `Registry1` |
-| `backline-hostd` + `backline-plugin-worker` | Out-of-process plugin host: each instance one process and one PipeWire node, with MIDI in, params and presets over D-Bus and OSC | C (hostd), C++ (worker) | **Built and measured** (§4.1, §4.3): supervisor with restart-with-state |
+| `backline-hostd` + `backline-plugin-worker` | Out-of-process plugin host: each instance one process and one PipeWire node, with MIDI in, params and presets over D-Bus and OSC | C (hostd), C++ (worker) | **Built and measured** (§4.1, §4.3, §4.5): CLAP, VST3 and LV2; presets; supervisor with restart-with-state |
 | `backline-recorderd` | Records any set of nodes to sample-aligned, timestamped multitrack WAV/BWF or FLAC | C | **Recorder built and measured** (§4.2), with signal alignment and pre-roll; the D-Bus daemon is next |
 | `backline-playerd` | Plays files into the graph, locked to the shared timeline | C | Design |
 | `backline-clockd` | Transport, tempo and timecode: the PipeWire timeline owner, Ableton Link, LTC/MTC generation and chase | C++ (Link is C++) | Design |
@@ -103,8 +103,9 @@ effect-insert component.
   - Grades: `fail` means a host would be hurt (a crash, a timeout, a load
     or instantiate error, non-finite output). `warn` means findings a host
     survives (a state round-trip mismatch, a slow load, files written into
-    the working directory). VST3 is graded on load only (`"checked":
-    "load"`) until the worker hosts VST3.
+    the working directory). VST3 is still graded on load only (`"checked":
+    "load"`): the worker hosts VST3 now (§4.5); a run check in the probe
+    is still open.
 - **Triggers.** A pacman hook for `/usr/lib/{clap,vst3,lv2}` (root,
   Omarchy-side), and a user `.path` unit on `~/.clap`, `~/.vst3` and
   `~/.lv2`.
@@ -135,19 +136,27 @@ effect-insert component.
 
 ### 2.2 Plugin host: `backline-hostd` + `backline-plugin-worker` (the AUv3-style host)
 
-- **Job.** Run CLAP plugins (then VST3 and LV2), instruments and effects,
+- **Job.** Run CLAP, VST3 and LV2 plugins, instruments and effects,
   **as PipeWire nodes**. An instrument takes MIDI from any PipeWire MIDI
   source, so a USB keyboard plays a system instrument with no DAW open.
 - **Process model.**
   - **`backline-plugin-worker`: one plugin instance, one process, one
     node.** It's a `pw_filter` with `midi_in` (for plugins with note
-    ports), `in_*` and `out_*` DSP ports per CLAP audio port and channel, a
-    D-Bus object and an OSC socket.
+    input), `in_*` and `out_*` DSP ports per audio bus (CLAP audio port,
+    VST3 bus, LV2 port group) and channel, a D-Bus object and an OSC socket.
+    The node publishes its channel layout (`audio.channels`,
+    `audio.position`; the first output bus keeps `MONO`/`FL,FR`, further
+    channels are `AUX<n>`), so meters and mixers can read it.
+  - **The format is chosen by the argument**: a `.clap` file, a `.vst3`
+    bundle, an LV2 URI or `.lv2` bundle, or a bare name looked up in the
+    standard directories (CLAP first; `--format` narrows it).
   - **`backline-hostd` is the supervisor** (built). Its D-Bus API is
     `io.github.manuaudio.Backline.Host1`:
     - `Load(s plugin, a{sv} options) → s id`. It replies once the node is
-      up. Options: `id`, `plugin-id`, `name`, `target`, `midi-follow`,
-      `state`, `memory-max`, `cpu-quota`, `autoconnect`, `restart`, `force`.
+      up. `plugin` is anything the worker takes (VST3 bundles and LV2 URIs
+      included). Options: `id`, `plugin-id`, `format`, `name`, `target`,
+      `midi-follow`, `state`, `memory-max`, `cpu-quota`, `autoconnect`,
+      `restart`, `force`.
     - `Unload(s)`, `Restart(s)`, `Get(s) → a{sv}`, `List() → aa{sv}`.
     - Signals `Loaded`, `Unloaded`, `Crashed(s id, i signal, i exit_status)`,
       `Restarted(s id, u pid, u restarts)` and `Failed(s id, s reason)`.
@@ -160,7 +169,9 @@ effect-insert component.
     `PR_SET_PDEATHSIG` and never outlive hostd. When a worker dies, hostd
     kills whatever is left in its scope.
   - **State.** hostd gives each instance a state file
-    (`$XDG_STATE_HOME/backline/instances/<id>.clapstate`). The worker
+    (`$XDG_STATE_HOME/backline/instances/<id>.clapstate`, `.vst3state` (a
+    `.vstpreset` image: component and controller state) or `.lv2state`
+    (LV2 state as Turtle, through `lilv_state`)). The worker
     restores it on start, and saves it atomically (temp file, fsync,
     rename) whenever it changes: 100 ms after the last change, at least
     once a second while changes continue, and *only once the audio thread
@@ -174,21 +185,31 @@ effect-insert component.
     that never came up is a load error, not a crash loop. A restart keeps
     the node name, OSC port and D-Bus name, and the worker re-makes its
     links.
-  - **Registry gate.** hostd looks a plugin up in the registry index.
-    One graded `fail` is refused unless loaded with `force`.
+  - **Registry gate.** hostd looks a plugin up in the registry index, in
+    its format (path for CLAP and VST3, URI for LV2). One graded `fail` is
+    refused unless loaded with `force`.
   - The supervisor never loads plugin code itself.
 - **Threads (implemented in the worker).**
-  - *Main* is the PipeWire main loop. It makes every CLAP `[main-thread]`
-    call (`init`, `activate`, `params.get_info`/`flush` while inactive,
-    `state`, `on_main_thread`, timers), and handles D-Bus, OSC, graph
-    watching and linking.
+  - *Main* is the PipeWire main loop. It makes every main-thread call of
+    the plugin (CLAP `[main-thread]`: `init`, `activate`,
+    `params.get_info`/`flush` while inactive, `state`, `on_main_thread`,
+    timers, presets; VST3: component and edit controller; LV2:
+    instantiate, activate, state, `work()` of the worker extension), and
+    handles D-Bus, OSC, graph watching and linking.
   - *Audio* is PipeWire's data loop (`PW_FILTER_FLAG_RT_PROCESS`). It makes
-    the `start_processing`, `process` and `stop_processing` calls. On
+    the `start_processing`/`setProcessing`, `process`/`run` and
+    `stop_processing` calls. On
     teardown and re-activation, `stop_processing` runs there through a
     blocking `pw_loop_invoke` on the filter's data loop.
   - Control in (parameter values, notes) goes through an SPSC ring. Output
-    parameter events come back through another. Events live in a
-    preallocated array.
+    parameter events come back through another. Events live in preallocated
+    arrays (CLAP events, VST3 `EventList`/`ParameterChanges` sized at load,
+    the LV2 atom sequence). LV2 worker requests and responses cross in SPSC
+    rings of fixed slots. A VST3 controller callback from a plugin's own
+    thread is queued under a lock only non-audio threads take.
+  - LV2 state restore is in LV2's instantiation threading class, so the
+    worker keeps the audio thread out of the plugin while it runs (the
+    same `pw_loop_invoke` handshake as a stop).
   - If the graph rate isn't the activated rate, the audio thread outputs
     silence and asks main to re-activate.
 - **MIDI.**
@@ -196,8 +217,10 @@ effect-insert component.
     `SPA_CONTROL_Midi` (MIDI 1.0 bytes, which 1.6.8's bridge sends) or
     `SPA_CONTROL_UMP` (converted with `spa_ump_to_midi`).
   - Events reach the plugin sample-accurately, at their offset in the
-    cycle. The plugin gets them as `CLAP_EVENT_MIDI` if its note port takes
-    MIDI, otherwise as CLAP note events.
+    cycle. CLAP: `CLAP_EVENT_MIDI` if its note port takes MIDI, otherwise
+    CLAP note events. VST3: note on/off and poly pressure events on the
+    event bus, CC, channel pressure and pitch bend through the controller's
+    `IMidiMapping`. LV2: `midi:MidiEvent` atoms with frame times.
   - **`--midi-follow REGEX`** watches the registry and links every matching
     MIDI source, now or when hotplugged. So "my USB keyboard plays the
     system synth" is one option, and the link dies with the worker.
@@ -208,28 +231,47 @@ effect-insert component.
   - D-Bus interface `io.github.manuaudio.Backline.Instance1` on the bus
     name `io.github.manuaudio.Backline.Instance.<node>`:
     - `ListParams`, `GetParam`, `SetParam(key, value)`. The key is an id, an
-      exact name, or a unique substring.
+      exact name, or a unique substring. VST3 values are plain values
+      (`normalizedParamToPlain`); LV2 parameters are the control ports.
     - `NoteOn`, `NoteOff`.
     - `SaveState(path)`, `LoadState(path)`.
-    - Properties: `PluginId`, `NodeId`, `OscPort`, `SampleRate`, `Cycles`,
-      `MidiEvents`, `DroppedEvents`, `ReleasedNotes`.
+    - `ListPresets`, `LoadPreset(id)`, `SavePreset(name)` (VST3).
+    - Properties: `PluginId`, `PluginFormat`, `NodeId`, `OscPort`,
+      `SampleRate`, `Cycles`, `MidiEvents`, `DroppedEvents`,
+      `ReleasedNotes`, `StateSerial`, `StateSaved`.
+    - Full reference: [docs/api/Instance1.md](docs/api/Instance1.md).
   - OSC: `/backline/param/set s|i f`, `/backline/param/<key> f`,
     `/backline/param/get s` (replies `/backline/param i s d d d`),
-    `/backline/param/list`, `/backline/note/on iii`, `/backline/note/off ii`.
-  - **Presets** come next. hostd indexes CLAP `preset-discovery` providers
-    (the registry already lists them) and loads them with the `preset-load`
-    extension. A plain `state` file is the fallback. Parameter names should
-    follow clap-pipewire's sanitised control names (`Gain (dB)` →
+    `/backline/param/list`, `/backline/note/on iii`, `/backline/note/off ii`,
+    `/backline/preset/list`, `/backline/preset/load s`.
+  - **Presets** (built). The worker lists them when asked: CLAP
+    `preset-discovery` providers crawled for the plugin's id, loaded with
+    `preset-load`; VST3 `.vstpreset` files in the standard directories
+    (read and written with the SDK's `PresetFile`) and the plugin's program
+    lists (loaded through the program-change parameter); LV2 `pset:Preset`
+    resources, loaded with `lilv_state`. A loaded preset counts as a state
+    change, so hostd's state file follows it. Still open: parameter names
+    following clap-pipewire's sanitised control names (`Gain (dB)` →
     `Gain_dB`), so one name works for an in-graph and an out-of-process
     instance of the same plugin.
-- **Formats.**
-  - **CLAP first** (done).
-  - **VST3** next, through the VST3 SDK hosting classes (MIT since 3.8).
-    VST3 needs C++, which is why the worker is C++.
-  - **LV2** through `lilv` (and `suil` for UIs). For in-graph LV2 effects,
-    PipeWire's own filter-chain is already the answer.
-  - The worker hides the format behind one internal `PluginInstance`
-    interface, so each format is one adapter.
+- **Formats** (all three built, §4.5). The worker hides the format behind
+  one internal `PluginInstance` interface (`host/plugin.h`), so each format
+  is one adapter.
+  - **CLAP** (`plugin_clap.cpp`): the original glue, moved behind the
+    interface unchanged.
+  - **VST3** (`plugin_vst3.cpp`) on the VST3 SDK 3.8 hosting classes (MIT):
+    `module_linux`, `plugprovider`, `hostclasses`, `eventlist`,
+    `parameterchanges`, `vstpresetfile`, compiled into a static library from
+    `BACKLINE_VST3SDK_DIR` (default: the `vst3sdk` pkg-config package).
+    Optional: without the SDK the worker is built without VST3 and says so.
+    The controller gets the component's state at load, as hosts do.
+  - **LV2** (`plugin_lv2.cpp`) on `lilv`: URID map/unmap, options and
+    `buf-size`, `log`, `worker`, `state:loadDefaultState`; audio ports by
+    port group; control ports as parameters. Only the spec bundles and the
+    bundles naming the plugin's URI are parsed, not every installed TTL.
+    LV2 fixes the rate at instantiation, so a rate change re-instantiates
+    and carries the state over. For in-graph LV2 effects, PipeWire's own
+    filter-chain is already the answer.
 - **GUIs.** Later. The worker opens the plugin's own window (CLAP `gui`,
   X11/XWayland today, Wayland when CLAP and VST3 settle), on request from
   hostd.
@@ -238,8 +280,10 @@ effect-insert component.
     tested against a rule-checking test plugin (thread and lifecycle rules,
     block splitting, aliasing, state). The worker should move onto it once
     it gains note ports and is installed as a static library or subproject.
-    See the coordination items in §6. The worker's own CLAP glue (≈600
-    lines) is the slice's stand-in.
+    Checked again with the VST3/LV2 work: it still has no note ports or
+    input events beyond parameters, and it isn't installed as a library, so
+    the worker keeps its own CLAP glue (now `plugin_clap.cpp`, behind the
+    same interface the core would sit behind). See §6.
   - **clap-helpers (MIT)** for VST3/CLAP-side C++ utilities.
   - **Carla's bridges** (`carla-bridge-native`, GPL) as the fallback for
     Windows VST via Wine and odd formats, *run as a separate process* so
@@ -433,10 +477,11 @@ effect-insert component.
 | In-graph LV2/LADSPA/builtin effects | PipeWire filter-chain | Already a system effect |
 | In-graph CLAP effects | clap-pipewire | Separate project |
 | CLAP SDK | free-audio/clap 1.2.10 headers (vendored, MIT) | |
-| CLAP host core | clap-pipewire `clap-host.c` (planned), clap-helpers | Avoid two CLAP hosts |
+| CLAP host core | clap-pipewire `clap-host.c` (planned, §6), clap-helpers | Avoid two CLAP hosts; until then the worker's own adapter |
 | CLAP validation | clap-validator | Run in a scope (it leaves hung children) |
-| VST3 hosting and validation | VST3 SDK 3.8 (MIT) hosting classes, `validator` | |
-| LV2 hosting | lilv, suil, jalv as reference | |
+| VST3 hosting and validation | VST3 SDK 3.8 (MIT) hosting classes (**used**, §4.5), `validator` | |
+| LV2 hosting | lilv (**used**, §4.5), suil, jalv as reference | |
+| Presets | CLAP `preset-discovery`/`preset-load`, the SDK's `PresetFile` (`.vstpreset`), `lilv_state` | |
 | Odd formats, Wine VST | Carla bridges, out of process (GPL boundary) | |
 | Single-stream capture/playback | `pw-record`, `pw-play`, `pw-cat --midi` | No alignment, no timestamps |
 | Multichannel capture to disk | jack_capture (reference) | JACK-only, GPL, no BWF |
@@ -580,6 +625,49 @@ A full scan of `~/.clap`, `~/.vst3` and `~/.lv2`, plus three test plugins
 - **Queries.** A D-Bus `Query` takes about 3 ms, and the service exits
   when idle.
 
+### 4.5 Formats and presets (`tests/formats-proof`)
+
+The same worker hosting VST3 and LV2, on throwaway sinks. Full report in
+`docs/proofs/formats-proof.txt`.
+
+| Note (one keyboard, two instruments, one take) | VST3 Surge XT | LV2 Odin2 |
+|---|---|---|
+| A4 440.000 Hz | 440.020 Hz, +0.08 cent, −21.9 dBFS | 440.022 Hz, +0.09 cent, −20.7 dBFS |
+| C4 261.626 Hz | 261.607 Hz, −0.12 cent | 261.607 Hz, −0.12 cent |
+| E5 659.255 Hz | 659.261 Hz, +0.02 cent | 659.263 Hz, +0.02 cent |
+| MIDI → node output (quantum 128) | 0.3–2.6 ms | 0.1–0.5 ms |
+
+- **Parameters.** Set over OSC, read back over OSC and D-Bus, restored over
+  D-Bus. Surge XT VST3 "Global Volume" 0.958 → 0.5: −21.98 dB, restored
+  ±0.00 dB. Odin2 LV2 "Amplifier Gain" 0.714 → 0.25: −19.5 dB, restored
+  −0.01 dB.
+- **Effects.** A 1 kHz burst into a sink whose monitor feeds both effects
+  (`--audio-source`). Dragonfly Hall Reverb (VST3): a tail at −38 dBFS
+  0.2–1.0 s after the burst, where the dry signal is digital silence. CHOW
+  Tape Model (LV2): third harmonic at −9.7 dB re the fundamental (dry:
+  −88 dB).
+- **Presets.** CLAP Surge XT: 2 986 presets from `preset-discovery`; loading
+  "Attacky" changed 36 of 775 values and the note (440 → 110 Hz, −21.9 →
+  −16.3 dBFS). VST3 Dexed: 32 programs from its program list; "LAURIE"
+  changed 92 of 2 264 values and the sound (centroid 513 → 5 034 Hz). A
+  `.vstpreset` written with `SavePreset` and loaded back: every value equal
+  (Dexed's program-change parameter aside: a program sets it, its state
+  doesn't keep it). LV2 CHOW Tape Model: 94 `pset:Preset`; "Bass Pusher I"
+  changed 9 of 52 values and +6.2 dB on the burst.
+- **Restart with state under hostd.** Three parameters moved on each, then
+  SIGKILL. VST3 Surge XT: restarted 126 ms after the kill; 2 855 values
+  equal (one, "A Pitch" 0.6, comes back as 0.6000000238: the plugin keeps it
+  as a 32-bit float); the note −43.91 dBFS at 477.04 Hz before and after.
+  LV2 Odin2: restarted 485 ms after the kill (JUCE's LV2 instantiation); 258 of 258 values exactly
+  equal; −65.61 dBFS at 493.90 Hz before and after.
+- **Registry gate by LV2 URI.** Cardinal Synth's LV2, graded fail (SIGABRT
+  on its own corrupt settings file), was refused.
+- **Channel layout.** Both instrument nodes show `audio.channels 2`,
+  `audio.position FL,FR`; Surge XT as CLAP (three stereo buses) shows 6 and
+  `FL,FR,AUX2,AUX3,AUX4,AUX5`.
+- The other nodes, the PipeWire/WirePlumber pids and the default sink were
+  unchanged; no node, process or scope of the proof was left.
+
 ## 5. Build order
 
 1. **Host supervisor and client skeleton.** *Done (§4.3).*
@@ -603,9 +691,10 @@ A full scan of `~/.clap`, `~/.vst3` and `~/.lv2`, plus three test plugins
      `transport` in the worker. Then Link, then LTC, then MTC, each with a
      measured proof (Link phase versus `link-hut`; LTC round trip through a
      loopback; MTC chase against a generator).
-5. **Host formats.**
-   - Move the worker onto the shared CLAP core (`cph_*`). Then VST3, then
-     LV2 instruments, then presets (`preset-discovery` and `preset-load`).
+5. **Host formats.** *VST3, LV2 and presets done (§4.5).*
+   - Still open: moving the CLAP adapter onto the shared core (`cph_*`, §6),
+     a VST3 run check in the registry, LV2 `patch:Parameter` parameters
+     (Surge XT's LV2 has only two control ports), saving LV2/CLAP presets,
      GUIs last.
 6. **Player.** Files on the timeline, chasing clockd.
 7. **Control service.** OSC and MIDI mapping across Backline, filter-chain
@@ -622,7 +711,10 @@ A full scan of `~/.clap`, `~/.vst3` and `~/.lv2`, plus three test plugins
 ## 6. Coordination with clap-pipewire (read-only here; via its README and API)
 
 - **Shared CLAP core.** The worker should link `clap-host.c` (`cph_*`)
-  instead of keeping its own glue. Two asks for that project:
+  instead of keeping its own glue. Checked again with the format work
+  (2026-11-11): neither ask below is met yet, so the worker's CLAP adapter
+  stays; it already sits behind the interface the core would plug into.
+  Two asks for that project:
   1. Install it as a static library or meson subproject with its header.
   2. Add note ports (`CLAP_EXT_NOTE_PORTS`, input events beyond params) to
      the core. Its README already lists "instruments and note effects" as

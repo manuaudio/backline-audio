@@ -26,7 +26,9 @@ jobs:
         if: matrix.distro == 'archlinux'
         run: |
           pacman -Syu --noconfirm --needed base-devel git cmake ninja pkgconf \
-            pipewire libpipewire systemd-libs libsndfile alsa-lib json-c lilv openssl
+            pipewire libpipewire systemd-libs libsndfile alsa-lib json-c lilv openssl vst3sdk
+      # Arch builds the worker with VST3 (extra/vst3sdk 3.8, found through
+      # pkg-config); Debian builds it without, so both paths stay green.
       - name: Install build dependencies (Debian)
         if: matrix.distro == 'debian-trixie'
         run: |

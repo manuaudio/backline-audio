@@ -162,9 +162,10 @@ EOF
 
 # ------------------------------------------------------------- 3. crash loop
 echo; echo "-- 3. crash loop: kill it whenever it comes back; hostd backs off, then gives up"
-running_new() { # prev-pid
-  [[ $($B --json host show synth | jq -r '"\(.state) \(.pid)"') == "running "* ]] &&
-    [[ $($B --json host show synth | jq -r .pid) != "$1" ]]
+running_new() { # prev-pid: running, with a pid other than prev (one query, so
+  # a crash between two queries can't pass a 0 pid on to kill)
+  local st; st=$($B --json host show synth | jq -r '"\(.state) \(.pid)"')
+  [[ $st == "running "* && ${st#running } != "$1" && ${st#running } -gt 0 ]]
 }
 pid_before=$($B --json host show synth | jq -r .pid)
 $B host restart synth   # an explicit restart also clears the crash history
@@ -177,7 +178,7 @@ prev=0
 for n in 1 2 3 4 5 6; do
   wait_for "worker $n running" running_new "$prev"
   prev=$($B --json host show synth | jq -r .pid)
-  kill -KILL "$prev" || true
+  [[ $prev -gt 0 ]] && kill -KILL "$prev" || true
 done
 wait_for "failed" bash -c "[[ \$($B --json host show synth | jq -r .state) == failed ]]"
 wait $watch 2>/dev/null || true

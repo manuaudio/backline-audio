@@ -1,0 +1,119 @@
+== formats-proof 2026-11-11T23:11:38-08:00
+pipewire 1.6.8, kernel 7.2.5-3-omarchy, systemd 261
+worker: usage: backline-plugin-worker --plugin PATH|NAME|URI [options]
+default sink: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"}
+other nodes in the graph: 6; pipewire/wireplumber pids: 20756 20754 / 20755
+
+-- 1. instruments: virtual keyboard -> MIDI bridge -> Surge XT (VST3) and Odin2 (LV2), one take
+  {"node":"backline.fmt-vst3","format":"vst3","plugin":"ABCDEF019182FAEB566D624153675854","plugin_path":"~/.vst3/Surge XT.vst3","pid":1942903}
+    loaded Surge XT (vst3, ABCDEF019182FAEB566D624153675854) from ~/.vst3/Surge XT.vst3: 2855 params, note input: vst3 events
+  {"node":"backline.fmt-lv2","format":"lv2","plugin":"https://thewavewarden.com/odin2","plugin_path":"~/.lv2/Odin2.lv2","pid":1944068}
+    loaded Odin2 (lv2, https://thewavewarden.com/odin2) from ~/.lv2/Odin2.lv2: 258 params, note input: atom
+  midi-follow: linking Midi-Bridge:backline-fmt-kbd:keys (capture) | backline-fmt-kbd:keys
+  VST3 Surge XT: note expect Hz    FFT Hz  cents     level  on->sound  gap peak
+                 A4     440.000   440.020   0.08  -21.9 dB    0.25 ms -176.7 dB
+                 C4     261.626   261.607  -0.12  -21.9 dB    2.58 ms -187.7 dB
+                 E5     659.255   659.261   0.02  -22.0 dB    0.79 ms -173.5 dB
+  LV2 Odin2: note expect Hz    FFT Hz  cents     level  on->sound  gap peak
+             A4     440.000   440.022   0.09  -20.7 dB    0.08 ms -240.0 dB
+             C4     261.626   261.607  -0.12  -20.6 dB    0.48 ms -240.0 dB
+             E5     659.255   659.263   0.02  -20.7 dB    0.12 ms -240.0 dB
+  overruns: 0 frames; graph quantum during the take: [128, 128] (MIDI-to-sound is up to one quantum: the note lands in the next cycle)
+  RESULT: PASS (each format: 3 notes from the keyboard, pitch within 5 cents, > -40 dBFS, silent between notes)
+
+-- 1b. channel layout of the worker nodes (pw-dump)
+  backline.fmt-vst3 (vst3): media.class Stream/Output/Audio, audio.channels 2, audio.position FL,FR; out ports: out_FL=FL out_FR=FR
+  backline.fmt-lv2 (lv2): media.class Stream/Output/Audio, audio.channels 2, audio.position FL,FR; out ports: out_FL=FL out_FR=FR
+
+-- 2. parameters over OSC and D-Bus: a note before, one after the OSC set, one after the D-Bus restore
+  vst3: "Global Volume" D-Bus GetParam 0.9577969908714294433594; OSC /param/set 0.5
+    OSC /param/get -> [1336600346,"Global & FX/Global Volume",0.5,0.0,1.0]
+    D-Bus GetParam -> 0.5000000000000000000000
+  lv2: "Amplifier Gain" D-Bus GetParam 0.7142860293388366699219; OSC /param/set 0.25
+    OSC /param/get -> [121,"Amplifier Gain",0.25,0.0,1.0]
+    D-Bus GetParam -> 0.2500000000000000000000
+  vst3: D-Bus SetParam("Global Volume", 0.9577969908714294433594) -> GetParam 0.9577969908714294433594, OSC /param/get 0.9577969908714294
+  lv2: D-Bus SetParam("Amplifier Gain", 0.7142860293388366699219) -> GetParam 0.7142860293388366699219, OSC /param/get 0.7142860293388367
+  VST3: note before -21.93 dBFS | after the OSC set -43.91 dBFS (-21.98 dB) | after the D-Bus restore -21.93 dBFS (-0.00 dB)
+  LV2: note before -20.38 dBFS | after the OSC set -39.89 dBFS (-19.51 dB) | after the D-Bus restore -20.39 dBFS (-0.01 dB)
+  RESULT: PASS (each format: OSC set and get, D-Bus get and set; quieter while set, back within 0.5 dB)
+
+-- 3. effects: tone burst -> Dragonfly Hall Reverb (VST3) and CHOW Tape Model (LV2)
+  {"node":"backline.fmt-fx-vst3","format":"vst3","plugin":"2046504473616C633172666400000000"}
+    audio-source: linking backline-fmt.src:monitor_FL -> in_FL
+    audio-source: linking backline-fmt.src:monitor_FR -> in_FR
+    audio-target: linking out_FL -> backline-fmt.fx-v:playback_FL
+    audio-target: linking out_FR -> backline-fmt.fx-v:playback_FR
+  {"node":"backline.fmt-fx-lv2","format":"lv2","plugin":"https://github.com/jatinchowdhury18/AnalogTapeModel"}
+    audio-source: linking backline-fmt.src:monitor_FL -> in_FL
+    audio-source: linking backline-fmt.src:monitor_FR -> in_FR
+    audio-target: linking out_FL -> backline-fmt.fx-l:playback_FL
+    audio-target: linking out_FR -> backline-fmt.fx-l:playback_FR
+  dry (sink monitor): 1 kHz burst 0.5 s at -15.05 dBFS; 0.2-1.0 s after it: -240.0 dBFS; H2 -162.1 dB, H3 -88.1 dB (re H1)
+  VST3 Dragonfly Hall Reverb: during the burst -16.68 dBFS; reverb tail 0.2-1.0 s after it: -38.1 dBFS
+  LV2 CHOW Tape Model: during the burst -16.01 dBFS (-0.96 dB); H2 -43.9 dB, H3 -9.7 dB (re H1); after it: -53.0 dBFS
+  RESULT: PASS (reverb: a tail where the dry signal is silent; tape: added harmonics or a level change)
+
+-- 4. presets
+  backline.fmt-clap (clap): media.class Stream/Output/Audio, audio.channels 6, audio.position FL,FR,AUX2,AUX3,AUX4,AUX5; out ports: out_FL=FL out_FR=FR out1_FL=AUX2 out1_FR=AUX3 out2_FL=AUX4 out2_FR=AUX5
+  CLAP Surge XT: 2986 presets from preset-discovery, e.g. ["~/.local/share/surge-xt/patches_factory/Basses/Attacky.fxp","Attacky","~/.local/share/surge-xt/patches_factory/Basses/Attacky.fxp"]
+    LoadPreset("~/.local/share/surge-xt/patches_factory/Basses/Attacky.fxp") ok
+    36 of 775 parameter values changed
+  VST3 Dexed: 32 presets (program list), e.g. ["program:1886548852:1","LAURIE    ","program list 'Factory Presets'"]
+    LoadPreset("LAURIE") ok (a program change through the program-change parameter)
+    92 of 2264 parameter values changed
+    SavePreset("Backline proof") -> ./tests/out/formats/vst3-presets/Backline proof.vstpreset (7271 bytes, header VST3)
+    LoadPreset("Say Again."): 92 of 2264 parameter values changed
+    ListPresets now: [["./tests/out/formats/vst3-presets/Backline proof.vstpreset","Backline proof","./tests/out/formats/vst3-presets/Backline proof.vstpreset"]]
+    LoadPreset("Backline proof") (the .vstpreset): 1 of 2264 parameter values changed against the saved values: [{"name":"Program","saved":1.000000000000000000000,"now":0E-21}]
+  LV2 CHOW Tape Model: 94 pset:Preset presets, e.g. ["https://github.com/jatinchowdhury18/AnalogTapeModel#preset001","Default","~/.lv2/CHOWTapeModel.lv2/presets.ttl"]
+    LoadPreset("https://github.com/jatinchowdhury18/AnalogTapeModel#preset007") ok
+    9 of 52 parameter values changed
+  CLAP: A4 before the preset -21.93 dBFS, f0 440.02 Hz, centroid 4608 Hz | after -16.34 dBFS, f0 110.01 Hz, centroid 189 Hz
+  VST3: A4 before the preset -26.96 dBFS, f0 219.99 Hz, centroid 513 Hz | after -20.5 dBFS, f0 442.24 Hz, centroid 5042 Hz
+  LV2: tone burst through CHOW before the preset -16.01 dBFS, after -9.78 dBFS (+6.23 dB)
+  presets listed: CLAP 2986, VST3 32, LV2 94; values changed by the load: CLAP 36, VST3 92, LV2 9; .vstpreset round trip: 0 differ (not counting Dexed's program-change parameter, which a program selects and its state does not keep)
+  RESULT: PASS (each format lists presets; a load changes parameters and the sound; a written .vstpreset reads back exactly)
+
+-- 5. supervisor: VST3 and LV2 instances, SIGKILL, restart with state
+  registry (throwaway index): [{"format":"lv2","name":"Cardinal Synth","grade":"fail"},{"format":"lv2","name":"Odin2","grade":"pass"},{"format":"vst3","name":"Surge XT","grade":"pass"}]
+  registry gate: load https://distrho.kx.studio/plugins/cardinal#synth refused: backline: host load: Load: the registry grades https://distrho.kx.studio/plugins/cardinal#synth fail: check crashed (SIGABRT, signal 6); last stderr: what():  Settings file has invalid JSON at 62:3 end of file expected near '{' (load with force=true to run it anyway)
+  {"id":"synth-vst3","plugin":"Surge XT","plugin_id":"ABCDEF019182FAEB566D624153675854","pid":2238937,"unit":"backline-worker-synth-vst3-0.scope","state_file":"./tests/out/formats/state/synth-vst3.vst3state"}
+  {"id":"synth-lv2","plugin":"https://thewavewarden.com/odin2","plugin_id":"https://thewavewarden.com/odin2","pid":2239865,"unit":"backline-worker-synth-lv2-0.scope","state_file":"./tests/out/formats/state/synth-lv2.lv2state"}
+  synth-vst3: "Global Volume" 0.5 -> 0.5; "A Pitch" 0.6 -> 0.59999999999999998; "Send FX 1 Return" 0.25 -> 0.25;
+    StateSerial 4 = StateSaved 4; synth-vst3.vst3state: 50449 bytes, starts with VST3
+  synth-lv2: "Amplifier Gain" 0.6 -> 0.59999999999999998; "Osc1 Semitones" 0.6 -> 0.59999999999999998; "Filter1 Frequency" 0.3 -> 0.29999999999999999;
+    StateSerial 3 = StateSaved 3; synth-lv2.lv2state: 81396 bytes, starts with <urn
+  SIGKILL -> workers 2238937 (VST3) and 2239865 (LV2)
+  {"id":"synth-vst3","state":"running","pid":2262412,"restarts":1,"last_signal":9,"unit":"backline-worker-synth-vst3-1.scope"}
+    worker: restored state from ./tests/out/formats/state/synth-vst3.vst3state (50449 bytes, 2855 params)
+  {"id":"synth-lv2","state":"running","pid":2262435,"restarts":1,"last_signal":9,"unit":"backline-worker-synth-lv2-1.scope"}
+    worker: restored state from ./tests/out/formats/state/synth-lv2.lv2state (81396 bytes, 258 params)
+  synth-vst3: 2855 parameters before, 2855 after; values that differ: 1 (exact comparison), 0 at 32-bit float precision
+    differs exactly: A Pitch 0.6 -> 0.6000000238418579 (the plugin keeps it as a 32-bit float)
+    Global Volume      before 0.5  after 0.5
+    A Pitch            before 0.6  after 0.6
+    Send FX 1 Return   before 0.25  after 0.25
+    Crashed(signal 9) +6.7 ms, Restarted(pid 2262412, restarts 1) +126.2 ms after the kill
+    A4 before the kill -43.91 dBFS, 477.04 Hz | after the restart -43.91 dBFS, 477.04 Hz (-0.00 dB, -0.00 cents)
+  synth-lv2: 258 parameters before, 258 after; values that differ: 0 (exact comparison), 0 at 32-bit float precision
+    Amplifier Gain     before 0.6  after 0.6
+    Osc1 Semitones     before 0.6  after 0.6
+    Filter1 Frequency  before 0.3  after 0.3
+    Crashed(signal 9) +9.6 ms, Restarted(pid 2262435, restarts 1) +485.3 ms after the kill
+    A4 before the kill -65.61 dBFS, 493.90 Hz | after the restart -65.61 dBFS, 493.90 Hz (+0.00 dB, +0.00 cents)
+  RESULT: PASS (both formats come back with every parameter value and the same sound; the gate refuses a fail grade)
+
+-- summary
+  notes: PASS
+  param: PASS
+  fx: PASS
+  presets: PASS
+  hostd: PASS
+
+-- clean up
+this proof's nodes left: 0; processes it started still running: 0; worker scopes left: 0
+other nodes same as at start: yes (6 nodes)
+  (quickshell meter streams: 0 at start, 0 at the end; not judged)
+pipewire/wireplumber pids: 20756 20754 / 20755 (before: 20756 20754 / 20755)
+default sink after: {"name":"alsa_output.pci-0000_00_1f.3.hdmi-stereo"} (unchanged)

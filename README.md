@@ -66,8 +66,8 @@ See [omarchy/README.md](omarchy/README.md) (panels, commands, menu, hotkeys, ins
 
 | Component | What it is | State |
 |---|---|---|
-| `backline-plugin-worker` | One CLAP plugin as one PipeWire node, in its own process. MIDI in (follows hotplugged keyboards, releases stuck notes on unplug), audio in/out, params, notes and state over D-Bus (`Instance1`) and localhost OSC | Built, measured |
-| `backline-hostd` | The supervisor (D-Bus `Host1`). It runs one worker per instance in a transient systemd user scope with resource limits. After a crash it restarts the worker with the saved CLAP state, with backoff and a give-up limit. It refuses plugins the registry grades `fail` unless forced | Built, measured |
+| `backline-plugin-worker` | One CLAP, VST3 or LV2 plugin as one PipeWire node, in its own process. MIDI in (follows hotplugged keyboards, releases stuck notes on unplug), audio in/out, params, notes, state and presets over D-Bus ([`Instance1`](docs/api/Instance1.md)) and localhost OSC | Built, measured |
+| `backline-hostd` | The supervisor (D-Bus `Host1`). It runs one worker per instance in a transient systemd user scope with resource limits. After a crash it restarts the worker with the saved plugin state (CLAP, VST3 or LV2), with backoff and a give-up limit. It refuses plugins the registry grades `fail` unless forced | Built, measured |
 | `backline-registry` + `backline-probe` | The plugin index (D-Bus `Registry1`, JSON `backline.plugins/1`). Each plugin is probed in its own process, sandboxed with timeouts, then graded and cached | Built, measured |
 | `backline-recorder` | N nodes into one take: WAV float/24-bit or FLAC, BWF `bext`, a sidecar with UTC, monotonic and graph timestamps. Signal alignment across driver and follower sinks, and pre-roll | Built, measured |
 | `libbackline` | The MIT C client library (sd-bus only, no PipeWire dependency): `Host1`, `Instance1`, `Registry1` calls and a signal watcher | Skeleton, used by the CLI |
@@ -82,12 +82,16 @@ effects) are a separate project,
 
 You need PipeWire ≥ 1.4 development headers (1.6 is preferred: the worker
 then uses the newer pod parser), plus libsystemd, libsndfile, alsa-lib,
-json-c, OpenSSL's libcrypto, and optionally lilv (for LV2). You also need
-CMake ≥ 3.20 and a C11/C++20 compiler. The CLAP headers are vendored (MIT).
+json-c, OpenSSL's libcrypto, and optionally lilv (for LV2) and the VST3 SDK
+3.8 (for VST3; MIT; Arch: `vst3sdk`, found through pkg-config, or point
+`-DBACKLINE_VST3SDK_DIR=` at an unpacked SDK). Without them the worker is
+built without that format (`-DBACKLINE_VST3=OFF`, `-DBACKLINE_LV2=OFF` to
+force it). You also need CMake ≥ 3.20 and a C11/C++20 compiler. The CLAP
+headers are vendored (MIT).
 
 ```sh
 # Arch
-sudo pacman -S --needed base-devel cmake ninja pipewire libsndfile alsa-lib json-c lilv openssl
+sudo pacman -S --needed base-devel cmake ninja pipewire libsndfile alsa-lib json-c lilv openssl vst3sdk
 # Debian 13 / Ubuntu 25.04+
 sudo apt install build-essential cmake ninja-build pkg-config libpipewire-0.3-dev libsystemd-dev \
   libsndfile1-dev libasound2-dev libjson-c-dev liblilv-dev libssl-dev
@@ -110,7 +114,11 @@ build/backline set synth "Global Volume" 0.5
 build/backline note synth on 60 100; sleep 1; build/backline note synth off 60
 build/backline --json host show synth                    # pid, node, OSC port, scope, state file
 build/backline host watch                                # Loaded / Crashed / Restarted / Failed
+build/backline host presets synth                        # CLAP preset-discovery, .vstpreset, LV2 presets
+build/backline host preset synth "Attacky"
 build/backline host unload synth
+build/backline host load "Dexed" --format vst3 --id dx   # a VST3 bundle by name (or a path)
+build/backline host load https://thewavewarden.com/odin2 --id odin   # an LV2 plugin by URI
 
 build/registry/backline-registry scan                    # index ~/.clap ~/.vst3 ~/.lv2 and the system dirs
 build/backline plugins list --kind instrument --grade pass
@@ -134,26 +142,30 @@ in [`docs/proofs/`](docs/proofs/).
 |---|---|---|
 | [`host-proof`](docs/proofs/host-proof.txt) | Surge XT played by a virtual keyboard through PipeWire's MIDI bridge; a live parameter over OSC/D-Bus; SIGKILL one of two instances | Pitch within 0.12 cent by FFT. The parameter took effect in ≤ 27 ms. The survivor was unchanged and gap-free across the kill |
 | [`hostd-proof`](docs/proofs/hostd-proof.txt) | hostd + CLI: three parameters moved, SIGKILL while a keyboard plays, crash loop, registry gate | All 775 parameter values identical after the restart. Restarted ≈ 80 ms after the kill. Level and pitch identical (±0.00 dB, ±0.00 cent), and every later note sounds. Backoff 0/250/500/1000/2000 ms, then `Failed`. A `fail`-graded plugin was refused, and when forced it left no processes |
+| [`formats-proof`](docs/proofs/formats-proof.txt) | VST3 (Surge XT, Dexed, Dragonfly) and LV2 (Odin2, CHOW Tape Model) in the worker: keyboard notes, OSC/D-Bus parameters, effects on a test signal, presets in all three formats, SIGKILL under hostd | Pitch within 0.12 cent in both formats. Reverb tail and tape harmonics measured. 2 986 CLAP, 32 VST3 and 94 LV2 presets listed; a load changes the sound in each format. After SIGKILL, every parameter value back (VST3 at 32-bit float precision, LV2 exact) and the same level and pitch |
 | [`registry-proof`](docs/proofs/registry-proof.txt) | Full scan of `~/.clap`, `~/.vst3` and `~/.lv2`, plus crash and hang test plugins | 645 plugins in 13.4 s cold (10 s of that is the hang plugin's timeout) and 1.6 s warm. The crash (SIGSEGV) and the hang were graded fail, and their helper processes were killed |
 | [`recorder-proof`](docs/proofs/recorder-proof.txt) | One signal into two sinks, one of them the graph driver, at quantum 2048 and 256; pre-roll | Bit-identical tracks at lag 0, where raw graph alignment is off by exactly one quantum. The pre-roll take is identical to the matching stretch of a reference take |
 
 ```sh
-tests/host-proof; tests/hostd-proof; tests/registry-proof; tests/recorder-proof
+tests/host-proof; tests/hostd-proof; tests/formats-proof; tests/registry-proof; tests/recorder-proof
 ```
 
 The proofs need a running PipeWire (≥ 1.4) with WirePlumber, a systemd user
 session, `pw-cli`, `pw-play`, `pw-record`, `jq`, `busctl`, `python3` and
 `metaflac`. `host-proof` and `hostd-proof` also need Surge XT (CLAP) in
-`~/.clap` or `/usr/lib/clap`.
+`~/.clap` or `/usr/lib/clap`. `formats-proof` needs Surge XT (CLAP, VST3),
+Dexed, Dragonfly Hall Reverb (VST3), Odin2, CHOW Tape Model and Cardinal
+(LV2) in the user plugin directories.
 
 ## Limits (as of now)
 
-- **CLAP only in the host.** VST3 and LV2 instruments come next. The registry
-  indexes all three, but grades VST3 on loading only, since running VST3
-  needs the SDK's hosting classes.
-- **No plugin GUIs, no presets index, no transport** (`clap_process.transport`
-  is null). The clock service is still design.
-- **State is whatever the plugin saves.** hostd restores the CLAP state blob;
+- **Formats.** CLAP, VST3 and LV2 run in the worker. The registry still
+  grades VST3 on loading only. LV2 parameters are control ports only, not
+  `patch:Parameter` (so Surge XT's LV2 shows two). Presets are saved only
+  for VST3 (`.vstpreset`).
+- **No plugin GUIs, no transport** (`clap_process.transport` is null; VST3
+  gets a fixed 120 BPM context). The clock service is still design.
+- **State is whatever the plugin saves.** hostd restores the plugin's state;
   a plugin that leaves something out of its state loses it on a restart. A
   note held at the moment of a crash is cut, and the next note-on sounds.
 - **Recorder alignment** follows PipeWire's scheduling, as measured: a sink

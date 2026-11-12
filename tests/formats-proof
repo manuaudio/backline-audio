@@ -127,21 +127,23 @@ for track, label in ((1, "VST3 Surge XT"), (2, "LV2 Odin2")):
         print(f"  {' ' * len(label)}  {n['name']:4} {expect:9.3f} {f:9.3f} {cents:6.2f} {lvl:6.1f} dB {n['midi_to_audio_ms']:7.2f} ms {gpk:6.1f} dB")
     ok = len(notes) == 3 and all(abs(n["cents"]) < 5 and n["rms_dbfs"] > -40 and n["gap_peak_dbfs"] < -80 for n in notes)
     res[label] = {"notes": notes, "pass": ok}
-print(f"  overruns: {take['overrun_frames']} frames")
+print(f"  overruns: {take['overrun_frames']} frames; graph quantum during the take: {take.get('quantum_range')} "
+      f"(MIDI-to-sound is up to one quantum: the note lands in the next cycle)")
 ok = all(r["pass"] for r in res.values()) and take["overrun_frames"] == 0
 print(f"  RESULT: {'PASS' if ok else 'FAIL'} (each format: 3 notes from the keyboard, pitch within 5 cents, > -40 dBFS, silent between notes)")
 json.dump(res | {"pass": ok}, open(f"{out}/result-notes.json", "w"), indent=1)
 EOF
 
 echo; echo "-- 1b. channel layout of the worker nodes (pw-dump)"
-for n in backline.fmt-vst3 backline.fmt-lv2; do
-  id=$(bl_node_id $n)
-  pw-dump 2>/dev/null | jq -r --arg n "$n" --argjson id "$id" '
+layout() { # node.name
+  local id; id=$(bl_node_id "$1")
+  pw-dump 2>/dev/null | jq -r --arg n "$1" --argjson id "$id" '
     (.[] | select(.type=="PipeWire:Interface:Node" and .id==$id) | .info.props) as $p
     | [.[] | select(.type=="PipeWire:Interface:Port" and .info.props["node.id"]==$id and .info.direction=="output")
         | "\(.info.props["port.name"])=\(.info.props["audio.channel"])"] as $ports
-    | "  \($n): media.class \($p["media.class"]), audio.channels \($p["audio.channels"]), audio.position \($p["audio.position"]); out ports: \($ports | join(" "))"'
-done
+    | "  \($n) (\($p["backline.plugin.format"])): media.class \($p["media.class"]), audio.channels \($p["audio.channels"]), audio.position \($p["audio.position"]); out ports: \($ports | join(" "))"'
+}
+layout backline.fmt-vst3; layout backline.fmt-lv2
 
 # ----------------------------------------------------------- 2. parameters
 echo; echo "-- 2. parameters over OSC and D-Bus: a note before, one after the OSC set, one after the D-Bus restore"
@@ -277,6 +279,7 @@ diff_params() { # before.json after.json -> "changed N of M"
 }
 # CLAP: Surge XT, preset-discovery + preset-load
 worker pc -p "Surge XT" -n backline.fmt-clap -t backline-fmt.pre
+layout backline.fmt-clap
 bus "$pc_bus" ListPresets | jq '.data[0]' >"$out/presets-clap.json"
 echo "  CLAP Surge XT: $(jq length "$out/presets-clap.json") presets from preset-discovery, e.g. $(jq -c '.[0]' "$out/presets-clap.json")"
 params_json "$pc_bus" >"$out/pc-before.json"; note_take pre-clap-a "$pc_bus" backline-fmt.pre
