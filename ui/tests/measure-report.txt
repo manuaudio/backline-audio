@@ -1,0 +1,22 @@
+# Backline UI measurements, 2026-11-11T23:25:20-08:00
+# 12th Gen Intel(R) Core(TM) i7-12650H, 16 threads; PipeWire 1.6.8; Qt 6.11.2
+# headless sway 1.12 (wlroots headless backend, GPU render node), the bench's throwaway devices
+# mixer scene graph: OpenGL VENDOR: Intel RENDERER: Mesa Intel(R) Graphics (ADL GT2) VERSION: 4.6 (Compatibility Profile) Mesa 26.2.2-arch1.1
+
+## 1. Meter latency (40 notes into Surge XT, metered by the mixer)
+notes sent 40, onsets matched 40
+key -> tap (MIDI, plugin, graph)   median   22.1 ms   p95   40.9 ms   max   42.1 ms
+tap -> frame (the mixer)           median   16.1 ms   p95   31.8 ms   max   32.7 ms
+key -> frame (total)               median   39.1 ms   p95   62.8 ms   max   68.7 ms
+graph quantum: 128 frames at 48000 Hz (2.7 ms); the meter tick is 33.3 ms (30 Hz)
+
+## 2. Mixer CPU (share of one core)
+metering 4 nodes, signal moving and the instrument playing, 25 s: 4.68%
+of which the meter tick itself (reading the taps, ballistics), per second: median 0.35% of wall time
+window open, graph silent, 10 s: 0.70%
+
+## 3. Quickshell panels
+all panels closed, 10 s: 0.10% of a core; processes started by the shell meanwhile: 0
+Record panel open (a peak monitor per source, the watcher), 10 s: 3.90% of a core
+Plugins panel open (641 plugins, 215 products), 10 s: 0.20% of a core
+processes left running by closed panels: 0

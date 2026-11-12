@@ -1,0 +1,141 @@
+#!/bin/bash
+
+# Measures what the UI costs and how late its meters are, on the bench
+# (omarchy/dev/bench: real services, throwaway devices) and the private
+# headless compositor (omarchy/dev/headless). Writes ui/tests/measure-report.txt.
+#
+#  1. Meter latency, key to pixel: a virtual MIDI keyboard plays 40 notes into
+#     a Backline instrument (Surge XT) while the mixer meters it. The keyboard
+#     logs when each note-on was sent (CLOCK_MONOTONIC); the mixer, with
+#     BACKLINE_MIXER_TRACE, logs when its tap's data thread first saw the
+#     onset and when the frame showing it was presented. Each note gives
+#       key -> tap    MIDI through the bridge, the plugin, one graph cycle
+#       tap -> frame  the mixer's own part: the 30 Hz tick and the render
+#  2. CPU of the mixer: user+system time from /proc over 30 s, with every
+#     strip metering a moving signal and the instrument playing, and over
+#     10 s with the window open on a silent graph.
+#  3. CPU of the Quickshell panels: the shell with the Record panel open
+#     (Quickshell's own peak monitors on each source) and closed, and the
+#     processes a closed panel starts (it should start none).
+
+set -uo pipefail
+
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo=$(cd -- "$here/../.." && pwd)
+dev=$repo/omarchy/dev
+report=${1:-$here/measure-report.txt}
+
+if [[ ${WAYLAND_DISPLAY:-} != bl-headless-0 ]]; then
+  "$dev/bench" start >/dev/null || exit 1
+  "$dev/headless" "$0" "$report"
+  status=$?
+  "$dev/bench" stop
+  exit $status
+fi
+
+# shellcheck disable=SC1091
+source "$XDG_RUNTIME_DIR/backline-ui-bench/env"
+# shellcheck source=../../omarchy/dev/lib.sh
+source "$dev/lib.sh"
+exec > >(tee "$report") 2>&1
+mixer=$repo/ui/build/backline-mixer
+work=$BACKLINE_BENCH/measure
+mkdir -p "$work"
+ticks=$(getconf CLK_TCK)
+
+cpu_ticks() { awk '{print $14 + $15}' "/proc/$1/stat"; }
+# cpu_percent PID SECONDS: share of one core over the window.
+cpu_percent() {
+  local a b
+  a=$(cpu_ticks "$1")
+  sleep "$2"
+  b=$(cpu_ticks "$1")
+  awk -v d=$((b - a)) -v t="$ticks" -v s="$2" 'BEGIN { printf "%.2f", 100 * d / t / s }'
+}
+
+echo "# Backline UI measurements, $(date -Is)"
+echo "# $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //'), $(nproc) threads; PipeWire $(pw-cli --version 2>/dev/null | sed -n 's/.*libpipewire \(.*\)/\1/p' | tail -1); Qt $(/usr/lib/qt6/bin/qtpaths6 --qt-version 2>/dev/null)"
+echo "# headless sway 1.12 (wlroots headless backend, GPU render node), the bench's throwaway devices"
+
+omarchy-backline-instrument-add "Surge XT" >/dev/null 2>&1
+quantum=$(pw-metadata -n settings 0 clock.quantum 2>/dev/null | sed -n "s/.*value:'\([0-9]*\)'.*/\1/p")
+rate=48000
+
+# ------------------------------------------------------------ 1. latency
+QT_FORCE_STDERR_LOGGING=1 QSG_INFO=1 BACKLINE_MIXER_TRACE=$work/trace.jsonl "$mixer" >"$work/mixer.log" 2>&1 &
+mixer_pid=$!
+sleep 3
+backend=$(grep -m1 -oE "OpenGL VENDOR: .*|Vulkan.*device.*" "$work/mixer.log" | head -1)
+echo "# mixer scene graph: ${backend:-see $work/mixer.log}"
+: >"$work/trace.jsonl"
+
+steps=()
+for i in $(seq 40); do
+  steps+=("on=$((48 + i % 24)),110" "wait=0.12" "off=$((48 + i % 24))" "wait=0.5")
+done
+"$BACKLINE_BIN/backline-test-keyboard" --name backline-bench-measure --wait 10 --linger 0.5 "${steps[@]}" >"$work/keys.jsonl" 2>"$work/keys.err" &
+kbd=$!
+cpu_busy=$(cpu_percent "$mixer_pid" 25)
+wait $kbd
+sleep 1
+
+echo
+echo "## 1. Meter latency (40 notes into Surge XT, metered by the mixer)"
+python3 -I - "$work/keys.jsonl" "$work/trace.jsonl" <<'PY'
+import json, statistics, sys
+keys = [json.loads(l) for l in open(sys.argv[1]) if l.startswith("{")]
+ons = [k["sent_ns"] for k in keys if k["event"].startswith("on=")]
+trace = [t for t in (json.loads(l) for l in open(sys.argv[2]) if l.strip()) if "node" in t]
+trace = sorted((t for t in trace if t["node"].startswith("backline.surge")), key=lambda t: t["tap_ns"])
+rows = []
+for on in ons:
+    after = [t for t in trace if t["tap_ns"] >= on - 1_000_000 and t["tap_ns"] - on < 400_000_000]
+    if after:
+        t = after[0]
+        rows.append(((t["tap_ns"] - on) / 1e6, (t["frame_ns"] - t["tap_ns"]) / 1e6, (t["frame_ns"] - on) / 1e6))
+def line(name, values):
+    v = sorted(values)
+    p95 = v[min(len(v) - 1, int(round(0.95 * (len(v) - 1))))]
+    print(f"{name:<34} median {statistics.median(v):6.1f} ms   p95 {p95:6.1f} ms   max {max(v):6.1f} ms")
+print(f"notes sent {len(ons)}, onsets matched {len(rows)}")
+if rows:
+    line("key -> tap (MIDI, plugin, graph)", [r[0] for r in rows])
+    line("tap -> frame (the mixer)", [r[1] for r in rows])
+    line("key -> frame (total)", [r[2] for r in rows])
+PY
+echo "graph quantum: ${quantum:-?} frames at ${rate} Hz ($(awk -v q="${quantum:-0}" -v r=$rate 'BEGIN { printf "%.1f", 1000 * q / r }') ms); the meter tick is 33.3 ms (30 Hz)"
+
+echo
+echo "## 2. Mixer CPU (share of one core)"
+strips=$(BACKLINE_NODE_FILTER=$BACKLINE_NODE_FILTER pw-dump | jq -r --arg f "$BACKLINE_NODE_FILTER" '[.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // "" | select(test($f))] | length')
+echo "metering $strips nodes, signal moving and the instrument playing, 25 s: ${cpu_busy}%"
+echo "of which the meter tick itself (reading the taps, ballistics), per second: median $(jq -s 'map(select(.tick_busy_percent != null) | .tick_busy_percent) | sort | .[length / 2 | floor] // 0 | . * 1000 | round / 1000' "$work/trace.jsonl")% of wall time"
+kill "$mixer_pid"
+wait "$mixer_pid" 2>/dev/null
+
+# Silent graph: the bench player stopped, the instrument quiet.
+pkill -STOP -f "^pw-cat .*backline-bench" 2>/dev/null
+"$mixer" >"$work/mixer2.log" 2>&1 &
+mixer_pid=$!
+sleep 3
+echo "window open, graph silent, 10 s: $(cpu_percent "$mixer_pid" 10)%"
+kill "$mixer_pid"
+pkill -CONT -f "^pw-cat .*backline-bench" 2>/dev/null
+
+echo
+echo "## 3. Quickshell panels"
+start_shell >/dev/null
+sleep 2
+children_before=$(pgrep -P "$QS_PID" | wc -l)
+echo "all panels closed, 10 s: $(cpu_percent "$QS_PID" 10)% of a core; processes started by the shell meanwhile: $(( $(pgrep -P "$QS_PID" | wc -l) - children_before ))"
+ipc backline.record open >/dev/null
+sleep 2
+echo "Record panel open (a peak monitor per source, the watcher), 10 s: $(cpu_percent "$QS_PID" 10)% of a core"
+ipc backline.record close >/dev/null
+ipc backline.plugins open >/dev/null
+sleep 2
+echo "Plugins panel open (641 plugins, 215 products), 10 s: $(cpu_percent "$QS_PID" 10)% of a core"
+ipc backline.plugins close >/dev/null
+sleep 1
+echo "processes left running by closed panels: $(pgrep -P "$QS_PID" | wc -l)"
+stop_shell

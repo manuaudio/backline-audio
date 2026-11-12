@@ -4,7 +4,7 @@ The four jobs come first. For each one, this is the shortest path through Omarch
 
 Counting rules: a chord such as `Super + Ctrl + I` counts as one keystroke. Typed filter letters count one each. A mouse path counts clicks. "From the desktop" means no Backline panel is open.
 
-Every count below is the measured one. [`omarchy/dev/flows`](../omarchy/dev/flows) runs each flow with real key presses into the real panels. It uses the real services (host, plugin worker, recorder, clock, registry) on the bench's throwaway devices, in a private headless compositor. It times each step from the key press to the moment the service or the graph shows the result. The report is [`omarchy/test/flows-report.txt`](../omarchy/test/flows-report.txt). Every step lands in 80 to 430 ms: about 160 ms per key press (the harness types with a 120 ms gap) plus the system's own work.
+Every count below is the measured one. [`omarchy/dev/flows`](../omarchy/dev/flows) runs each flow with real key presses into the real panels. It uses the real services (host, plugin worker, recorder, clock, registry) on the bench's throwaway devices, in a private headless compositor. It times each step from the key press to the moment the service or the graph shows the result. The report is [`omarchy/test/flows-report.txt`](../omarchy/test/flows-report.txt). Every step lands in 44 to 550 ms. That includes about 120 ms per key press, the harness's typing gap; the slowest steps are the ones with three or four keys. A single key lands in under 300 ms, the system's own work included.
 
 ## Defaults that save keystrokes
 

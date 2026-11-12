@@ -1,0 +1,375 @@
+#!/bin/bash
+
+# The UX flows of ui/UX-FLOWS.md, end to end: Backline's real panels on a
+# private headless compositor, driven by real key presses (wtype), against
+# the real services (host, plugin worker, recorder, registry) on the bench's
+# throwaway devices. Every step is timed from the key press to the moment the
+# service or the graph shows the result, and screenshots are taken for the
+# README. The hotkeys themselves (Super+Ctrl+I, ...) belong to Hyprland, which
+# can't run headless; each hotkey step makes the same call its binding makes
+# ({ panel = "<id>" } opens the panel), and is timed the same way.
+#
+#   omarchy/dev/flows [report] [screenshots-dir]
+#
+# BACKLINE_ENGINE_BUILD names the engine build to run (default: build/ here);
+# SHELL_ROOT an Omarchy shell to stage against (default: the installed one).
+
+set -uo pipefail
+
+dev=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+report=$(realpath -m "${1:-$dev/../test/flows-report.txt}")
+SHOTS=$(realpath -m "${2:-$dev/../../docs/screenshots}")
+
+if [[ ${WAYLAND_DISPLAY:-} != bl-headless-0 ]]; then
+  "$dev/bench" start >/dev/null || exit 1
+  "$dev/headless" "$0" "$report" "$SHOTS"
+  status=$?
+  "$dev/bench" stop
+  exit $status
+fi
+
+# shellcheck disable=SC1091
+source "$XDG_RUNTIME_DIR/backline-ui-bench/env"
+# shellcheck source=lib.sh
+source "$dev/lib.sh"
+mkdir -p "$SHOTS" "$(dirname "$report")"
+exec > >(tee "$report") 2>&1
+
+failed=0
+flow_keys=0
+flow_ms=0
+PANEL_GEOMETRY="1600,0 960x760"
+
+cleanup() {
+  stop_shell
+  pkill -f "^$REPO/ui/build/backline-mixer" 2>/dev/null
+}
+trap cleanup EXIT
+
+ok() { echo "ok - $*"; }
+bad() { echo "not ok - $*"; failed=1; }
+
+# step "description" KEYS COUNT CHECK...: press, then time until CHECK holds.
+step() {
+  local description=$1 keys=$2 count=$3 start ms
+  shift 3
+  start=$(now_ms)
+  if [[ $keys == ipc:* ]]; then
+    ipc ${keys#ipc:} >/dev/null
+  elif [[ $keys == cmd:* ]]; then
+    eval "${keys#cmd:}" >/dev/null 2>&1 &
+  elif [[ -n $keys ]]; then
+    # shellcheck disable=SC2086
+    key $keys
+  fi
+  if ms=$(wait_until 20 "$@"); then
+    ms=$(($(now_ms) - start))
+    flow_keys=$((flow_keys + count))
+    flow_ms=$((flow_ms + ms))
+    printf 'ok - %-58s %2d key(s) %6d ms\n' "$description" "$count" "$ms"
+  else
+    printf 'not ok - %-54s %2d key(s)  timeout\n' "$description" "$count"
+    failed=1
+  fi
+}
+
+flow_start() { flow_keys=0; flow_ms=0; echo; echo "## $*"; }
+flow_end() { printf '# total: %d keystroke(s), %d ms of waiting for the system\n' "$flow_keys" "$flow_ms"; }
+
+host_json() { busctl --user --json=short call io.github.manuaudio.Backline.Host /io/github/manuaudio/Backline/Host io.github.manuaudio.Backline.Host1 List 2>/dev/null | jq -c '[.data[0][] | with_entries(.value = .value.data)]'; }
+rec_prop() { bl_rec_props | jq -r ".$1"; }
+bl_rec_props() { busctl --user --json=short call io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder org.freedesktop.DBus.Properties GetAll s io.github.manuaudio.Backline.Recorder1 2>/dev/null | jq -c '.data[0] | with_entries(.value = .value.data)'; }
+
+# A take's audio, as the recorder wrote it: peak dBFS of a WAV.
+wav_peak() {
+  python3 -I - "$1" <<'PY'
+import math, struct, sys, wave
+data = open(sys.argv[1], "rb").read()
+# WAV float32 (the recorder's default): find the data chunk.
+i = 12; peak = 0.0
+while i + 8 <= len(data):
+    cid, size = data[i:i+4], struct.unpack("<I", data[i+4:i+8])[0]
+    if cid == b"data":
+        n = size // 4
+        for v in struct.unpack("<%df" % n, data[i+8:i+8+4*n]):
+            a = abs(v)
+            if a > peak: peak = a
+        break
+    i += 8 + size + (size & 1)
+print("%.1f" % (20 * math.log10(peak)) if peak > 0 else "-inf")
+PY
+}
+
+echo "# Backline UX flows, $(date -Is)"
+echo "# panels: omarchy/plugins, staged against the Omarchy shell in ${SHELL_ROOT/#$HOME/\~}; services: ${BACKLINE_BIN/#$HOME/\~}"
+echo "# devices: throwaway bench nodes only; the live desktop, shell and devices are not touched"
+
+# The panels launch the mixer the desktop would; here, the one just built.
+export BACKLINE_MIXER=$REPO/ui/build/backline-mixer
+start_shell || exit 1
+
+# ------------------------------------------------------------------ flow 1
+flow_start "1. Play an instrument from a keyboard (first time)"
+step "Super+Ctrl+I: Instruments opens, cursor on Add" "ipc:backline.instruments open" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r ".opened and .selectedIndex == 0") == true ]]'
+shot 1-instruments-empty "$PANEL_GEOMETRY"
+step "Enter: the picker opens" "Return" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r .mode) == picker ]]'
+step "s u r: the list narrows to Surge XT" "s u r" 3 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r ".picker[0]") == "Surge XT" ]]'
+shot 2-instruments-picker "$PANEL_GEOMETRY"
+step "Enter: Surge XT runs, following every keyboard" "Return" 1 \
+  bash -c 'busctl --user --json=short call io.github.manuaudio.Backline.Host /io/github/manuaudio/Backline/Host io.github.manuaudio.Backline.Host1 List | jq -e "[.data[0][] | select(.state.data == \"running\")] | length == 1" && pw-link -o | grep -q "^backline.surge-xt:out_FL"'
+flow_end
+# The keyboard is "plugged in" now; the worker links it by itself.
+rec_dir=$BACKLINE_BENCH/proof
+mkdir -p "$rec_dir"
+start=$(now_ms)
+"$BACKLINE_BIN/backline-test-keyboard" --name backline-bench-play --wait 10 --linger 0.5 \
+  on=57,100 wait=0.4 off=57 on=60,100 wait=0.4 off=60 on=64,100 wait=0.6 off=64 >"$rec_dir/kbd.log" 2>&1 &
+kbd=$!
+if ms=$(wait_until 10 bash -c 'pw-link -l | grep -A1 "^Midi-Bridge:backline-bench-play" | grep -q "backline.surge-xt:midi_in"'); then
+  ok "a keyboard plugged in is linked to the instrument by itself ($(($(now_ms) - start)) ms)"
+else
+  bad "the plugged-in keyboard was not linked"
+fi
+"$BACKLINE_BIN/backline-recorder" -s backline.surge-xt -o "$rec_dir" -n played -d 1.6 >"$rec_dir/rec.log" 2>&1
+wait $kbd
+peak=$(wav_peak "$(ls "$rec_dir"/played*.wav | head -n1)")
+if [[ $peak != "-inf" ]] && (($(printf '%.0f' "$peak") > -40)); then
+  ok "it plays: the instrument's output peaks at $peak dBFS while the keyboard plays"
+else
+  bad "no sound from the instrument (peak $peak dBFS)"
+fi
+shot 3-instruments-running "$PANEL_GEOMETRY"
+
+# The panel reads MIDI inputs on open and on the host's signals; the played
+# keyboard has gone, so read again as reopening would.
+ipc backline.instruments refresh >/dev/null
+sleep 0.5
+flow_start "1b. Choose one keyboard (in the open panel)"
+step "l: the cursor moves to the keyboard's pill" "l" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r .pillIndex) == 1 ]]'
+step "Enter: the instrument follows only that keyboard" "Return" 1 \
+  bash -c 'busctl --user --json=short call io.github.manuaudio.Backline.Host /io/github/manuaudio/Backline/Host io.github.manuaudio.Backline.Host1 Get s surge-xt | jq -e ".data[0][\"midi-follow\"].data | test(\"backline-bench-kbd\")" && pw-link -o | grep -q "^backline.surge-xt:out_FL"'
+flow_end
+shot 4-instruments-midi "$PANEL_GEOMETRY"
+
+flow_start "1c. Again, from the desktop (last used first)"
+key Escape
+sleep 0.3
+step "Super+Ctrl+I" "ipc:backline.instruments open" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r .opened) == true ]]'
+step "a: the picker, Surge XT first" "a" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r "[.mode, .picker[0]] | join(\",\")") == "picker,Surge XT" ]]'
+step "Enter: a second Surge XT runs" "Return" 1 \
+  bash -c 'busctl --user --json=short call io.github.manuaudio.Backline.Host /io/github/manuaudio/Backline/Host io.github.manuaudio.Backline.Host1 List | jq -e "[.data[0][] | select(.state.data == \"running\")] | length == 2"'
+flow_end
+
+flow_start "1d. Remove an instrument (in the open panel)"
+step "j: to the second instrument" "j" 1 true
+step "x: it stops, the first keeps running" "x" 1 \
+  bash -c 'busctl --user --json=short call io.github.manuaudio.Backline.Host /io/github/manuaudio/Backline/Host io.github.manuaudio.Backline.Host1 List | jq -e "[.data[0][] | .id.data] == [\"surge-xt\"]"'
+flow_end
+key Escape
+sleep 0.3
+
+# ------------------------------------------------------------------ flow 2
+flow_start "2. Record a set (first time)"
+step "Super+Ctrl+M: Record opens, cursor on the first source" "ipc:backline.record open" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.record state | jq -r ".opened and (.sources | length) > 1") == true ]]'
+step "Space: the microphone is armed, the recorder stands by" "space" 1 \
+  bash -c '[[ $(busctl --user --json=short call io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder org.freedesktop.DBus.Properties Get ss io.github.manuaudio.Backline.Recorder1 State | jq -r ".data[0].data") == armed ]]'
+step "j Space: the instrument is armed too (2 tracks)" "j space" 2 \
+  bash -c 'busctl --user --json=short call io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder org.freedesktop.DBus.Properties Get ss io.github.manuaudio.Backline.Recorder1 Sources | jq -e ".data[0].data | length == 2"'
+shot 5-record-armed "$PANEL_GEOMETRY"
+# The set is armed: the recorder keeps the last 5 s while the band counts in.
+armed_at=$(now_ms)
+sleep 2
+step "r: recording (the pre-roll is already in the take)" "r" 1 \
+  bash -c '[[ $(busctl --user --json=short call io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder org.freedesktop.DBus.Properties Get ss io.github.manuaudio.Backline.Recorder1 State | jq -r ".data[0].data") == recording ]]'
+sleep 1.5
+shot 6-record-recording "$PANEL_GEOMETRY"
+step "m: a marker" "m" 1 \
+  bash -c 'grep -q "record marker" "$BACKLINE_BENCH/calls" || busctl --user --json=short call io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder io.github.manuaudio.Backline.Recorder1 Takes >/dev/null'
+sleep 0.6
+recorded_ms=$(($(now_ms) - armed_at))
+step "r: stopped, the take is saved" "r" 1 \
+  bash -c 'busctl --user --json=short call io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder io.github.manuaudio.Backline.Recorder1 Takes | jq -e ".data[0] | fromjson | .takes | length == 1"'
+flow_end
+take=$(busctl --user --json=short call io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder io.github.manuaudio.Backline.Recorder1 Takes | jq -c '.data[0] | fromjson | .takes[0]')
+echo "# take: $(jq -r '"\(.take): \(.tracks | length) tracks, \(.seconds | . * 100 | round / 100) s, \(.markers) marker(s)"' <<<"$take")"
+if [[ $(jq --argjson armed "$recorded_ms" '.seconds * 1000 >= $armed - 400' <<<"$take") == true ]]; then
+  ok "the take holds the pre-roll: $(jq -r '.seconds | . * 100 | round / 100' <<<"$take") s, from the moment of arming ($((recorded_ms / 100))00 ms before Stop), not from r"
+else
+  bad "the take is shorter than its pre-roll"
+fi
+mic_peak=$(wav_peak "$(jq -r '.tracks[0].file' <<<"$take")")
+[[ $mic_peak != "-inf" ]] && ok "the microphone track has signal ($mic_peak dBFS)" || bad "the microphone track is silent"
+sleep 0.5
+shot 7-record-takes "$PANEL_GEOMETRY"
+
+flow_start "2b. Again, from anywhere: the record hotkey"
+key Escape
+sleep 0.3
+step "Super+Ctrl+Alt+M: the remembered set records" "cmd:omarchy-backline-record toggle" 1 \
+  bash -c '[[ $(busctl --user --json=short call io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder org.freedesktop.DBus.Properties Get ss io.github.manuaudio.Backline.Recorder1 State | jq -r ".data[0].data") == recording ]]'
+sleep 1
+step "Super+Ctrl+Alt+M: stopped and saved" "cmd:omarchy-backline-record toggle" 1 \
+  bash -c 'busctl --user --json=short call io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder io.github.manuaudio.Backline.Recorder1 Takes | jq -e ".data[0] | fromjson | .takes | length == 2"'
+flow_end
+grep -E "^notify .*(Recording|Saved)" "$BACKLINE_BENCH/calls" | tail -2 | sed 's/^/# notification: /'
+
+# ------------------------------------------------------------------ flow 3
+flow_start "3. Virtual soundcheck: a take in place of its inputs"
+room_from() { pw-link -l | awk '/^backline-bench.room-in:input_FL/{getline; print $2}'; }
+echo "# the bench room listens to: $(room_from)"
+step "Super+Ctrl+M" "ipc:backline.record open" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.record state | jq -r .opened) == true ]]'
+step "p: the newest take plays, inputs live, cursor on the first" "p" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.record state | jq -r "(.soundcheck != \"\") and .current.type == \"input\"") == true ]]'
+step "l: the microphone is on playback; the room hears the take" "l" 1 \
+  bash -c 'pw-link -l | awk "/^backline-bench.room-in:input_FL/{getline; print \$2}" | grep -q "^backline.soundcheck:"'
+echo "# the bench room listens to: $(room_from)"
+shot 8-soundcheck "$PANEL_GEOMETRY"
+step "p: soundcheck stops, the room hears the microphone again" "p" 1 \
+  bash -c 'pw-link -l | awk "/^backline-bench.room-in:input_FL/{getline; print \$2}" | grep -q "^backline-bench.mic:"'
+flow_end
+echo "# the bench room listens to: $(room_from)"
+key Escape
+sleep 0.3
+
+# ------------------------------------------------------------------ flow 4
+flow_start "4. Check a plugin"
+step "Super+Ctrl+I" "ipc:backline.instruments open" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r .opened) == true ]]'
+step "Tab: Plugins, with the grades of everything installed" "Tab" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.plugins state | jq -r ".opened and .total > 0") == true ]]'
+step "/: the filter" "slash" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.plugins state | jq -r .filtering) == true ]]'
+step "c a r: Cardinal's products, the finding under the cursor" "c a r" 3 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.plugins state | jq -r ".current.name") == Cardinal* ]]'
+flow_end
+ipc backline.plugins state | jq -r '"# under the cursor: \(.current.name): \(.current.grade | ascii_upcase), \(.current.finding)"'
+step "Enter j j j: the failing one, and why" "Return j j j" 4 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.plugins state | jq -r ".current.grade") == fail ]]'
+ipc backline.plugins state | jq -r '"# under the cursor: \(.current.name): \(.current.grade | ascii_upcase), \(.current.finding)"'
+shot 9-plugins-finding "$PANEL_GEOMETRY"
+key Escape Escape
+sleep 0.3
+
+# ------------------------------------------------------------------ flow 5
+flow_start "5. Lock to timecode (first time: pick the input)"
+if [[ -s $BACKLINE_BENCH/services/io.github.manuaudio.Backline.Clock.service && -s $BACKLINE_BENCH/ltc-gen.pid ]]; then
+  # LTC at 25 fps from 01:00:00:00, from the engine's independent generator,
+  # on the bench's LTC line (a sink, chased from its monitor).
+  "$dev/bench" ltc-start
+  clock_get() { busctl --user --json=short call io.github.manuaudio.Backline.Clock /io/github/manuaudio/Backline/Clock io.github.manuaudio.Backline.Clock1 Get | jq -r ".data[0] | with_entries(.value = .value.data) | $1"; }
+  transport_state() { quickshell ipc -p "$BENCH_QS_PATH" call backline.transport state | jq -r "$1"; }
+  export -f clock_get transport_state
+  # The first-time path picks the LTC line from the input pills, which needs
+  # a clockd that chases a sink's monitor; until then, the remembered input
+  # is the generator's own output, which every clockd chases.
+  if ! busctl --user call io.github.manuaudio.Backline.Clock /io/github/manuaudio/Backline/Clock io.github.manuaudio.Backline.Clock1 \
+    Ltc 'sa{sv}' chase 1 source s backline-bench.ltc-line >/dev/null 2>&1; then
+    echo "# this clockd can't chase a sink's monitor yet (reported); the flow runs with the input remembered"
+    mkdir -p "$XDG_STATE_HOME/backline/omarchy"
+    echo '{"ltc":"backline-bench.ltc-gen","mtc":"","fps":25}' >"$XDG_STATE_HOME/backline/omarchy/sync.json"
+    first_time=false
+  else
+    first_time=true
+  fi
+  busctl --user call io.github.manuaudio.Backline.Clock /io/github/manuaudio/Backline/Clock io.github.manuaudio.Backline.Clock1 Ltc 'sa{sv}' off 0 >/dev/null 2>&1
+  busctl --user call io.github.manuaudio.Backline.Clock /io/github/manuaudio/Backline/Clock io.github.manuaudio.Backline.Clock1 Stop >/dev/null 2>&1
+  step "Super+Ctrl+G: Transport opens on the SYNC pills" "ipc:backline.transport open" 1 \
+    bash -c '[[ $(transport_state .row) == sync ]]'
+  step "l l: to LTC" "l l" 2 \
+    bash -c '[[ $(transport_state .syncPill) == ltc ]]'
+  if [[ $first_time == "false" ]]; then
+    step "Enter: chasing LTC from the remembered input, LOCKED" "Return" 1 \
+      bash -c '[[ $(clock_get "[.LtcMode, .Locked] | map(tostring) | join(\",\")") == "chase,true" && $(transport_state .chase) == LOCKED* ]]'
+  else
+  step "Enter: chasing the first input; no timecode there" "Return" 1 \
+    bash -c '[[ $(clock_get .LtcMode) == chase && $(transport_state .chase) =~ ^(NO\ SIGNAL|FREEWHEEL)$ ]]'
+  shot 10a-transport-no-signal "$PANEL_GEOMETRY"
+  step "j: to the input pills" "j" 1 \
+    bash -c '[[ $(transport_state .row) == input ]]'
+  # l along the pills until the LTC line; each press applies at once.
+  presses=0
+  start=$(now_ms)
+  while [[ $(transport_state .input) != "backline-bench.ltc-line" ]] && ((presses < 6)); do
+    key l
+    presses=$((presses + 1))
+    wait_until 3 bash -c "[[ \$(transport_state .input) != '$(transport_state .input)' ]]" >/dev/null
+  done
+  step "l ×$presses: the LTC line; LOCKED" "" "$presses" \
+    bash -c '[[ $(clock_get "[.LtcMode, .Locked] | map(tostring) | join(\",\")") == "chase,true" && $(transport_state .chase) == LOCKED* ]]'
+  fi
+  flow_end
+  echo "# clock: $(clock_get '"\(.Source) \(.Timecode) locked=\(.Locked) chase error \(.ChaseError) frames"')"
+  sleep 0.8
+  shot 10-transport "$PANEL_GEOMETRY"
+  key Escape
+  sleep 0.3
+  grim -g "1500,0 1060x30" "$SHOTS/10b-bar-locked.png"
+  [[ $(transport_state .opened) == false ]] && ok "the bar keeps the lock and timecode after the panel closes: $(transport_state .timecode)"
+
+  flow_start "5b. Lock to timecode again (input and frame rate remembered)"
+  omarchy-backline-transport sync internal >/dev/null 2>&1
+  step "Super+Ctrl+G" "ipc:backline.transport open" 1 bash -c '[[ $(transport_state .row) == sync ]]'
+  step "l l: to LTC" "l l" 2 bash -c '[[ $(transport_state .syncPill) == ltc ]]'
+  step "Enter: chasing the remembered LTC line, LOCKED" "Return" 1 \
+    bash -c '[[ $(clock_get "[.LtcMode, .Locked] | map(tostring) | join(\",\")") == "chase,true" ]]'
+  flow_end
+  key Escape
+else
+  echo "skip - backline-clockd is not built yet; the Transport panel shows the clock as stopped"
+fi
+
+# ------------------------------------------------------------------ flow 6
+flow_start "6. Open the mixer"
+step "Super+Ctrl+I" "ipc:backline.instruments open" 1 \
+  bash -c '[[ $(quickshell ipc -p "$BENCH_QS_PATH" call backline.instruments state | jq -r .opened) == true ]]'
+step "o: the mixer window is mapped" "o" 1 \
+  bash -c 'swaymsg -t get_tree | jq -e "[.. | objects | select(.app_id? == \"backline-mixer\" and .visible == true)] | length == 1"'
+flow_end
+ipc backline.instruments close >/dev/null
+
+# The mixer for the README: the set armed and recording while the keyboard
+# plays the instrument, every meter moving.
+omarchy-backline-record arm backline-bench.mic backline.surge-xt backline-bench.out >/dev/null 2>&1
+sleep 1
+omarchy-backline-record record >/dev/null 2>&1
+"$BACKLINE_BIN/backline-test-keyboard" --name backline-bench-play --wait 10 --linger 0.3 \
+  on=48,110 on=55,100 on=64,100 wait=2.5 off=64 on=67,110 wait=2 off=48 off=55 off=67 >/dev/null 2>&1 &
+sleep 2.2
+omarchy-backline-record marker >/dev/null 2>&1
+sleep 1.2
+swaymsg '[app_id="backline-mixer"] focus' >/dev/null
+grim -g "40,150 1680x900" "$SHOTS/11-mixer.png"
+sleep 1.5
+omarchy-backline-record stop >/dev/null 2>&1
+sleep 1
+grim -g "40,150 1680x900" "$SHOTS/12-mixer-takes.png"
+if pgrep -f "^$REPO/ui/build/backline-mixer" >/dev/null; then
+  ok "the mixer metered through arm, record, marker and stop, and is still running"
+else
+  bad "the mixer did not survive the record cycle"
+fi
+
+# Panel shots, cropped to the card (the headless desktop around it is black).
+for shot in "$SHOTS"/[0-9]-*.png; do
+  crop=$(ffmpeg -hide_banner -i "$shot" -vf "cropdetect=limit=8:round=2:reset=0" -f null - 2>&1 | grep -o 'crop=[0-9:]*' | tail -1)
+  [[ -n $crop ]] && ffmpeg -loglevel error -y -i "$shot" -vf "$crop,pad=iw+24:ih+24:12:12:color=black" "$shot.tmp.png" && mv "$shot.tmp.png" "$shot"
+done
+echo
+if qml_errors; then
+  bad "QML errors in the panels (above)"
+else
+  ok "no QML errors in the panels"
+fi
+leaks=$("$dev/bench" leaks)
+[[ -z $leaks ]] && ok "nothing linked outside the bench" || bad "links outside the bench: $leaks"
+echo "# notifications and shell pushes the commands made:"
+sort "$BACKLINE_BENCH/calls" | uniq -c | sort -rn | head -12 | sed 's/^/#   /'
+exit $failed

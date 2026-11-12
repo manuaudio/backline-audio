@@ -36,6 +36,32 @@ The choices that shape the project are in [docs/DECISIONS.md](docs/DECISIONS.md)
   even when one of the recorded sinks drives the graph, and there is a
   pre-roll so a take never misses its first notes.
 
+## On the desktop: Omarchy panels and a mixer
+
+On [Omarchy](https://omarchy.org), Backline lives in the desktop's own workflow:
+
+- **Four bar panels:** Instruments, Record, Plugins and Transport. They're built from Omarchy's own shell components and theme tokens.
+- **`omarchy-backline-*` commands.**
+- **Menu rows** in the Omarchy menu.
+- **`Super + Ctrl` hotkeys.**
+
+A larger **mixer window** has a channel strip with a live meter for every input, instrument and output, plus the transport and the takes. It follows the Omarchy theme and language live. Every job takes a few keystrokes, measured end to end against the real services.
+
+| Play an instrument | Record a set | Soundcheck | Check a plugin | Lock to timecode |
+|---|---|---|---|---|
+| ![Instruments: the picker](docs/screenshots/2-instruments-picker.png) | ![Record: recording two sources](docs/screenshots/6-record-recording.png) | ![Record: a take in place of its inputs](docs/screenshots/8-soundcheck.png) | ![Plugins: a failing plugin and why](docs/screenshots/9-plugins-finding.png) | ![Transport: locked to LTC](docs/screenshots/10-transport.png) |
+| 6 keys first time, 3 again | 5 keys; 1 from anywhere after | 3 keys | 6 keys, no Enter | 6 keys first time, 4 again |
+
+![The mixer, recording while a keyboard plays an instrument](docs/screenshots/11-mixer.png)
+
+Measured:
+
+- **Meter latency:** a key press on a MIDI keyboard reaches the meter's pixel in 21–39 ms (median, over two runs). Of that, the mixer's own part is 16–18 ms; the rest is the MIDI bridge, the plugin and the graph.
+- **Mixer CPU:** about 5% of one core while metering.
+- **Closed panels:** they start no processes.
+
+See [omarchy/README.md](omarchy/README.md) (panels, commands, menu, hotkeys, install), [ui/README.md](ui/README.md) (the mixer), [ui/UX-FLOWS.md](ui/UX-FLOWS.md) (the jobs, key by key) and [ui/DESIGN-LANGUAGE.md](ui/DESIGN-LANGUAGE.md) (the look). The screenshots are from the flows test, which runs on a private headless compositor with a stand-in bar.
+
 ## Components
 
 | Component | What it is | State |

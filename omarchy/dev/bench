@@ -1,0 +1,277 @@
+#!/bin/bash
+
+# A throwaway Backline bench for the UI: the real services, on a private
+# session bus, with private state, against throwaway devices on this
+# machine's PipeWire. Nothing links to a real device, the default devices are
+# never changed, and every node goes away with the bench (object.linger =
+# false), so the live desktop never sees it.
+#
+#   omarchy/dev/bench start      start it; prints the env file to source
+#   omarchy/dev/bench stop       stop everything it started
+#   omarchy/dev/bench exec CMD   run CMD inside it
+#
+# The bench has:
+#   backline-bench.mic    a microphone (an Audio/Source) fed a looping test signal
+#   backline-bench.out    a sink every instrument plays to
+#   backline-bench.room   a listener on the mic (a loopback to .out), so the
+#                        soundcheck has a consumer to switch
+#   backline-bench-kbd    a virtual MIDI keyboard (ALSA sequencer client)
+#   the registry index   a scan of this machine's plugins, in a private cache
+#   recorderd, clockd    D-Bus activated from the engine's build, when built
+#   hostd                started by omarchy-backline-instrument-add, as it
+#                        would be on a desktop (--no-scope, private state)
+
+set -uo pipefail
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+# The engine build to run: this checkout's build/ unless BACKLINE_ENGINE_BUILD
+# names another.
+engine=${BACKLINE_ENGINE_BUILD:-$repo/build}
+bench=${XDG_RUNTIME_DIR:?}/backline-ui-bench
+envfile=$bench/env
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/backline-ui-test
+
+stop() {
+  local pid name
+  if [[ -S $bench/bus ]]; then
+    # Services the private bus activated (recorder, clock, registry) and the
+    # host: found by their bus names, so nothing else is touched.
+    for name in Host Recorder Clock Registry; do
+      pid=$(DBUS_SESSION_BUS_ADDRESS=unix:path=$bench/bus busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus GetConnectionUnixProcessID s "io.github.manuaudio.Backline.$name" 2>/dev/null | awk '{print $2}')
+      [[ -n $pid ]] && kill "$pid" 2>/dev/null
+    done
+  fi
+  # The bench's own helpers, matched from the start of their command lines so
+  # a shell that merely mentions the bench is never hit. Workers die with
+  # their host (PR_SET_PDEATHSIG); the pw-cli holding the devices exits when
+  # its holder does.
+  for pattern in "^backline-bench-hold" "^pw-cat .*backline-bench" "^pw-loopback .*backline-bench" \
+    "^[^ ]*backline-test-keyboard --name backline-bench" "^[^ ]*backline-test-timecode -n backline-bench" "^[^ ]*backline-(hostd|plugin-worker) .*$bench" \
+    "^dbus-daemon --config-file=$bench" "^[^ ]*quickshell -p $bench"; do
+    pkill -f -- "$pattern" 2>/dev/null
+  done
+  if [[ -r $bench/pids ]]; then
+    while read -r pid; do
+      kill "$pid" 2>/dev/null
+    done <"$bench/pids"
+  fi
+  sleep 0.3
+  rm -rf "$bench"
+}
+
+track() {
+  echo "$1" >>"$bench/pids"
+}
+
+# A stereo test signal: drum-like hits, a swelling chord and noise, with the
+# left and right channels at different levels so the meters show both.
+make_signal() {
+  python3 -I - "$1" <<'PY'
+import math, random, struct, sys, wave
+rate, seconds = 48000, 4
+random.seed(7)
+frames = []
+for i in range(rate * seconds):
+    t = i / rate
+    beat = t % 0.5
+    hit = math.exp(-beat * 18) * math.sin(2 * math.pi * 55 * beat)
+    swell = 0.5 * (1 - math.cos(2 * math.pi * t / seconds))
+    chord = sum(math.sin(2 * math.pi * f * t) for f in (220, 277.2, 329.6)) / 3
+    noise = random.uniform(-1, 1) * 0.05
+    left = 0.55 * hit + 0.25 * swell * chord + noise
+    right = 0.35 * hit + 0.4 * swell * chord + noise
+    frames.append(struct.pack("<hh", int(max(-1, min(1, left)) * 32000), int(max(-1, min(1, right)) * 32000)))
+with wave.open(sys.argv[1], "wb") as w:
+    w.setnchannels(2); w.setsampwidth(2); w.setframerate(rate)
+    w.writeframes(b"".join(frames))
+PY
+}
+
+start() {
+  stop
+  mkdir -p "$bench"/{state,data,config,services,logs} "$cache/registry"
+
+  # Private session bus, with activation files for the engine's services.
+  # The clock's node is named for the bench, so it never shares a name with
+  # another clockd in the same graph.
+  for service in Registry:"backline-registry serve --idle 60" Recorder:"backline-recorderd" Clock:"backline-clockd --name backline-bench.clock"; do
+    name=${service%%:*}
+    exe=${service#*:}
+    binary=${exe%% *}
+    path=$engine/$binary
+    [[ -x $path ]] || path=$engine/registry/$binary
+    [[ -x $path ]] || path=$engine/recorder/$binary
+    [[ -x $path ]] || path=$engine/clock/$binary
+    if [[ -x $path ]]; then
+      # Every bench service joins the bench's node group, so it is driven
+      # only inside the bench, never under another graph's driver.
+      printf '[D-BUS Service]\nName=io.github.manuaudio.Backline.%s\nExec=/usr/bin/env PIPEWIRE_PROPS={node.group=backline-bench} %s%s\n' "$name" "$path" "${exe#"$binary"}" \
+        >"$bench/services/io.github.manuaudio.Backline.$name.service"
+    fi
+  done
+  cat >"$bench/bus.conf" <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path=$bench/bus</listen>
+  <servicedir>$bench/services</servicedir>
+  <policy context="default"><allow send_destination="*" eavesdrop="true"/><allow eavesdrop="true"/><allow own="*"/></policy>
+</busconfig>
+EOF
+
+  # Stand-ins for the desktop: notifications and shell pushes are logged (and
+  # pushes reach the bench's own Quickshell, if one runs), and the menu picker
+  # answers from BENCH_MENU_ANSWER, so nothing reaches the live desktop.
+  mkdir -p "$bench/stubs"
+  printf '#!/bin/bash\necho "notify $*" >>"%s/calls"\n' "$bench" >"$bench/stubs/omarchy-notification-send"
+  printf '#!/bin/bash\n[[ $1 == "-q" ]] && shift\necho "shell $*" >>"%s/calls"\n[[ -n ${BENCH_QS_PATH:-} ]] && quickshell ipc -p "$BENCH_QS_PATH" call "$@" >/dev/null 2>&1\nexit 0\n' "$bench" >"$bench/stubs/omarchy-shell"
+  printf '#!/bin/bash\nprintf "%%s\\n" "$@" >"%s/menu"\n[[ -n ${BENCH_MENU_ANSWER:-} ]] || exit 1\nprintf "%%s\\n" "$BENCH_MENU_ANSWER"\n' "$bench" >"$bench/stubs/omarchy-menu-select"
+  chmod +x "$bench/stubs"/*
+
+  cat >"$envfile" <<EOF
+export DBUS_SESSION_BUS_ADDRESS=unix:path=$bench/bus
+export XDG_STATE_HOME=$bench/state
+export XDG_DATA_HOME=$bench/data
+export BACKLINE_CACHE_DIR=$cache/registry
+export BACKLINE_BIN=$engine
+export BACKLINE_HOSTD_CMD="$engine/backline-hostd --no-scope --state-dir $bench/state/backline/instances --log-dir $bench/logs --registry $cache/registry/plugins.json >>$bench/logs/hostd.log 2>&1"
+export BACKLINE_INSTRUMENT_TARGET=backline-bench.out
+export BACKLINE_MIDI_ALL_MATCH='^Midi-Bridge:backline-bench'
+export BACKLINE_NODE_FILTER='^backline(-bench\\.(mic|out|ltc-line)\$|\\.surge-xt(-[0-9]+)?\$)'
+export BACKLINE_MIDI_FILTER='^backline-bench'
+export PATH=$bench/stubs:$repo/omarchy/bin:$engine:$engine/registry:\$PATH
+export BACKLINE_BENCH=$bench
+EOF
+  # shellcheck disable=SC1090
+  source "$envfile"
+  env -u DBUS_SESSION_BUS_ADDRESS dbus-daemon --config-file="$bench/bus.conf" --nofork --nopidfile \
+    >"$bench/logs/bus.log" 2>&1 &
+  track $!
+  for _ in {1..50}; do [[ -S $bench/bus ]] && break; sleep 0.05; done
+
+  # The registry index, scanned once per machine into the private cache.
+  if [[ ! -s $cache/registry/plugins.json ]]; then
+    "$engine/registry/backline-registry" scan >"$bench/logs/scan.log" 2>&1
+  fi
+
+  # Throwaway devices, owned by one pw-cli that stays connected.
+  {
+    printf '%s\n' \
+      'create-node adapter { factory.name = support.null-audio-sink node.name = backline-bench.out node.description = "Bench output" node.group = backline-bench media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false node.virtual = true monitor.channel-volumes = false }' \
+      'create-node adapter { factory.name = support.null-audio-sink node.name = backline-bench.mic-feed node.description = "Bench microphone feed" media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false node.virtual = true monitor.channel-volumes = false }'
+    exec -a backline-bench-hold sleep 1000000
+  } | pw-cli >/dev/null 2>&1 &
+  track $!
+  for _ in {1..100}; do
+    pw-dump 2>/dev/null | grep -q '"backline-bench.mic-feed"' && break
+    sleep 0.05
+  done
+
+  # The player is never autoconnected and never falls back to a default
+  # device: it is linked to the bench microphone by hand, and only there.
+  make_signal "$bench/signal.wav"
+  tail -c +45 "$bench/signal.wav" >"$bench/signal.raw"
+  (while cat "$bench/signal.raw"; do :; done |
+    pw-cat --playback --raw --format s16 --rate 48000 --channels 2 \
+      -P '{ node.name = backline-bench.player node.autoconnect = false node.dont-fallback = true node.dont-reconnect = true }' - \
+      >/dev/null 2>&1) &
+  track $!
+  for _ in {1..100}; do
+    pw-link -o 2>/dev/null | grep -q '^backline-bench.player:output_FR' && break
+    sleep 0.05
+  done
+  pw-link backline-bench.player:output_FL backline-bench.mic-feed:playback_FL
+  pw-link backline-bench.player:output_FR backline-bench.mic-feed:playback_FR
+  # The microphone itself is an Audio/Source with output ports only, as a USB
+  # microphone is: the far side of a loopback from the feed's monitor.
+  pw-loopback --capture-props='node.name=backline-bench.mic-in target.object=backline-bench.mic-feed stream.capture.sink=true node.dont-fallback=true node.passive=true' \
+    --playback-props='node.name=backline-bench.mic media.class=Audio/Source node.description="Bench microphone" node.virtual=true' >/dev/null 2>&1 &
+  track $!
+  for _ in {1..100}; do
+    pw-dump 2>/dev/null | grep -q '"backline-bench.mic"' && break
+    sleep 0.05
+  done
+  pw-loopback --capture-props='node.name=backline-bench.room-in target.object=backline-bench.mic node.dont-fallback=true node.description="Bench room"' \
+    --playback-props='node.name=backline-bench.room-out target.object=backline-bench.out node.dont-fallback=true' >/dev/null 2>&1 &
+  track $!
+  "$engine/backline-test-keyboard" --name backline-bench-kbd --wait 1000000 --linger 1000000 wait=1000000 \
+    >"$bench/logs/keyboard.log" 2>&1 &
+  track $!
+  # Timecode: an LTC line (a sink) fed by the engine's independent LTC
+  # generator, for the Transport panel to lock to. Generation starts on
+  # `bench ltc-start`.
+  if [[ -x $engine/clock/backline-test-timecode ]]; then
+    { printf '%s\n' 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-bench.ltc-line node.description = "Bench LTC line" node.group = backline-bench media.class = Audio/Sink audio.position = [ MONO ] object.linger = false node.virtual = true monitor.channel-volumes = false }'
+      exec -a backline-bench-hold sleep 1000000; } | pw-cli >/dev/null 2>&1 &
+    track $!
+    PIPEWIRE_PROPS="{node.group=backline-bench}" "$engine/clock/backline-test-timecode" -n backline-bench.ltc-gen -o "$bench/logs/ltc-gen.log" --ltc-gen 01:00:00:00 --fps 25 \
+      >"$bench/logs/ltc-gen.err" 2>&1 &
+    echo $! >"$bench/ltc-gen.pid"
+    track $!
+    for _ in {1..100}; do
+      pw-link -o 2>/dev/null | grep -q '^backline-bench.ltc-gen:ltc_out' && pw-link -i 2>/dev/null | grep -q '^backline-bench.ltc-line:playback_MONO' && break
+      sleep 0.05
+    done
+    pw-link backline-bench.ltc-gen:ltc_out backline-bench.ltc-line:playback_MONO 2>/dev/null
+  fi
+  watchdog &
+  track $!
+  echo "$envfile"
+}
+
+# Every link with a Backline node on one end, as "out-node in-node" lines.
+backline_links() {
+  pw-dump 2>/dev/null | jq -r '
+    ([.[] | select(.type == "PipeWire:Interface:Node") | {key: (.id | tostring), value: (.info.props["node.name"] // "")}] | from_entries) as $n
+    | .[] | select(.type == "PipeWire:Interface:Link")
+    | "\($n[(.info["output-node-id"] | tostring)] // "?") \($n[(.info["input-node-id"] | tostring)] // "?")"'
+}
+
+# A leak is a link between one of the bench's own nodes (backline-bench.*,
+# and the instruments it loads) and something that isn't Backline's: a real
+# device or someone else's app. Allowed on the far side: Backline's services
+# (recorder, soundcheck, clock), a MIDI bridge feeding an instrument, and a
+# meter reading a node (Quickshell's peak monitor, the mixer's taps). Links
+# between nodes that aren't the bench's (another harness on this machine)
+# are not the bench's business.
+leaks() {
+  backline_links | awk '{
+    mine_o = ($1 ~ /^backline-bench/ || $1 ~ /^backline\.surge-xt/)
+    mine_i = ($2 ~ /^backline-bench/ || $2 ~ /^backline\.surge-xt/)
+    if (!mine_o && !mine_i) next
+    other = mine_o ? $2 : $1
+    if (other ~ /^backline/ || other == "quickshell" || other == "Midi-Bridge") next
+    print
+  }'
+}
+
+# Stop the whole bench the moment anything of it links to a real device.
+watchdog() {
+  local found
+  while sleep 1; do
+    found=$(leaks)
+    if [[ -n $found ]]; then
+      echo "bench: leak, stopping: $found" >>"$bench/../backline-ui-bench-leaks.log"
+      setsid "$0" stop &
+      return
+    fi
+  done
+}
+
+case ${1:-} in
+  start) start ;;
+  stop) stop ;;
+  leaks) leaks ;;
+  ltc-start) kill -USR1 "$(<"$bench/ltc-gen.pid")" ;;
+  exec)
+    shift
+    # shellcheck disable=SC1090
+    source "$envfile"
+    exec "$@"
+    ;;
+  *)
+    echo "Usage: omarchy/dev/bench <start|stop|exec CMD...>" >&2
+    exit 1
+    ;;
+esac

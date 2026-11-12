@@ -1,0 +1,102 @@
+# Backline UX flows, 2026-11-11T23:24:19-08:00
+# panels: omarchy/plugins, staged against the Omarchy shell in ~/Developer-lab/omarchy-audio/upstream/shell; services: ~/Developer-lab/backline/build
+# devices: throwaway bench nodes only; the live desktop, shell and devices are not touched
+
+## 1. Play an instrument from a keyboard (first time)
+ok - Super+Ctrl+I: Instruments opens, cursor on Add              1 key(s)    149 ms
+ok - Enter: the picker opens                                     1 key(s)    163 ms
+ok - s u r: the list narrows to Surge XT                         3 key(s)    434 ms
+ok - Enter: Surge XT runs, following every keyboard              1 key(s)    196 ms
+# total: 6 keystroke(s), 942 ms of waiting for the system
+ok - a keyboard plugged in is linked to the instrument by itself (13 ms)
+ok - it plays: the instrument's output peaks at -10.0 dBFS while the keyboard plays
+
+## 1b. Choose one keyboard (in the open panel)
+ok - l: the cursor moves to the keyboard's pill                  1 key(s)    166 ms
+ok - Enter: the instrument follows only that keyboard            1 key(s)    149 ms
+# total: 2 keystroke(s), 315 ms of waiting for the system
+
+## 1c. Again, from the desktop (last used first)
+ok - Super+Ctrl+I                                                1 key(s)    117 ms
+ok - a: the picker, Surge XT first                               1 key(s)    174 ms
+ok - Enter: a second Surge XT runs                               1 key(s)    193 ms
+# total: 3 keystroke(s), 484 ms of waiting for the system
+
+## 1d. Remove an instrument (in the open panel)
+ok - j: to the second instrument                                 1 key(s)    133 ms
+ok - x: it stops, the first keeps running                        1 key(s)    139 ms
+# total: 2 keystroke(s), 272 ms of waiting for the system
+
+## 2. Record a set (first time)
+ok - Super+Ctrl+M: Record opens, cursor on the first source      1 key(s)     86 ms
+ok - Space: the microphone is armed, the recorder stands by      1 key(s)    194 ms
+ok - j Space: the instrument is armed too (2 tracks)             2 key(s)    267 ms
+ok - r: recording (the pre-roll is already in the take)          1 key(s)    140 ms
+ok - m: a marker                                                 1 key(s)    140 ms
+ok - r: stopped, the take is saved                               1 key(s)    136 ms
+# total: 7 keystroke(s), 963 ms of waiting for the system
+# take: take-20261111-232428: 2 tracks, 5.46 s, 1 marker(s)
+ok - the take holds the pre-roll: 5.46 s, from the moment of arming (4900 ms before Stop), not from r
+ok - the microphone track has signal (-3.1 dBFS)
+
+## 2b. Again, from anywhere: the record hotkey
+ok - Super+Ctrl+Alt+M: the remembered set records                1 key(s)     92 ms
+ok - Super+Ctrl+Alt+M: stopped and saved                         1 key(s)     65 ms
+# total: 2 keystroke(s), 157 ms of waiting for the system
+# notification: notify -g 󰻃 Recording 2 tracks
+# notification: notify -g 󰻃 Saved take-20261111-232434 (0:02)
+
+## 3. Virtual soundcheck: a take in place of its inputs
+# the bench room listens to: backline-bench.mic:capture_FL
+ok - Super+Ctrl+M                                                1 key(s)    121 ms
+ok - p: the newest take plays, inputs live, cursor on the first  1 key(s)    168 ms
+ok - l: the microphone is on playback; the room hears the take   1 key(s)    144 ms
+# the bench room listens to: backline.soundcheck:t1_1
+ok - p: soundcheck stops, the room hears the microphone again    1 key(s)    141 ms
+# total: 4 keystroke(s), 574 ms of waiting for the system
+# the bench room listens to: backline-bench.mic:capture_FL
+
+## 4. Check a plugin
+ok - Super+Ctrl+I                                                1 key(s)     93 ms
+ok - Tab: Plugins, with the grades of everything installed       1 key(s)    170 ms
+ok - /: the filter                                               1 key(s)    167 ms
+ok - c a r: Cardinal's products, the finding under the cursor    3 key(s)    432 ms
+# total: 6 keystroke(s), 862 ms of waiting for the system
+# under the cursor: Cardinal: PASS, Loads, runs and restores its state
+ok - Enter j j j: the failing one, and why                       4 key(s)    549 ms
+# under the cursor: Cardinal Synth: FAIL, CLAP: check crashed (SIGABRT, signal 6)
+
+## 5. Lock to timecode (first time: pick the input)
+ok - Super+Ctrl+G: Transport opens on the SYNC pills             1 key(s)     94 ms
+ok - l l: to LTC                                                 2 key(s)    305 ms
+ok - Enter: chasing the first input; no timecode there           1 key(s)    173 ms
+ok - j: to the input pills                                       1 key(s)    181 ms
+ok - l ×1: the LTC line; LOCKED                                 1 key(s)     44 ms
+# total: 6 keystroke(s), 797 ms of waiting for the system
+# clock: ltc 01:00:04:14 locked=true chase error 0 frames
+ok - the bar keeps the lock and timecode after the panel closes: 01:00:06:08
+
+## 5b. Lock to timecode again (input and frame rate remembered)
+ok - Super+Ctrl+G                                                1 key(s)    125 ms
+ok - l l: to LTC                                                 2 key(s)    291 ms
+ok - Enter: chasing the remembered LTC line, LOCKED              1 key(s)    164 ms
+# total: 4 keystroke(s), 580 ms of waiting for the system
+
+## 6. Open the mixer
+ok - Super+Ctrl+I                                                1 key(s)    134 ms
+ok - o: the mixer window is mapped                               1 key(s)    283 ms
+# total: 2 keystroke(s), 417 ms of waiting for the system
+ok - the mixer metered through arm, record, marker and stop, and is still running
+
+ok - no QML errors in the panels
+ok - nothing linked outside the bench
+# notifications and shell pushes the commands made:
+#        17 shell backline.record refresh
+#         4 shell backline.transport refresh
+#         4 shell backline.instruments refresh
+#         2 notify -g 󰌌 Surge XT is ready Every MIDI keyboard plays it
+#         2 notify -g 󰻃 Recording 2 tracks
+#         1 notify -g 󰻃 Saved take-20261111-232448 (0:06)
+#         1 notify -g 󰻃 Saved take-20261111-232434 (0:02)
+#         1 notify -g 󰻃 Saved take-20261111-232428 (0:05)
+#         1 notify -g 󰻃 Recording 3 tracks

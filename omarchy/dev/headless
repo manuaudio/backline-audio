@@ -1,0 +1,88 @@
+#!/bin/bash
+
+# Run a command against a private, headless Wayland compositor instead of the
+# live desktop, so the panels' real layer-shell surfaces and the mixer window
+# never map on the session in use and never read its keyboard.
+#
+# The compositor is sway 1.12 on wlroots' headless backend (no session, no
+# input devices, one 2560x1440 output, layer-shell, virtual keyboard for
+# wtype, screencopy for grim), unpacked under the cache from Arch's packages;
+# nothing is installed. Hyprland can't be used here: its backend refuses to
+# start without a DRM master.
+#
+#   omarchy/dev/headless CMD...   run CMD with WAYLAND_DISPLAY set to it
+#   omarchy/dev/headless stop
+
+set -euo pipefail
+
+tools="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-audio-tools"
+root="$tools/root"
+runtime="${XDG_RUNTIME_DIR:?}"
+socket_name=bl-headless-0
+pidfile="$runtime/bl-headless.pid"
+mirror=https://stable-mirror.omarchy.org/extra/os/x86_64
+packages=("sway-1%3A1.12-4" "wlroots0.20-0.20.2-1" "libliftoff-0.5.0-1")
+
+unpack() {
+  [[ -x $root/usr/bin/sway ]] && return 0
+  mkdir -p "$tools/pkgs" "$root"
+  local package
+  for package in "${packages[@]}"; do
+    [[ -f $tools/pkgs/$package-x86_64.pkg.tar.zst ]] ||
+      curl -fsSL -o "$tools/pkgs/$package-x86_64.pkg.tar.zst" "$mirror/$package-x86_64.pkg.tar.zst"
+    tar -C "$root" -xf "$tools/pkgs/$package-x86_64.pkg.tar.zst" --exclude='.[A-Z]*'
+  done
+}
+
+running() {
+  [[ -r $pidfile ]] && kill -0 "$(<"$pidfile")" 2>/dev/null && [[ -S $runtime/$socket_name ]]
+}
+
+stop() {
+  if [[ -r $pidfile ]]; then
+    kill "$(<"$pidfile")" 2>/dev/null || true
+    rm -f "$pidfile" "$runtime/$socket_name"
+  fi
+}
+
+start() {
+  running && return 0
+  unpack
+  local conf="$runtime/bl-headless.conf"
+  cat >"$conf" <<CONF
+output HEADLESS-1 resolution 2560x1440 scale 1 bg #000000 solid_color
+default_border none
+for_window [app_id="backline-mixer"] floating enable, resize set 1680 900, move position 40 120
+CONF
+  env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u SWAYSOCK \
+    WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128 \
+    LD_LIBRARY_PATH="$root/usr/lib" SWAYSOCK="$runtime/bl-headless.sock" \
+    setsid "$root/usr/bin/sway" -c "$conf" --unsupported-gpu \
+    >"$runtime/bl-headless.log" 2>&1 </dev/null &
+  echo $! >"$pidfile"
+  local found
+  for _ in {1..50}; do
+    found=$(find "$runtime" -maxdepth 1 -name 'wayland-*' -type s -newer "$pidfile" -printf '%f\n' 2>/dev/null | head -n1)
+    if [[ -n $found ]]; then
+      ln -sfn "$found" "$runtime/$socket_name"
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "Headless compositor did not start; see $runtime/bl-headless.log" >&2
+  exit 1
+}
+
+if [[ ${1:-} == "stop" ]]; then
+  stop
+  exit 0
+fi
+
+start
+export WAYLAND_DISPLAY="$socket_name"
+export SWAYSOCK="$runtime/bl-headless.sock"
+# swaymsg, for tests that look at the windows.
+export PATH="$PATH:$root/usr/bin"
+unset HYPRLAND_INSTANCE_SIGNATURE DISPLAY
+(($# > 0)) || set -- bash
+exec "$@"
