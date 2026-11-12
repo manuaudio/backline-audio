@@ -249,6 +249,15 @@ if(BACKLINE_REGISTRY)
   add_subdirectory(registry)
 endif()
 
+# The session manager's own policy, on a private PipeWire and WirePlumber
+# (tests/autolink-proof; skipped when they aren't installed): an instrument
+# with no target plays to the default output and follows it when it changes.
+if(BUILD_TESTING AND BACKLINE_REGISTRY)
+  add_test(NAME autolink COMMAND ${PROJECT_SOURCE_DIR}/tests/autolink-proof)
+  set_tests_properties(autolink PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90
+    ENVIRONMENT "BL_BIN=${CMAKE_BINARY_DIR};BL_OUT=${CMAKE_BINARY_DIR}/tests-out/autolink")
+endif()
+
 install(TARGETS backline-plugin-worker backline-recorder backline-recorderd backline-hostd backline-cli RUNTIME DESTINATION bin)
 install(TARGETS backline LIBRARY DESTINATION lib)
 install(DIRECTORY lib/include/backline DESTINATION include)

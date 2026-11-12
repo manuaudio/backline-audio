@@ -27,7 +27,8 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed base-devel git cmake ninja pkgconf \
             pipewire libpipewire systemd-libs libsndfile alsa-lib json-c lilv openssl vst3sdk \
-            pipewire-jack libltc asio
+            pipewire-jack libltc asio \
+            wireplumber jq python dbus
       # Arch builds the worker with VST3 (extra/vst3sdk 3.8, found through
       # pkg-config) and clockd with Ableton Link (fetched, pinned by hash);
       # Debian builds both without, so every path stays green.
@@ -45,5 +46,12 @@ jobs:
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ matrix.distro == 'archlinux' && '-DBACKLINE_LINK=ON' || '' }}
       - name: Build
         run: cmake --build build
+      # Under a session bus of its own, so tests/autolink-proof can run a
+      # private PipeWire and WirePlumber (it is skipped where they're missing).
       - name: Unit tests
-        run: ctest --test-dir build --output-on-failure
+        run: |
+          if command -v dbus-run-session >/dev/null; then
+            dbus-run-session -- ctest --test-dir build --output-on-failure
+          else
+            ctest --test-dir build --output-on-failure
+          fi

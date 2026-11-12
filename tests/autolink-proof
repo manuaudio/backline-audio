@@ -1,0 +1,104 @@
+#!/bin/bash
+# autolink-proof: an instrument started WITHOUT --audio-target plays to the
+# default output, linked by the session manager like any app stream
+# (DECISIONS D2), and moves when the default output changes.
+#
+#  1. The test sine instrument starts with no target. WirePlumber must accept
+#     its format (no "no usable format found") and link its main output to the
+#     default sink, channel by channel.
+#  2. A note played over OSC is heard on that sink's monitor.
+#  3. The default output is changed to a second sink: the instrument follows,
+#     and is no longer linked to the first.
+#
+# Runs on a private PipeWire and WirePlumber (tests/lib.sh bl_private_graph):
+# the user's graph, devices and saved defaults are never touched, and nothing
+# reaches a speaker. Exit 77 (skip) without pipewire/wireplumber.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+out=${BL_OUT:-$here/out/autolink}
+rm -rf "$out"; mkdir -p "$out"
+scratch=$(mktemp -d)
+trap 'bl_cleanup; rm -rf -- "$scratch"' EXIT
+plugin=${BL_TEST_PLUGINS:-$BL_BIN/test-plugins}/backline-test-ok.clap
+[[ -f $plugin ]] || { echo "no test plugin at $plugin (build first)"; exit 1; }
+
+fails=0
+check() { # description, then the condition as a command
+  local d=$1; shift
+  if "$@"; then echo "  ok   $d"; else echo "  FAIL $d"; fails=$((fails + 1)); fi
+}
+links_to() { # sink -> the instrument's ports linked to it, sorted
+  pw-link -l 2>/dev/null | awk -v s="$1:" '/^[^ ]/{port=$1} $1=="|->" && index($2, s)==1 {print port " -> " $2}' |
+    grep '^backline.autolink:' | sort || true
+}
+wait_for() { # command... (up to 5 s)
+  local _
+  for _ in $(seq 50); do "$@" && return 0; sleep 0.1; done
+  return 1
+}
+sink() { # name
+  pw-cli create-node adapter "{ factory.name = support.null-audio-sink node.name = $1 node.description = \"autolink $1\" media.class = Audio/Sink audio.position = [ FL FR ] audio.rate = 48000 object.linger = true monitor.channel-volumes = false }" >/dev/null
+  bl_wait_node "$1"
+}
+
+echo "== autolink-proof $(date -Is)"
+for tool in jq python3 pw-cli pw-dump pw-link pw-metadata pw-record; do
+  command -v $tool >/dev/null || { echo "SKIP: $tool not installed"; exit 77; }
+done
+rc=0; bl_private_graph "$scratch/graph" || rc=$?
+((rc == 77)) && { echo "SKIP: pipewire or wireplumber not installed"; exit 77; }
+((rc == 0)) || exit 1
+echo "private graph: pipewire $(pipewire --version | sed -n 's/.*libpipewire \(.*\)/\1/p' | tail -1), $(wireplumber --version | sed -n 's/Linked with //p')"
+sink autolink.sink-a
+wait_for test "$(bl_default_sink)" = '{"name":"autolink.sink-a"}'
+echo "default sink: $(bl_default_sink)"
+
+echo; echo "-- 1. no --audio-target: the session manager links it to the default output"
+bl_spawn "$BL_BIN/backline-plugin-worker" -p "$plugin" -i backline.test.sine -n backline.autolink --no-dbus \
+  >"$out/worker.json" 2>"$out/worker.log"
+bl_wait_node backline.autolink 200
+want_a=$'backline.autolink:out_FL -> autolink.sink-a:playback_FL\nbackline.autolink:out_FR -> autolink.sink-a:playback_FR'
+wait_for test "$(links_to autolink.sink-a)" = "$want_a" || true
+links_to autolink.sink-a | sed 's/^/  /'
+check "out_FL and out_FR are linked to the default sink, by channel" test "$(links_to autolink.sink-a)" = "$want_a"
+node=$(pw-dump | jq -c '.[] | select(.info.props["node.name"] == "backline.autolink") | .info.props
+  | {"media.class", "media.category", "node.autoconnect", "audio.channels", "audio.position"}')
+echo "  node: $node"
+check "it is an ordinary playback stream" test "$(jq -r '."media.class"' <<<"$node")" = Stream/Output/Audio
+check "WirePlumber found a usable format" bash -c "! grep -q 'no usable format' '$scratch/graph/wireplumber.log'"
+
+echo; echo "-- 2. a note is heard on the default sink"
+osc_port=$(jq -r .osc_port "$out/worker.json")
+pw-record --target autolink.sink-a -P '{ stream.capture.sink = true }' --rate 48000 --channels 2 --format s16 \
+  "$out/take.wav" 2>"$out/record.log" &
+rec=$!
+sleep 0.6
+python3 -I "$here/oscsend.py" "$osc_port" /note/on 0 69 100 >/dev/null
+sleep 0.6
+python3 -I "$here/oscsend.py" "$osc_port" /note/off 0 69 >/dev/null
+sleep 0.4
+kill -INT $rec; wait $rec 2>/dev/null || true
+peak=$(python3 -I - "$out/take.wav" <<'PY'
+import sys, wave, array
+w = wave.open(sys.argv[1]); a = array.array("h", w.readframes(w.getnframes()))
+print(round(max((abs(x) for x in a), default=0) / 32768, 4))
+PY
+)
+echo "  peak on the sink's monitor: $peak (full scale 1.0)"
+check "the note reaches the default output" python3 -I -c "import sys; sys.exit(0 if $peak > 0.01 else 1)"
+
+echo; echo "-- 3. the default output changes: it follows"
+sink autolink.sink-b
+pw-metadata -n default 0 default.configured.audio.sink '{"name":"autolink.sink-b"}' Spa:String:JSON >/dev/null
+wait_for test "$(bl_default_sink)" = '{"name":"autolink.sink-b"}'
+want_b=${want_a//sink-a/sink-b}
+wait_for test "$(links_to autolink.sink-b)" = "$want_b" || true
+links_to autolink.sink-b | sed 's/^/  /'
+check "it is linked to the new default sink" test "$(links_to autolink.sink-b)" = "$want_b"
+check "and no longer to the old one" test -z "$(links_to autolink.sink-a)"
+
+echo
+grep -E 'session manager|filter error' "$out/worker.log" | sed 's/^/  worker: /' || true
+if ((fails)); then echo "autolink-proof: $fails check(s) FAILED"; exit 1; fi
+echo "autolink-proof: all checks passed"

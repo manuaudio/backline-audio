@@ -51,6 +51,10 @@
 #include <pipewire/pipewire.h>
 #include <spa/control/control.h>
 #include <spa/control/ump-utils.h>
+#include <spa/param/audio/format-utils.h>
+#include <spa/param/audio/raw-types.h>
+#include <spa/param/props.h>
+#include <spa/pod/builder.h>
 #include <spa/pod/parser.h>
 #include <spa/utils/string.h>
 #include <systemd/sd-bus.h>
@@ -501,9 +505,38 @@ void on_state_changed(void *, pw_filter_state, pw_filter_state state, const char
     }
 }
 
+// WirePlumber links a stream to the default output (DECISIONS D2) the way it
+// links any app: it reads the node's EnumFormat (see stream_format), then sets
+// PortConfig to the sink's DSP format and waits for the ports to change, or,
+// for a node whose ports are already DSP ports (this one), for Props to be
+// emitted again. Our ports already are what it asks for, so answer with Props.
+void publish_props(const char *port_config)
+{
+    uint8_t buf[256];
+    spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
+    spa_pod_frame f[2];
+    spa_pod_builder_push_object(&b, &f[0], SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+    spa_pod_builder_prop(&b, SPA_PROP_params, 0);
+    spa_pod_builder_push_struct(&b, &f[1]);
+    spa_pod_builder_string(&b, "backline.port-config");
+    spa_pod_builder_string(&b, port_config);
+    spa_pod_builder_pop(&b, &f[1]);
+    const spa_pod *props = (const spa_pod *)spa_pod_builder_pop(&b, &f[0]);
+    pw_filter_update_params(W->filter, nullptr, &props, 1);
+}
+
+void on_param_changed(void *, void *port_data, uint32_t id, const spa_pod *)
+{
+    if (port_data == nullptr && id == SPA_PARAM_PortConfig) {
+        LOG("session manager configured the ports (dsp); ports unchanged\n");
+        publish_props("dsp");
+    }
+}
+
 const pw_filter_events filter_events = {
     .version = PW_VERSION_FILTER_EVENTS,
     .state_changed = on_state_changed,
+    .param_changed = on_param_changed,
     .process = on_process,
 };
 
@@ -1336,6 +1369,23 @@ std::vector<std::string> out_positions(const std::vector<bl::BusInfo> &buses)
     return v;
 }
 
+// The node-level EnumFormat an instrument shows the session manager: what its
+// main output is, as an app stream would say it (F32 planar, the main bus's
+// channels and positions). Without it WirePlumber finds "no usable format"
+// and never links the instrument to the default output.
+const spa_pod *stream_format(spa_pod_builder *b, uint32_t channels, const std::vector<std::string> &pos, uint32_t rate)
+{
+    spa_audio_info_raw info{};
+    info.format = SPA_AUDIO_FORMAT_F32P;
+    info.rate = rate;
+    info.channels = std::min<uint32_t>({channels, (uint32_t)pos.size(), (uint32_t)SPA_N_ELEMENTS(info.position)});
+    if (info.channels == 0)
+        return nullptr;
+    for (uint32_t c = 0; c < info.channels; c++)
+        info.position[c] = spa_type_audio_channel_from_short_name(pos[c].c_str());
+    return spa_format_audio_raw_build(b, SPA_PARAM_EnumFormat, &info);
+}
+
 void add_audio_ports(bool input, std::vector<PortGroup> &groups)
 {
     auto &buses = input ? W->inst->inputs : W->inst->outputs;
@@ -1530,7 +1580,14 @@ int main(int argc, char **argv)
     add_audio_ports(false, w.outs);
 
     activate(w.server_rate); // re-activated on the first cycle if the graph runs at another rate
-    if (pw_filter_connect(w.filter, PW_FILTER_FLAG_RT_PROCESS, nullptr, 0) < 0)
+    uint8_t fmt_buf[1024];
+    spa_pod_builder fb = SPA_POD_BUILDER_INIT(fmt_buf, sizeof(fmt_buf));
+    const spa_pod *node_params[1];
+    uint32_t n_node_params = 0;
+    if (instrument && !I->outputs.empty())
+        if ((node_params[0] = stream_format(&fb, I->outputs[0].channels, pos, w.server_rate)))
+            n_node_params = 1;
+    if (pw_filter_connect(w.filter, PW_FILTER_FLAG_RT_PROCESS, node_params, n_node_params) < 0)
         die("pw_filter_connect failed");
 
     w.housekeeping = pw_loop_add_timer(l, on_housekeeping, nullptr);

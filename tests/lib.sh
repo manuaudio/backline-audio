@@ -97,3 +97,45 @@ bl_watch_defaults() { # sink source FILE
     done ) &
   BL_WATCH=$!
 }
+
+# bl_private_graph DIR: a PipeWire and a WirePlumber of this script's own,
+# with their own runtime, config and state directories under DIR and every
+# device monitor off, so the session manager's real policy (default output,
+# linking, following a default change) can be tested without touching the
+# user's graph, devices or saved defaults. Exports XDG_RUNTIME_DIR and friends
+# for the rest of the script; the session bus stays the user's. Returns 77
+# (skip) when pipewire or wireplumber isn't installed.
+bl_private_graph() {
+  local d=$1 _
+  command -v pipewire >/dev/null && command -v wireplumber >/dev/null || return 77
+  mkdir -p "$d/run" "$d/config/wireplumber/wireplumber.conf.d" "$d/state"
+  chmod 700 "$d/run"
+  cat >"$d/config/wireplumber/wireplumber.conf.d/90-private.conf" <<'CONF'
+wireplumber.profiles = {
+  main = {
+    monitor.alsa = disabled
+    monitor.alsa-midi = disabled
+    monitor.bluez = disabled
+    monitor.bluez-midi = disabled
+    monitor.v4l2 = disabled
+    monitor.libcamera = disabled
+    support.logind = disabled
+  }
+}
+CONF
+  export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$UID}/bus}
+  export XDG_RUNTIME_DIR=$d/run PIPEWIRE_RUNTIME_DIR=$d/run XDG_CONFIG_HOME=$d/config XDG_STATE_HOME=$d/state
+  unset PIPEWIRE_REMOTE
+  pipewire >"$d/pipewire.log" 2>&1 &
+  BL_PIDS+=($!)
+  for _ in $(seq 100); do [[ -S $d/run/pipewire-0 ]] && break; sleep 0.05; done
+  [[ -S $d/run/pipewire-0 ]] || { echo "private pipewire did not start" >&2; cat "$d/pipewire.log" >&2; return 1; }
+  wireplumber >"$d/wireplumber.log" 2>&1 &
+  BL_PIDS+=($!)
+  for _ in $(seq 100); do
+    pw-dump 2>/dev/null | jq -e 'any(.[]; .type == "PipeWire:Interface:Metadata" and .props["metadata.name"] == "sm-settings")' >/dev/null && return 0
+    sleep 0.1
+  done
+  echo "private wireplumber did not start" >&2; cat "$d/wireplumber.log" >&2
+  return 1
+}
