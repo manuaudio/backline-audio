@@ -17,8 +17,22 @@ exec > >(tee "$out/report.txt") 2>&1
 trap 'bl_cleanup; kill ${BL_WATCH:-} 2>/dev/null; true' EXIT
 trap "exit 130" INT TERM
 secs=${SECONDS_TAKE:-1460}
+# The test runs in its own node group under its own driver (a test null
+# sink), so a real device suspending or resuming can't change its driver
+# mid-take, at a quantum of QUANTUM frames (default 1024, 21 ms: a longer
+# graph buffer, for a machine without realtime priority).
+quantum=${QUANTUM:-1024}
+G='node.group = backline-test.rf64'
+export PIPEWIRE_PROPS="{ $G }"
+others() { # other agents' workloads and heavy processes right now
+  ps -eo pcpu=,etime=,args= --sort=-pcpu | awk '$1 > 5' | grep -v -E "rf64|backline-(recorder|test-source)|ps -eo" |
+    cut -c1-110 | head -8 | sed 's/^/    /'
+}
 
 echo "== rf64-proof $(date -Is)"
+echo "quantum $quantum (forced on the test driver only); realtime priority: $(ulimit -r | sed 's/^0$/none (RLIMIT_RTPRIO 0, no rtkit)/')"
+echo "load at start: $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) cpus; processes over 5% CPU:"
+others
 default_before=$(bl_default_sink); source_before=$(bl_default_source); bl_foreign_nodes >"$out/nodes-before.txt"
 bl_watch_defaults "$default_before" "$source_before" "$out/defaults-moved.txt"
 echo "default sink: $default_before; free space: $(df -h --output=avail "$out" | tail -1)"
@@ -27,6 +41,9 @@ echo "default sink: $default_before; free space: $(df -h --output=avail "$out" |
 # file is the recorder's (or a graph dropout, which would show in both)
 bl_spawn "$BL_BIN/backline-test-source" --sines 100:16 backline-test.rf64
 bl_wait_node backline-test.rf64
+{ printf 'create-node adapter { factory.name = support.null-audio-sink node.name = backline-test.rf64drv media.class = Audio/Sink audio.position = [ FL FR ] object.linger = false priority.driver = -1 priority.session = 1 node.virtual = true node.force-quantum = %s %s }\n' "$quantum" "$G"; exec sleep 100000; } | pw-cli >/dev/null 2>&1 &
+BL_PIDS+=($!)
+bl_wait_node backline-test.rf64drv
 sleep 1
 mkfifo "$out/ctl"
 exec 9<>"$out/ctl"
@@ -47,10 +64,12 @@ BL_PIDS+=($!)
 while kill -0 $REC 2>/dev/null; do
   sleep 60
   sz=$(stat -c %s "$out"/big-01-*.wav 2>/dev/null || echo 0)
-  echo "  $(( $(date +%s) - t0 )) s: $((sz / 1000000)) MB; default sink $( [[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED), source $( [[ $(bl_default_source) == "$source_before" ]] && echo unchanged || echo CHANGED)"
+  echo "  $(( $(date +%s) - t0 )) s: $((sz / 1000000)) MB; load $(cut -d' ' -f1 /proc/loadavg); default sink $( [[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED), source $( [[ $(bl_default_source) == "$source_before" ]] && echo unchanged || echo CHANGED)"
 done
 wait $REC || true
 wait $REFP || true
+echo "load at the end: $(cut -d' ' -f1-3 /proc/loadavg); processes over 5% CPU:"
+others
 echo "recorder: $(grep -E 'overrun|WARNING' "$out/rec.log" || echo 'no overrun warnings')"
 f=$(ls "$out"/big-01-*.wav)
 rf=$(ls "$out"/ref/ref-01-*.wav)

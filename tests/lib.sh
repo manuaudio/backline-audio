@@ -81,7 +81,11 @@ bl_cleanup() {
 # Watch the default sink and source for the whole run (WirePlumber may make a
 # new test node the default while it exists). Lines in FILE if they move.
 bl_watch_defaults() { # sink source FILE
+  # A read can fail while pw-metadata is busy (it then prints nothing), so a
+  # mismatch counts only if it is still there on a second read.
   ( while sleep 0.5; do
+      [[ $(bl_default_sink) == "$1" && $(bl_default_source) == "$2" ]] && continue
+      sleep 0.2
       [[ $(bl_default_sink) == "$1" && $(bl_default_source) == "$2" ]] ||
         echo "$(date +%T) sink=$(bl_default_sink) source=$(bl_default_source)" >>"$3"
     done ) &
