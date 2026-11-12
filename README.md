@@ -5,6 +5,8 @@ keyboard, sample-aligned multitrack recording, files played on one shared
 transport, an index of every installed plugin, and OSC/MIDI control of all
 of it, as small PipeWire services with panels in the Omarchy bar.
 
+> **Preview, not yet tested by the author on real hardware.** Everything here was proven with automated, measured tests on virtual devices (see `docs/proofs/`), but has not yet been run on real audio interfaces, MIDI controllers or a live session. Expect rough edges.
+
 ```sh
 yay -S backline-audio && omarchy plugin add https://github.com/manuaudio/backline-audio --enable
 ```
