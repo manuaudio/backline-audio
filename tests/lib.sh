@@ -5,7 +5,7 @@
 # shellcheck shell=bash
 
 BL_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BL_BIN=$BL_ROOT/build
+BL_BIN=${BL_BIN:-$BL_ROOT/build}
 BL_PIDS=()
 
 bl_node_id() { # node.name -> id

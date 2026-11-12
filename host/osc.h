@@ -24,8 +24,10 @@ inline size_t pad4(size_t n) { return (n + 3) & ~size_t(3); }
 inline bool parse(const uint8_t *buf, size_t len, Message &out)
 {
     auto read_str = [&](size_t &pos, std::string &s) {
+        if (pos >= len)
+            return false;
         const void *end = memchr(buf + pos, 0, len - pos);
-        if (pos >= len || !end)
+        if (!end)
             return false;
         size_t n = (const uint8_t *)end - (buf + pos);
         s.assign((const char *)buf + pos, n);
@@ -34,6 +36,7 @@ inline bool parse(const uint8_t *buf, size_t len, Message &out)
     };
     size_t pos = 0;
     std::string tags;
+    out.args.clear();
     if (!read_str(pos, out.address) || out.address.empty() || out.address[0] != '/')
         return false;
     if (pos == len)

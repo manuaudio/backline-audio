@@ -1,0 +1,207 @@
+#!/bin/bash
+# hostd-proof: the supervisor brings a crashed plugin back with its state.
+#
+#  1. backline-hostd starts Surge XT (CLAP) in its own systemd user scope, via
+#     the backline CLI (libbackline). Three parameters are moved away from
+#     their defaults: Global Volume, A Pitch and Send FX 1 Return.
+#  2. A virtual keyboard plays a note every 0.45 s through PipeWire's MIDI
+#     bridge. While it plays, the worker gets SIGKILL. Measured: the Crashed
+#     and Restarted signals, the new process and scope, every parameter value
+#     before and after (all of them, exact), pitch by FFT and level of every
+#     note before and after, how long the sound was gone, and that the same
+#     node name, OSC port and D-Bus name answer again.
+#  3. Crash loop: the worker is killed again and again; hostd backs off and
+#     gives up after 6 crashes in a minute, and says so (Failed).
+#
+# Throwaway only: a null sink owned by this script, nothing linked to real
+# devices, state in tests/out/hostd.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+source "$here/lib.sh"
+
+out=$here/out/hostd
+rm -rf "$out"; mkdir -p "$out"
+exec > >(tee "$out/report.txt") 2>&1
+trap bl_cleanup EXIT
+B="$BL_BIN/backline"
+mono() { python3 -I -c 'import time; print(time.monotonic_ns())'; }
+osc() { python3 -I "$here/oscsend.py" "$@"; }
+wait_for() { # description command...
+  local d=$1; shift
+  for _ in $(seq 400); do "$@" >/dev/null 2>&1 && return 0; sleep 0.025; done
+  echo "timed out waiting for: $d"; return 1
+}
+saved() { [[ $($B counter synth StateSaved) == $($B counter synth StateSerial) ]]; }
+eval_py() { python3 -I - "$here" "$out" "$@"; }
+
+echo "== hostd-proof $(date -Is)"
+echo "pipewire $(pipewire --version | sed -n 's/.*libpipewire \(.*\)/\1/p' | tail -1), kernel $(uname -r), systemd $(systemctl --version | head -1 | awk '{print $2}')"
+default_before=$(bl_default_sink)
+pw_pids_before="$(pidof pipewire) / $(pidof wireplumber)"
+bl_foreign_nodes >"$out/foreign-before.txt"
+echo "default sink: $default_before"
+
+bl_testbed backline-test.sink-a
+bl_spawn "$BL_BIN/backline-hostd" --state-dir "$out/state" --log-dir "$out/logs" >"$out/hostd.json" 2>"$out/hostd.log"
+wait_for "hostd on the bus" busctl --user status io.github.manuaudio.Backline.Host
+echo "hostd: $(cat "$out/hostd.json")"
+
+# ------------------------------------------------------------ 1. load + params
+echo; echo "-- 1. load through the CLI, move three parameters, state saved"
+$B --json host load "Surge XT" --id synth --target backline-test.sink-a \
+  --midi-follow '^Midi-Bridge:backline-test-kbd' >"$out/load.json"
+jq -c '{id, node, dbus, pid, osc_port, unit, state_file}' "$out/load.json" | sed 's/^/  /'
+unit0=$(jq -r .unit "$out/load.json"); pid0=$(jq -r .pid "$out/load.json")
+echo "  scope: $(systemctl --user show "$unit0" -p ActiveState -p MemoryMax -p TasksMax -p ControlGroup | tr '\n' ' ')"
+for kv in "Global Volume=0.5" "A Pitch=0.6" "Send FX 1 Return=0.25"; do
+  echo "  backline set synth \"${kv%=*}\" ${kv#*=} -> $($B set synth "${kv%=*}" "${kv#*=}")"
+done
+wait_for "state saved" saved
+echo "  StateSerial $($B counter synth StateSerial) = StateSaved $($B counter synth StateSaved) (autosaves: $($B counter synth StateSaves)), $(stat -c %s "$(jq -r .state_file "$out/load.json")") bytes"
+$B --json params synth >"$out/params-before.json"
+
+# ----------------------------------------------------- 2. SIGKILL while playing
+echo; echo "-- 2. SIGKILL the worker while the keyboard plays"
+$B --json host watch --count 2 --timeout 20 >"$out/events.jsonl" &
+watch=$!
+sleep 0.3
+"$BL_BIN/backline-recorder" -s backline-test.sink-a -o "$out" -n take-crash -d 9.0 >/dev/null 2>"$out/rec.log" &
+rec=$!
+for _ in $(seq 200); do grep -q armed "$out/rec.log" 2>/dev/null && break; sleep 0.05; done
+steps=()
+for _ in $(seq 18); do steps+=(on=69,100 wait=0.35 off=69 wait=0.1); done
+"$BL_BIN/backline-test-keyboard" --name backline-test-kbd wait=0.3 "${steps[@]}" >"$out/kbd.jsonl" &
+kbd=$!
+sleep 3.6
+t_kill=$(mono); kill -KILL "$pid0"
+echo "  SIGKILL -> worker pid $pid0"
+wait $watch || true
+wait_for "restarted instance answers" $B get synth "Global Volume"
+$B --json host show synth >"$out/after.json"
+jq -c '{state, pid, restarts, last_signal, osc_port, node, dbus, unit}' "$out/after.json" | sed 's/^/  /'
+echo "  old scope $unit0: $(systemctl --user show "$unit0" -p ActiveState --value 2>/dev/null || echo gone);" \
+  "new scope $(jq -r .unit "$out/after.json"): $(systemctl --user show "$(jq -r .unit "$out/after.json")" -p ActiveState --value)"
+echo "  OSC on the same port $(jq -r .osc_port "$out/after.json"): $(osc "$(jq -r .osc_port "$out/after.json")" /backline/param/get "Global Volume")"
+$B --json params synth >"$out/params-after.json"
+wait $kbd; wait $rec
+grep -E "restored state|midi-follow: linking" "$out/logs/synth.log" | sed 's/^/  worker: /'
+eval_py "$t_kill" "$pid0" <<'EOF'
+import glob, json, math, sys
+here, out, t_kill, pid0 = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+sys.path.insert(0, here)
+import analyze as A
+before = {p["id"]: p for p in json.load(open(f"{out}/params-before.json"))}
+after = {p["id"]: p for p in json.load(open(f"{out}/params-after.json"))}
+diff = [i for i in before if i not in after or before[i]["value"] != after[i]["value"]]
+moved = {n: (before[i]["value"], after[i]["value"]) for i in before
+         for n in ("Global Volume", "A Pitch", "Send FX 1 Return") if before[i]["name"] == n}
+print(f"  parameters: {len(before)} before, {len(after)} after; values that differ: {len(diff)} (exact comparison)")
+for n, (b, a) in moved.items():
+    print(f"    {n:18} before {b:.6g}  after {a:.6g}")
+ev = [json.loads(l) for l in open(f"{out}/events.jsonl")]
+crash = next(e for e in ev if e["event"] == "Crashed"); rst = next(e for e in ev if e["event"] == "Restarted")
+ms = lambda t: (t - t_kill) / 1e6
+print(f"  signals: Crashed(signal {crash['signal']}) +{ms(crash['monotonic_ns']):.1f} ms, "
+      f"Restarted(pid {rst['pid']}, restarts {rst['restarts']}) +{ms(rst['monotonic_ns']):.1f} ms after the kill")
+take = json.load(open(f"{out}/take-crash.json"))
+w = A.read_wav(glob.glob(f"{out}/take-crash-01-*.wav")[0]); rate = w["rate"]; x = A.mono(w)
+t0 = take["start"]["monotonic_ns"]
+idx = lambda t: int((t - t0) * rate / 1e9)
+kbd = [json.loads(l) for l in open(f"{out}/kbd.jsonl")]
+ons = [e for e in kbd if e["event"].startswith("on=")]
+offs = [e for e in kbd if e["event"].startswith("off=")]
+k = idx(t_kill)
+notes = []
+for on, off in zip(ons, offs):
+    a, b = idx(on["t_ns"]), idx(off["t_ns"])
+    if a < 0 or b > len(x):
+        continue
+    seg = x[a + int(0.08 * rate): b - int(0.02 * rate)]
+    if len(seg) < 4096:
+        continue
+    lvl = A.db(A.rms(seg))
+    f = A.f0(seg, rate)[0] if lvl > -70 else None
+    where = "before" if b < k else "after" if a > k else "at-kill"
+    notes.append({"t_s": round(a / rate, 3), "where": where, "rms_dbfs": round(lvl, 2), "f0_hz": f and round(f, 2)})
+pre = [n for n in notes if n["where"] == "before"]
+post = [n for n in notes if n["where"] == "after"]
+# sound back: first 5 ms window above -60 dBFS after the kill
+hop = rate // 200
+back = next((i for i in range(k + int(0.01 * rate), len(x) - hop, hop) if A.db(A.rms(x[i:i + hop])) > -60), None)
+first_on_after_restart = next((idx(e["t_ns"]) for e in ons if e["t_ns"] > rst["monotonic_ns"]), None)
+sounding_post = [n for n in post if n["rms_dbfs"] > -60]
+mean = lambda v: sum(v) / len(v)
+lv_pre, lv_post = mean([n["rms_dbfs"] for n in pre]), mean([n["rms_dbfs"] for n in post])
+f_pre, f_post = mean([n["f0_hz"] for n in pre]), mean([n["f0_hz"] for n in post if n["f0_hz"]])
+print(f"  notes (A4 = 440 Hz played; A Pitch moved): {len(pre)} before the kill, {len(post)} after the restart, "
+      f"{len(sounding_post)}/{len(post)} of those sound")
+print(f"    before: {lv_pre:.2f} dBFS, {f_pre:.2f} Hz (spread {max(n['f0_hz'] for n in pre) - min(n['f0_hz'] for n in pre):.2f} Hz)")
+print(f"    after:  {lv_post:.2f} dBFS, {f_post:.2f} Hz -> level {lv_post - lv_pre:+.2f} dB, pitch {1200 * math.log2(f_post / f_pre):+.2f} cents")
+print(f"    (defaults would give about -21.9 dBFS at 440 Hz: the moved parameters were restored, not reset)")
+gap_ms = (back - k) / rate * 1000 if back else None
+lat = (back - first_on_after_restart) / rate * 1000 if back and first_on_after_restart else None
+print(f"  silence after the kill: {gap_ms:.0f} ms. Sound returns with the first note-on sent after the restart "
+      f"(onset within {abs(lat):.1f} ms of it); the note held at the kill is cut. Notes are 0.45 s apart.")
+ok = (not diff and len(before) > 700 and crash["signal"] == 9 and rst["pid"] != pid0 and rst["restarts"] == 1
+      and len(pre) >= 5 and len(post) >= 5 and len(sounding_post) == len(post)
+      and abs(lv_post - lv_pre) < 0.2 and abs(1200 * math.log2(f_post / f_pre)) < 2
+      and lv_pre < -35 and abs(1200 * math.log2(f_pre / 440)) > 50 and take["overrun_frames"] == 0)
+print(f"  RESULT: {'PASS' if ok else 'FAIL'} (same {len(before)} parameter values, same level and pitch, every note after the restart sounds)")
+json.dump({"param_count": len(before), "param_diffs": len(diff), "moved": moved, "crashed_ms": ms(crash["monotonic_ns"]),
+           "restarted_ms": ms(rst["monotonic_ns"]), "notes": notes, "gap_ms": gap_ms, "note_on_to_sound_ms": lat, "pass": ok},
+          open(f"{out}/result-crash.json", "w"), indent=1)
+EOF
+
+# ------------------------------------------------------------- 3. crash loop
+echo; echo "-- 3. crash loop: kill it whenever it comes back; hostd backs off, then gives up"
+running_new() { # prev-pid
+  [[ $($B --json host show synth | jq -r '"\(.state) \(.pid)"') == "running "* ]] &&
+    [[ $($B --json host show synth | jq -r .pid) != "$1" ]]
+}
+pid_before=$($B --json host show synth | jq -r .pid)
+$B host restart synth   # an explicit restart also clears the crash history
+wait_for "running after the explicit restart" running_new "$pid_before"
+echo "  'backline host restart synth' -> $($B --json host show synth | jq -c '{state, pid, restarts}')"
+$B --json host watch --count 12 --timeout 30 >"$out/loop.jsonl" &
+watch=$!
+sleep 0.3
+prev=0
+for n in 1 2 3 4 5 6; do
+  wait_for "worker $n running" running_new "$prev"
+  prev=$($B --json host show synth | jq -r .pid)
+  kill -KILL "$prev" || true
+done
+wait_for "failed" bash -c "[[ \$($B --json host show synth | jq -r .state) == failed ]]"
+wait $watch 2>/dev/null || true
+$B --json host show synth | jq -c '{state, restarts, pid, fail_reason}' | sed 's/^/  /'
+python3 -I - "$out/loop.jsonl" <<'EOF'
+import json, sys
+ev = [json.loads(l) for l in open(sys.argv[1])]
+crash = [e for e in ev if e["event"] == "Crashed"]
+delays = []
+for c in crash:
+    nxt = next((e for e in ev if e["event"] == "Restarted" and e["monotonic_ns"] > c["monotonic_ns"]), None)
+    delays.append(round((nxt["monotonic_ns"] - c["monotonic_ns"]) / 1e6) if nxt else None)
+failed = [e for e in ev if e["event"] == "Failed"]
+print(f"  {len(crash)} crashes; crash -> restarted (ms): {delays}")
+print(f"  Failed: {failed[0]['reason'] if failed else 'none'}")
+ok = len(crash) == 6 and delays[-1] is None and all(d is not None for d in delays[:-1]) and \
+     delays[1] >= 250 and delays[2] >= 500 and failed
+print(f"  RESULT: {'PASS' if ok else 'FAIL'} (immediate first restart, then backoff, then it stays down)")
+EOF
+$B host restart synth
+wait_for "running after an explicit restart" running_new 0
+echo "  explicit 'backline host restart synth': $($B --json host show synth | jq -c '{state, restarts}'), Global Volume $($B get synth 'Global Volume')"
+
+# ---------------------------------------------------------------- cleanup
+echo; echo "-- clean up"
+$B --json host unload synth | jq -c . | sed 's/^/  /'
+echo "  after unload: instances $($B --json host list | jq length), node present: $([[ -n $(bl_node_id backline.synth) ]] && echo YES || echo no)"
+bl_cleanup
+sleep 0.5
+left=$(pw-dump 2>/dev/null | jq -r '.[] | select(.type=="PipeWire:Interface:Node") | .info.props["node.name"] // empty' | grep -c '^backline' || true)
+echo "backline nodes left: $left; processes left: $(pgrep -c -f 'backline-(hostd|plugin-worker|recorder|test-keyboard)' || true); scopes left: $(systemctl --user list-units 'backline-*' --no-legend | wc -l)"
+bl_foreign_nodes >"$out/foreign-end.txt"
+echo "other nodes same as at start: $(bl_same_nodes "$out/foreign-before.txt" "$out/foreign-end.txt")"
+echo "pipewire/wireplumber pids: $(pidof pipewire) / $(pidof wireplumber) (before: $pw_pids_before)"
+echo "default sink after: $(bl_default_sink) ($([[ $(bl_default_sink) == "$default_before" ]] && echo unchanged || echo CHANGED))"

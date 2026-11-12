@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(backline VERSION 0.1.0 LANGUAGES C CXX)
+project(backline VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
@@ -7,13 +7,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
-add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
+add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-format-truncation)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3>=1.4)
 pkg_check_modules(SYSTEMD REQUIRED IMPORTED_TARGET libsystemd)
 pkg_check_modules(SNDFILE REQUIRED IMPORTED_TARGET sndfile>=1.1)
 pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
+pkg_check_modules(JSONC REQUIRED IMPORTED_TARGET json-c)
+
+include(CTest)
 
 # Shared graph helper (C, main-thread only).
 add_library(bl_graph STATIC common/bl_graph.c)
@@ -34,4 +37,44 @@ target_link_libraries(backline-recorder PRIVATE bl_graph PkgConfig::PIPEWIRE Pkg
 add_executable(backline-test-keyboard tools/test-keyboard.c)
 target_link_libraries(backline-test-keyboard PRIVATE PkgConfig::ALSA)
 
-install(TARGETS backline-plugin-worker backline-recorder RUNTIME DESTINATION bin)
+
+# Plugin-host supervisor: one systemd user scope per worker, restart with state.
+add_library(bl_hostd_policy STATIC hostd/policy.c)
+target_include_directories(bl_hostd_policy PUBLIC hostd)
+target_link_libraries(bl_hostd_policy PUBLIC PkgConfig::JSONC)
+add_executable(backline-hostd hostd/hostd.c)
+target_link_libraries(backline-hostd PRIVATE bl_hostd_policy PkgConfig::SYSTEMD)
+
+# libbackline: the MIT C client library (D-Bus only), and the backline CLI.
+add_library(backline SHARED lib/backline.c)
+set_target_properties(backline PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 0 C_VISIBILITY_PRESET default)
+target_include_directories(backline PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/lib/include> $<INSTALL_INTERFACE:include>)
+target_link_libraries(backline PRIVATE PkgConfig::SYSTEMD)
+add_executable(backline-cli cli/backline.c)
+set_target_properties(backline-cli PROPERTIES OUTPUT_NAME backline)
+target_link_libraries(backline-cli PRIVATE backline PkgConfig::JSONC)
+
+# Unit tests (no PipeWire daemon, no session bus needed).
+if(BUILD_TESTING)
+  add_executable(test_hostd_policy tests/unit/test_hostd_policy.c)
+  target_link_libraries(test_hostd_policy PRIVATE bl_hostd_policy)
+  add_test(NAME hostd_policy COMMAND test_hostd_policy)
+  add_executable(test_rt tests/unit/test_rt.cpp)
+  target_include_directories(test_rt PRIVATE host)
+  find_package(Threads REQUIRED)
+  target_link_libraries(test_rt PRIVATE Threads::Threads)
+  add_test(NAME rt_spsc_osc COMMAND test_rt)
+  add_executable(test_libbackline tests/unit/test_libbackline.c)
+  target_link_libraries(test_libbackline PRIVATE backline bl_hostd_policy)
+  add_test(NAME libbackline COMMAND test_libbackline)
+endif()
+
+# Plugin registry: sandboxed probes, grades, cache, D-Bus query service.
+option(BACKLINE_REGISTRY "Build the plugin registry" ON)
+if(BACKLINE_REGISTRY)
+  add_subdirectory(registry)
+endif()
+
+install(TARGETS backline-plugin-worker backline-recorder backline-hostd backline-cli RUNTIME DESTINATION bin)
+install(TARGETS backline LIBRARY DESTINATION lib)
+install(DIRECTORY lib/include/backline DESTINATION include)

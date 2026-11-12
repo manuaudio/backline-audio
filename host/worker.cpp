@@ -100,9 +100,10 @@ struct alignas(8) EvSlot { uint8_t raw[64]; };
 
 struct Worker {
     // ---- options
-    std::string plugin_path, plugin_id, node_name, midi_follow, audio_target;
+    std::string plugin_path, plugin_id, node_name, midi_follow, audio_target, state_file;
     int osc_port = 0;
-    bool use_dbus = true, autoconnect = false, list_only = false;
+    int autoconnect = -1; // -1: default (on unless an audio target is given)
+    bool use_dbus = true, list_only = false;
 
     // ---- PipeWire
     pw_main_loop *loop = nullptr;
@@ -166,6 +167,18 @@ struct Worker {
     spa_source *osc_source = nullptr;
     sd_bus *bus = nullptr;
     sd_bus_slot *bus_slot = nullptr;
+
+    // ---- state persistence (main thread)
+    // serial counts changes a saved state would see: parameter sets, plugin
+    // mark_dirty, parameter values the plugin reports, LoadState.
+    uint64_t state_serial = 0, state_saved = 0, state_saves = 0;
+    uint64_t dirty_since_ns = 0, last_save_ns = 0;
+    uint64_t announced_serial = UINT64_MAX;
+    // Control events pushed to the audio thread (main) and consumed by it
+    // (audio, after process() returned). A save waits until the plugin has
+    // seen every change, or it would capture the state before the last move.
+    uint64_t ctl_pushed = 0, ctl_needed = 0;
+    std::atomic<uint64_t> ctl_consumed{0};
     spa_source *bus_source = nullptr;
     std::string bus_name;
 };
@@ -229,7 +242,8 @@ void host_params_clear(const clap_host *, clap_id, clap_param_clear_flags) {}
 void host_params_request_flush(const clap_host *) { host_request_callback(nullptr); }
 const clap_host_params host_params_ext{host_params_rescan, host_params_clear, host_params_request_flush};
 
-void host_state_mark_dirty(const clap_host *) {}
+void mark_dirty();
+void host_state_mark_dirty(const clap_host *) { mark_dirty(); }
 const clap_host_state host_state_ext{host_state_mark_dirty};
 
 void host_latency_changed(const clap_host *) { LOG("plugin latency changed\n"); }
@@ -421,7 +435,10 @@ void on_process(void *, spa_io_position *pos)
         silence(n);
         drain_midi_port(n, false);
         CtlEvent ce;
-        while (w->to_audio.pop(ce)) {} // stale when inactive
+        uint64_t dropped_ctl = 0;
+        while (w->to_audio.pop(ce)) dropped_ctl++; // stale when inactive
+        if (dropped_ctl)
+            w->ctl_consumed.fetch_add(dropped_ctl, std::memory_order_release);
         if (w->active && rate != w->active_rate && !w->want_reactivate.exchange(true))
             pw_loop_signal_event(pw_main_loop_get_loop(w->loop), w->main_event);
         return;
@@ -430,7 +447,9 @@ void on_process(void *, spa_io_position *pos)
     // Events: control changes first (time 0), then MIDI in timeline order.
     w->n_evs = 0;
     CtlEvent ce;
+    uint64_t popped = 0;
     while (w->to_audio.pop(ce)) {
+        popped++;
         if (ce.kind == CtlEvent::ParamValue) {
             auto *e = ev_alloc<clap_event_param_value>();
             if (!e) break;
@@ -486,6 +505,8 @@ void on_process(void *, spa_io_position *pos)
     if (w->plugin->process(w->plugin, &p) == CLAP_PROCESS_ERROR)
         silence(n);
     w->steady += n;
+    if (popped)
+        w->ctl_consumed.fetch_add(popped, std::memory_order_release);
 }
 
 int reconcile_port(void *, const bl_port *p);
@@ -607,6 +628,7 @@ int set_param(const Param &p, double v)
     if (p.flags & CLAP_PARAM_IS_STEPPED)
         v = std::round(v);
     W->values[W->param_index[p.id]].store(v);
+    mark_dirty();
     if (!W->active.load()) {
         if (W->ext_params) {
             W->n_evs = 0;
@@ -622,12 +644,18 @@ int set_param(const Param &p, double v)
         }
         return 0;
     }
-    return W->to_audio.push({CtlEvent::ParamValue, {}, p.id, p.cookie, v}) ? 0 : -EAGAIN;
+    if (!W->to_audio.push({CtlEvent::ParamValue, {}, p.id, p.cookie, v}))
+        return -EAGAIN;
+    W->ctl_needed = ++W->ctl_pushed;
+    return 0;
 }
 
 int send_midi(uint8_t a, uint8_t b, uint8_t c)
 {
-    return W->to_audio.push({CtlEvent::Midi, {a, b, c}, 0, nullptr, 0}) ? 0 : -EAGAIN;
+    if (!W->to_audio.push({CtlEvent::Midi, {a, b, c}, 0, nullptr, 0}))
+        return -EAGAIN;
+    W->ctl_pushed++;
+    return 0;
 }
 
 void on_main_event(void *, uint64_t)
@@ -649,16 +677,30 @@ void on_main_event(void *, uint64_t)
     }
 }
 
+bool save_state_to(const std::string &path, std::string *err);
+void autosave(bool force);
+
 void on_housekeeping(void *, uint64_t)
 {
     OutParam op;
+    bool changed = false;
     while (W->from_audio.pop(op)) {
         auto it = W->param_index.find(op.id);
-        if (it != W->param_index.end())
+        if (it != W->param_index.end() && W->values[it->second].load() != op.value) {
             W->values[it->second].store(op.value);
+            changed = true;
+        }
     }
-    if (W->bus)
+    if (changed)
+        mark_dirty();
+    autosave(false);
+    if (W->bus) {
+        if (W->announced_serial != W->state_serial + W->state_saved) {
+            W->announced_serial = W->state_serial + W->state_saved;
+            sd_bus_emit_properties_changed(W->bus, kObjectPath, kInterface, "StateSerial", "StateSaved", nullptr);
+        }
         while (sd_bus_process(W->bus, nullptr) > 0) {}
+    }
 }
 
 // ---------------------------------------------------------------- linking
@@ -724,7 +766,8 @@ void on_port_removed(void *, uint32_t id)
         return;
     v.erase(it);
     LOG("midi-follow: source port %u went away; releasing held notes\n", id);
-    W->to_audio.push({CtlEvent::ReleaseAll, {}, 0, nullptr, 0});
+    if (W->to_audio.push({CtlEvent::ReleaseAll, {}, 0, nullptr, 0}))
+        W->ctl_pushed++;
 }
 
 const bl_graph_events graph_events = {on_port_added, on_port_removed};
@@ -868,18 +911,103 @@ int m_note_off(sd_bus_message *m, void *u, sd_bus_error *e) { return m_note(m, u
 int64_t st_write(const clap_ostream *s, const void *buf, uint64_t size) { return (int64_t)fwrite(buf, 1, size, (FILE *)s->ctx); }
 int64_t st_read(const clap_istream *s, void *buf, uint64_t size) { return (int64_t)fread(buf, 1, size, (FILE *)s->ctx); }
 
+void mark_dirty()
+{
+    if (W->state_serial == W->state_saved)
+        W->dirty_since_ns = now_ns();
+    W->state_serial++;
+}
+
+// Writes the plugin's state to PATH atomically (temp file, fsync, rename), so
+// a crash during a save leaves the previous state intact. Main thread.
+bool save_state_to(const std::string &path, std::string *err)
+{
+    if (!W->ext_state) {
+        if (err) *err = "plugin has no state extension";
+        return false;
+    }
+    std::string tmp = path + ".tmp." + std::to_string(getpid());
+    FILE *f = fopen(tmp.c_str(), "wb");
+    if (!f) {
+        if (err) *err = std::string("open ") + tmp + ": " + strerror(errno);
+        return false;
+    }
+    clap_ostream os{f, st_write};
+    bool ok = W->ext_state->save(W->plugin, &os);
+    ok = fflush(f) == 0 && ok;
+    ok = fsync(fileno(f)) == 0 && ok;
+    fclose(f);
+    if (!ok || rename(tmp.c_str(), path.c_str()) != 0) {
+        unlink(tmp.c_str());
+        if (err) *err = ok ? std::string("rename: ") + strerror(errno) : "plugin failed to save state";
+        return false;
+    }
+    return true;
+}
+
+bool load_state_from(const std::string &path, std::string *err)
+{
+    if (!W->ext_state) {
+        if (err) *err = "plugin has no state extension";
+        return false;
+    }
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) {
+        if (err) *err = std::string("open ") + path + ": " + strerror(errno);
+        return false;
+    }
+    clap_istream is{f, st_read};
+    bool ok = W->ext_state->load(W->plugin, &is);
+    fclose(f);
+    if (!ok) {
+        if (err) *err = "plugin failed to load state";
+        return false;
+    }
+    rescan_params();
+    return true;
+}
+
+// --state-file: save once the state has been quiet for 100 ms (so a burst of
+// parameter moves is one write), but at least every second while it keeps
+// changing. Main thread (housekeeping timer).
+void autosave(bool force)
+{
+    if (W->state_file.empty() || W->state_serial == W->state_saved)
+        return;
+    uint64_t now = now_ns();
+    bool quiet = now - W->dirty_since_ns > 100000000ull;
+    bool overdue = now - W->dirty_since_ns > 1000000000ull && now - W->last_save_ns > 1000000000ull;
+    // Every parameter change must have reached the plugin first. If the graph
+    // stopped running, events wait in the ring; after 2 s save what we have.
+    bool delivered = W->ctl_consumed.load(std::memory_order_acquire) >= W->ctl_needed;
+    bool stuck = now - W->dirty_since_ns > 2000000000ull;
+    if (!force && ((!quiet && !overdue) || (!delivered && !stuck)))
+        return;
+    if (!delivered && !force)
+        LOG("autosave: %llu parameter change(s) not yet processed by the plugin (graph not running?); saving anyway\n",
+            (unsigned long long)(W->ctl_needed - W->ctl_consumed.load()));
+    uint64_t serial = W->state_serial;
+    std::string err;
+    if (save_state_to(W->state_file, &err)) {
+        W->state_saved = serial;
+        W->state_saves++;
+        W->last_save_ns = now;
+        W->dirty_since_ns = now;
+    } else {
+        LOG("autosave to %s failed: %s\n", W->state_file.c_str(), err.c_str());
+        W->last_save_ns = now; // retry in a second, not every tick
+    }
+}
+
 int m_save_state(sd_bus_message *m, void *, sd_bus_error *e)
 {
     const char *path;
     int r = sd_bus_message_read(m, "s", &path);
     if (r < 0) return r;
-    if (!W->ext_state) return sd_bus_error_set(e, SD_BUS_ERROR_NOT_SUPPORTED, "plugin has no state extension");
-    FILE *f = fopen(path, "wb");
-    if (!f) return sd_bus_error_set_errno(e, errno);
-    clap_ostream os{f, st_write};
-    bool ok = W->ext_state->save(W->plugin, &os);
-    fclose(f);
-    if (!ok) return sd_bus_error_set(e, SD_BUS_ERROR_FAILED, "plugin failed to save state");
+    std::string err;
+    uint64_t serial = W->state_serial;
+    if (!save_state_to(path, &err)) return sd_bus_error_set(e, SD_BUS_ERROR_FAILED, err.c_str());
+    if (W->state_file == path) W->state_saved = serial;
     return sd_bus_reply_method_return(m, "");
 }
 int m_load_state(sd_bus_message *m, void *, sd_bus_error *e)
@@ -887,14 +1015,9 @@ int m_load_state(sd_bus_message *m, void *, sd_bus_error *e)
     const char *path;
     int r = sd_bus_message_read(m, "s", &path);
     if (r < 0) return r;
-    if (!W->ext_state) return sd_bus_error_set(e, SD_BUS_ERROR_NOT_SUPPORTED, "plugin has no state extension");
-    FILE *f = fopen(path, "rb");
-    if (!f) return sd_bus_error_set_errno(e, errno);
-    clap_istream is{f, st_read};
-    bool ok = W->ext_state->load(W->plugin, &is);
-    fclose(f);
-    if (!ok) return sd_bus_error_set(e, SD_BUS_ERROR_FAILED, "plugin failed to load state");
-    rescan_params();
+    std::string err;
+    if (!load_state_from(path, &err)) return sd_bus_error_set(e, SD_BUS_ERROR_FAILED, err.c_str());
+    mark_dirty();
     return sd_bus_reply_method_return(m, "");
 }
 
@@ -903,6 +1026,7 @@ int p_str(sd_bus *, const char *, const char *, const char *prop, sd_bus_message
     if (!strcmp(prop, "PluginId")) return sd_bus_message_append(r, "s", W->plugin->desc->id);
     if (!strcmp(prop, "PluginName")) return sd_bus_message_append(r, "s", W->plugin_name.c_str());
     if (!strcmp(prop, "PluginPath")) return sd_bus_message_append(r, "s", W->plugin_path.c_str());
+    if (!strcmp(prop, "StateFile")) return sd_bus_message_append(r, "s", W->state_file.c_str());
     return sd_bus_message_append(r, "s", W->node_name.c_str());
 }
 int p_u(sd_bus *, const char *, const char *, const char *prop, sd_bus_message *r, void *, sd_bus_error *)
@@ -917,6 +1041,9 @@ int p_t(sd_bus *, const char *, const char *, const char *prop, sd_bus_message *
     if (!strcmp(prop, "Cycles")) return sd_bus_message_append(r, "t", W->cycles.load());
     if (!strcmp(prop, "MidiEvents")) return sd_bus_message_append(r, "t", W->midi_in.load());
     if (!strcmp(prop, "ReleasedNotes")) return sd_bus_message_append(r, "t", W->released.load());
+    if (!strcmp(prop, "StateSerial")) return sd_bus_message_append(r, "t", W->state_serial);
+    if (!strcmp(prop, "StateSaved")) return sd_bus_message_append(r, "t", W->state_saved);
+    if (!strcmp(prop, "StateSaves")) return sd_bus_message_append(r, "t", W->state_saves);
     return sd_bus_message_append(r, "t", W->dropped.load());
 }
 
@@ -940,6 +1067,10 @@ const sd_bus_vtable vtable[] = {
     SD_BUS_PROPERTY("MidiEvents", "t", p_t, 0, 0),
     SD_BUS_PROPERTY("DroppedEvents", "t", p_t, 0, 0),
     SD_BUS_PROPERTY("ReleasedNotes", "t", p_t, 0, 0),
+    SD_BUS_PROPERTY("StateFile", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_PROPERTY("StateSerial", "t", p_t, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+    SD_BUS_PROPERTY("StateSaved", "t", p_t, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+    SD_BUS_PROPERTY("StateSaves", "t", p_t, 0, 0),
     SD_BUS_VTABLE_END,
 };
 
@@ -1086,6 +1217,17 @@ void add_audio_ports(bool input, std::vector<PortGroup> &groups)
 
 void on_signal(void *, int) { pw_main_loop_quit(W->loop); }
 
+std::string json_str(const std::string &v)
+{
+    std::string o = "\"";
+    for (unsigned char c : v) {
+        if (c == '"' || c == '\\') { o += '\\'; o += (char)c; }
+        else if (c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+        else o += (char)c;
+    }
+    return o + "\"";
+}
+
 void usage(FILE *f)
 {
     fputs("usage: backline-plugin-worker --plugin PATH|NAME [options]\n"
@@ -1095,7 +1237,11 @@ void usage(FILE *f)
           "  -m, --midi-follow REGEX  link every MIDI source matching REGEX, now and when hotplugged\n"
           "  -t, --audio-target NODE  link the main output to NODE's playback ports\n"
           "  -o, --osc-port PORT      OSC on 127.0.0.1:PORT (default: any free port)\n"
-          "  -a, --autoconnect        let the session manager link the output (default: off)\n"
+          "  -a, --autoconnect        let the session manager link the output to the default\n"
+          "                           output (the default unless --audio-target is given)\n"
+          "  -A, --no-autoconnect     never let the session manager link the output\n"
+          "  -s, --state-file PATH    load the plugin state from PATH at start (if it exists),\n"
+          "                           and save it there, atomically, whenever it changes\n"
           "      --no-dbus            no D-Bus control object\n"
           "  -l, --list               print the plugins in the file as JSON and exit\n",
           f);
@@ -1112,10 +1258,11 @@ int main(int argc, char **argv)
         {"plugin", required_argument, nullptr, 'p'}, {"id", required_argument, nullptr, 'i'},
         {"name", required_argument, nullptr, 'n'}, {"midi-follow", required_argument, nullptr, 'm'},
         {"audio-target", required_argument, nullptr, 't'}, {"osc-port", required_argument, nullptr, 'o'},
-        {"autoconnect", no_argument, nullptr, 'a'}, {"no-dbus", no_argument, nullptr, 'D'},
+        {"autoconnect", no_argument, nullptr, 'a'}, {"no-autoconnect", no_argument, nullptr, 'A'},
+        {"state-file", required_argument, nullptr, 's'}, {"no-dbus", no_argument, nullptr, 'D'},
         {"list", no_argument, nullptr, 'l'}, {"help", no_argument, nullptr, 'h'}, {}};
     int c;
-    while ((c = getopt_long(argc, argv, "p:i:n:m:t:o:alh", opts, nullptr)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:i:n:m:t:o:aAs:lh", opts, nullptr)) != -1) {
         switch (c) {
         case 'p': w.plugin_path = optarg; break;
         case 'i': w.plugin_id = optarg; break;
@@ -1123,7 +1270,9 @@ int main(int argc, char **argv)
         case 'm': w.midi_follow = optarg; break;
         case 't': w.audio_target = optarg; break;
         case 'o': w.osc_port = atoi(optarg); break;
-        case 'a': w.autoconnect = true; break;
+        case 'a': w.autoconnect = 1; break;
+        case 'A': w.autoconnect = 0; break;
+        case 's': w.state_file = optarg; break;
         case 'D': w.use_dbus = false; break;
         case 'l': w.list_only = true; break;
         case 'h': usage(stdout); return 0;
@@ -1134,6 +1283,8 @@ int main(int argc, char **argv)
         usage(stderr);
         return 2;
     }
+    if (w.autoconnect < 0)
+        w.autoconnect = w.audio_target.empty(); // instruments play to the default output (DECISIONS D2)
     if (!w.midi_follow.empty())
         w.midi_re.emplace(w.midi_follow, std::regex::ECMAScript | std::regex::icase);
 
@@ -1145,6 +1296,16 @@ int main(int argc, char **argv)
     w.main_event = pw_loop_add_event(l, on_main_event, nullptr);
 
     load_plugin();
+    if (!w.state_file.empty()) {
+        struct stat st;
+        std::string err;
+        if (stat(w.state_file.c_str(), &st) == 0) {
+            if (load_state_from(w.state_file, &err))
+                LOG("restored state from %s (%lld bytes, %zu params)\n", w.state_file.c_str(), (long long)st.st_size, w.params.size());
+            else
+                LOG("could not restore state from %s: %s; starting from defaults\n", w.state_file.c_str(), err.c_str());
+        }
+    }
     if (w.node_name.empty())
         w.node_name = std::string("backline.") + w.plugin->desc->id;
     setup_osc();
@@ -1170,7 +1331,7 @@ int main(int argc, char **argv)
                                                PW_KEY_MEDIA_CLASS, instrument ? "Stream/Output/Audio" : "Audio/Filter",
                                                PW_KEY_NODE_NAME, w.node_name.c_str(),
                                                PW_KEY_NODE_DESCRIPTION, desc.c_str(),
-                                               PW_KEY_NODE_AUTOCONNECT, w.autoconnect ? "true" : "false",
+                                               PW_KEY_NODE_AUTOCONNECT, w.autoconnect > 0 ? "true" : "false",
                                                PW_KEY_NODE_ALWAYS_PROCESS, "true",
                                                "backline.plugin.format", "clap",
                                                "backline.plugin.id", w.plugin->desc->id,
@@ -1197,19 +1358,22 @@ int main(int argc, char **argv)
     timespec hk{0, 20 * 1000000L};
     pw_loop_update_timer(l, w.housekeeping, &hk, &hk, false);
 
-    printf("{\"node\": \"%s\", \"plugin\": \"%s\", \"osc_port\": %d, \"dbus\": \"%s\", \"pid\": %d}\n",
-           w.node_name.c_str(), w.plugin->desc->id, w.osc_port, w.bus_name.c_str(), getpid());
+    printf("{\"node\": %s, \"plugin\": %s, \"plugin_path\": %s, \"osc_port\": %d, \"dbus\": %s, \"pid\": %d}\n",
+           json_str(w.node_name).c_str(), json_str(w.plugin->desc->id).c_str(), json_str(w.plugin_path).c_str(),
+           w.osc_port, json_str(w.bus_name).c_str(), getpid());
     fflush(stdout);
 
     pw_main_loop_run(w.loop);
 
     LOG("shutting down\n");
+    autosave(true);
     stop_audio();
     pw_filter_disconnect(w.filter);
     w.plugin->deactivate(w.plugin);
+    w.plugin->destroy(w.plugin); // may unregister its timers itself
     for (auto &[id, s] : w.timers)
         pw_loop_destroy_source(l, s);
-    w.plugin->destroy(w.plugin);
+    w.timers.clear();
     w.entry->deinit();
     pw_filter_destroy(w.filter);
     bl_graph_destroy(w.graph);
