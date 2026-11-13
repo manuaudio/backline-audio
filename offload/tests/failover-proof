@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# failover-proof: network DSP offload on one box, no sudo, no audio server.
+#
+# Three "boxes", each its own network stack: the console in a user + network
+# namespace (unshare -rn), and two DSP servers, primary and mirror, each in a
+# network namespace of its own inside it, joined to the console by a veth
+# pair (10.77.1.0/24 and 10.77.2.0/24). Each server is backline-offloadd with
+# one slot: the slot test effect (37 frames of latency) in a backline-slot-host
+# over Slot1. The console (backline-test-offload-console) sends one 64-frame
+# stereo block per period to both and checks every returned sample.
+#
+#   1. one server: the lockstep loop, every block back in its period
+#   2. primary and mirror, the primary server killed (SIGKILL) mid-run: the
+#      mirror's blocks take over with no gap
+#   3. primary and mirror, the primary's plugin crashes mid-run: the mirror
+#      takes over with no gap; the primary restarts its chain meanwhile
+#
+# Usage: offload/tests/failover-proof BUILD_DIR [SECONDS]
+set -uo pipefail
+B=$(cd "${1:?build dir}" && pwd)
+S=${2:-8}
+here=$(cd "$(dirname "$0")" && pwd)
+if [[ -z ${BL_OFFLOAD_NS:-} ]]; then
+  for t in unshare ip nsenter; do command -v $t >/dev/null || { echo "skipped: no $t"; exit 77; }; done
+  unshare -rn true 2>/dev/null || { echo "skipped: user namespaces are not available here"; exit 77; }
+  BL_OFFLOAD_NS=1 exec unshare -rn --kill-child bash "$0" "$@"
+fi
+out=$here/../../tests/out/offload
+rm -rf "$out"; mkdir -p "$out"
+export LV2_PATH=$B/slot-plugins/lv2
+empty=$(mktemp -d)
+export PIPEWIRE_RUNTIME_DIR=$empty PIPEWIRE_REMOTE=$empty/none
+PLUG="$B/slot-plugins/backline-test-slotfx.clap#backline.test.slotfx-lat37"
+pids=()
+cleanup() { for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; done; rm -rf "$empty"; }
+trap cleanup EXIT
+ip link set lo up
+
+# a box: a network namespace held by a sleeping process, a veth to it
+box() { # index -> sets BOXPID
+  unshare -n sleep infinity & BOXPID=$!
+  pids+=("$BOXPID")
+  sleep 0.1
+  ip link add vc$1 type veth peer name vs$1
+  ip link set vs$1 netns "$BOXPID"
+  ip addr add 10.77.$1.1/24 dev vc$1
+  ip link set vc$1 up
+  nsenter -t "$BOXPID" -n ip link set lo up
+  nsenter -t "$BOXPID" -n ip addr add 10.77.$1.2/24 dev vs$1
+  nsenter -t "$BOXPID" -n ip link set vs$1 up
+}
+
+server() { # box-pid name -> sets SRVPID
+  local st=$out/state-$2
+  nsenter -t "$1" -n "$B/backline-offloadd" --listen 0.0.0.0 --slot-host "$B/backline-slot-host" --state-dir "$st" \
+    --spin --slot 2 --plugin "$PLUG" >"$out/$2.ready" 2>>"$out/$2.log" &
+  SRVPID=$!
+  pids+=("$SRVPID")
+  for _ in $(seq 200); do grep -q ready "$out/$2.ready" 2>/dev/null && return 0; sleep 0.05; done
+  echo "server $2 did not come up"; cat "$out/$2.log"; return 1
+}
+
+rc=0
+run() { # label args...
+  local label=$1; shift
+  local line
+  if line=$("$B/backline-test-offload-console" --spin "$@" 2>>"$out/console.log"); then
+    echo "  ok   $label: $line"
+  else
+    echo "  FAIL $label: $line"; tail -3 "$out/console.log" | sed 's/^/       /'; rc=1
+  fi
+  echo "{\"label\": \"$label\", \"result\": ${line:-null}}" >>"$out/results.jsonl"
+}
+
+echo "failover-proof: Offload1, one box, three network stacks ($(uname -r))"
+box 1; A=$BOXPID
+box 2; Bx=$BOXPID
+for i in 1 2; do ping -c1 -W1 10.77.$i.2 >/dev/null 2>&1 || { echo "no link to box $i"; exit 1; }; done
+
+server "$A" primary || exit 1; PA=$SRVPID
+run "one server, lockstep" --server 10.77.1.2:49800 --seconds "$S"
+server "$Bx" mirror || exit 1; PB=$SRVPID
+half=$(awk "BEGIN{print $S/2}")
+run "primary killed, mirror takes over" --server 10.77.1.2:49800 --server 10.77.2.2:49800 --seconds "$S" \
+  --kill-pid "$PA" --at "$half"
+wait "$PA" 2>/dev/null
+server "$A" primary2 || exit 1
+run "primary's plugin crashes, mirror takes over" --server 10.77.1.2:49800 --server 10.77.2.2:49800 --seconds "$S" \
+  --crash-primary --at "$half"
+sleep 0.5
+grep -h 'died\|back,' "$out"/primary2.log | sed 's/^/  primary: /'
+exit $rc

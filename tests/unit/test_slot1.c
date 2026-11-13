@@ -165,12 +165,12 @@ int main(void)
 		for (int i = 0; i < N; i++) {
 			int64_t n = n0 + i;
 			float dry = n - (int64_t)L >= 0 ? x(n - L) : 0.f;
-			float want = r == BL_SLOT1_WET ? 0.5f * x(n) : dry;
+			float want = r == BL_SLOT1_WET || r == BL_SLOT1_RESUMED ? 0.5f * x(n) : dry;
 			float err = fabsf(o0[i] - want) + fabsf(o1[i] - want);
 			if (err > worst)
 				worst = err;
 		}
-		if (r == BL_SLOT1_WET) wet++;
+		if (r == BL_SLOT1_WET || r == BL_SLOT1_RESUMED) wet++;
 		else if (r == BL_SLOT1_LATE) late++;
 		else if (r == BL_SLOT1_STALLED) stalled++;
 		else notready++;

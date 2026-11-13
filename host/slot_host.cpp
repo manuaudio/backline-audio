@@ -135,6 +135,7 @@ struct G {
     int shm_fd = -1;
     std::string name = "slot";
     int rt_priority = 80;
+    uint64_t spin_ns = 0;                 // --spin-us: spin on req before sleeping
     std::string state_dir;
     std::vector<Slot *> slots;
 
@@ -390,7 +391,7 @@ void audio_main()
     bl_slot1_header *h = g.h;
     uint32_t seen = g.start_seen;
     for (;;) {
-        uint32_t seq = bl_slot1_sandbox_wait(h, seen, &g.quit);
+        uint32_t seq = bl_slot1_sandbox_wait_spin(h, seen, &g.quit, g.spin_ns);
         if (g.quit)
             break;
         seen = seq;
@@ -641,7 +642,9 @@ void usage(FILE *f)
             "  --format F          clap, vst3 or lv2, for the --plugin that follows\n"
             "  --name NAME         for the log and the ready line (default \"slot\")\n"
             "  --state-dir DIR     restore each insert from DIR/insert<k><ext> and keep it saved there\n"
-            "  --rt-priority N     SCHED_FIFO priority of the audio thread (default 80; 0: none)\n");
+            "  --rt-priority N     SCHED_FIFO priority of the audio thread (default 80; 0: none)\n"
+            "  --spin-us N         after each request, spin up to N µs for the next before sleeping\n"
+            "                      (a DSP server's chain on a core of its own)\n");
 }
 
 } // namespace
@@ -659,7 +662,8 @@ int main(int argc, char **argv)
         {"shm", required_argument, nullptr, 's'},      {"shm-fd", required_argument, nullptr, 'F'},
         {"plugin", required_argument, nullptr, 'p'},   {"format", required_argument, nullptr, 'f'},
         {"name", required_argument, nullptr, 'n'},     {"state-dir", required_argument, nullptr, 'S'},
-        {"rt-priority", required_argument, nullptr, 'r'}, {"help", no_argument, nullptr, 'h'},
+        {"rt-priority", required_argument, nullptr, 'r'}, {"spin-us", required_argument, nullptr, 'u'},
+        {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}};
     Fmt next_fmt = Fmt::Auto;
     int c;
@@ -692,6 +696,7 @@ int main(int argc, char **argv)
         case 'n': g.name = optarg; break;
         case 'S': g.state_dir = optarg; break;
         case 'r': g.rt_priority = atoi(optarg); break;
+        case 'u': g.spin_ns = (uint64_t)atoll(optarg) * 1000; break;
         case 'h': usage(stdout); return 0;
         default: usage(stderr); return 2;
         }

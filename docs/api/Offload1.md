@@ -1,9 +1,19 @@
-# `io.github.manuaudio.Backline.Offload1`: network DSP offload (draft)
+# `io.github.manuaudio.Backline.Offload1`: network DSP offload
 
-**Status: design draft plus a single-box proof** (`offload/`,
-[docs/proofs/offload-proof.txt](../proofs/offload-proof.txt)). Nothing in this
-file is implemented as a service yet. The method and frame names are the
-proposal that the proof code was built to test. Licence: MIT, like the rest of
+**Status, 2026-11-13:**
+
+| Part | State |
+|---|---|
+| The server node, `backline-offloadd` | **Built** |
+| The console's data plane, `backline/offload1.h` (send, wait, mirror failover) | **Built** |
+| The `BLO1` frame | **v1** |
+| The D-Bus control plane on the console box (below) | Still a **draft** |
+
+Proofs:
+- [docs/proofs/offload-failover-proof.txt](../proofs/offload-failover-proof.txt):
+  the server, mirror takeover, one box with three network stacks.
+- [docs/proofs/offload-proof.txt](../proofs/offload-proof.txt): the first
+  loop, and capacity. Licence: MIT, like the rest of
 Backline. The offload is open infrastructure. Any mixer program uses it
 through this API, and no part of it is specific to one console.
 
@@ -28,13 +38,25 @@ dedicated Ethernet link, the way SoundGrid servers do for LV1 and SuperRack.
 
 | Piece | Where | What |
 |---|---|---|
-| `backline-offloadd` | each DSP server | Runs the slots. Each slot is a CLAP chain in a lockstep loop, on its own isolated core, driven by packet arrival. The server has no clock of its own. Plugins are hosted by `backline-plugin-worker` code (`host/plugin.h`). For the proof, `offload/rack.h` runs them in process. |
-| `libbackline-offload` | console process | Data plane, called from the engine's realtime thread: `blo_send(slot, block)`, `blo_wait(slot, deadline)`. No allocation, no locks. The only syscall is the send. With the AF_XDP path, there are no syscalls at all. |
+| `backline-offloadd` (built) | each DSP server | Runs the slots. Each slot is a plugin chain (CLAP, VST3, LV2) in a `backline-slot-host`, over [Slot1](Slot1.md) shared memory, exactly as a mixing engine hosts a strip's inserts. A lockstep loop per slot is driven by packet arrival, on its own core with `--spin`. The server has no clock of its own. A supervisor per slot restarts a crashed chain on the same memory, with its saved state. |
+| `backline/offload1.h` (built) | console process | Data plane, header-only C, called from the engine's realtime thread: `blo1_client_send()` sends the block to the primary and the mirror; `blo1_client_wait(deadline)` returns the active server's block, the mirror's (a takeover), or the console's delayed dry. No allocation, no locks; the syscalls are `send`, `recv` and (unless spinning) `ppoll`. |
 | Offload1 D-Bus object | console box | Control plane: discover servers, create and move slots, read status. It is never on the audio path. |
 
 ## Data plane: the `BLO1` frame (proof: `offload/offload-proof.cpp`)
 
-**Transport: raw Ethernet (L2), EtherType 0x88B5.** 0x88B5 is the IEEE "local
+**v1 as built (`backline/offload1.h`): UDP, one slot per port** (slot *k*
+on `BLO1_DEFAULT_PORT` 49800 + *k*), with the 32-byte header below. The
+header's last word is now `slot u16 | part u16`; `part` must be 0 in v1.
+Control frames use the same header: `BLO1_F_HELLO` asks for the slot's
+latency, which the reply carries in `server_us`. `BLO1_F_PARAM` carries up
+to 32 Slot1 events, each `insert u8 | type u8 | offset u16 | id u32 |
+value f64`, and `part` is the count; they are applied with the next block.
+On a block the server sends back, `BLO1_F_DRY` means the samples are the
+server's delayed dry, so do not use them. The raw-Ethernet transport below
+is the production target. It is measured in `offload/offload-proof.cpp`, but
+the server does not speak it yet.
+
+**Transport target: raw Ethernet (L2), EtherType 0x88B5.** 0x88B5 is the IEEE "local
 experimental" EtherType, so a production version needs its own registered
 value. There is no IP, UDP, RTP or PTP on the audio path. The transport is
 `AF_XDP` (zero-copy, busy-polled) where the NIC supports it, and otherwise
@@ -44,8 +66,8 @@ debugging and for the proof's loopback runs.
 ```
 Ethernet header (14 B) | Hdr (32 B) | samples
 Hdr: magic u32 "BLO1" | seq u32 (block number, console's count)
-     frames u16 | channels u16 | flags u32 (bit0: server error, block is dry)
-     t_send_ns u64 (console clock, echoed) | server_us u32 | reserved u32
+     frames u16 | channels u16 | flags u32 (bit0 DRY, bit1 PARAM, bit2 HELLO)
+     t_send_ns u64 (console clock, echoed) | server_us u32 | slot u16 | part u16
 samples: planar float32, channels x frames
 ```
 
@@ -93,11 +115,24 @@ silently.** A slot that fits no mode at the current period is refused with
 
 ## Failover
 
-- **`redundancy=mirror`:** a hot spare runs the same slot on the same input,
-  because the console multicasts the input frame to both servers. The console
-  takes the first valid return for each `seq`. When a server dies, the next
-  block comes from the mirror, with **0 frames of gap** and no switchover mute.
-  Mirrors match only as far as the plugin is deterministic.
+- **`redundancy=mirror`** (built):
+  - **The setup.** A hot spare runs the same slot on the same input: the
+    console sends every block to both servers.
+  - **Which block plays.** The console listens to one server, the *active*
+    one. At its deadline, if the active server's block is missing or marked
+    `DRY`, it uses the mirror's block for that same `seq`. The mirror then
+    becomes active (`BLO1_TAKEOVER`).
+  - **Why one active server, not the first block to arrive.** A server that
+    comes back after a crash starts its plugins from silence. Taking the
+    first valid block would switch back to that server while its output
+    differs from the mirror's.
+  - **The gap is 0 blocks.** The measured takeover is the block the primary
+    failed on, with every sample right (§ Proof below).
+  - **Determinism.** Mirrors match only as far as the plugin is
+    deterministic.
+  - **What counts as failed.** A server whose chain is late, restarting, or
+    just back after a gap (Slot1's `RESUMED`) marks its blocks `DRY`, so the
+    mirror's block is used.
 - **No mirror, or both servers late:** the console substitutes the dry signal
   for that block, with a one-block crossfade, and counts a `Miss`. After 3
   misses in a row the slot is marked `Down`. It is then moved to a spare if one
@@ -136,3 +171,45 @@ boundaries.
 - Use jumbo frames, NIC interrupt coalescing, or EEE on the offload link.
 - Accept lookahead plugins on a `same-cycle` slot without saying how much
   latency they add.
+
+## Proof: the server, and a mirror takeover (`offload/tests/failover-proof`)
+
+Run on one box with no sudo and no audio server, and registered as a ctest
+(`offload-failover`). The setup:
+
+- **Three network stacks.** The console is in a user and network namespace;
+  each server is in a network namespace of its own inside it, joined by a
+  veth pair.
+- **The chain.** Each server runs `backline-offloadd --spin` with one slot:
+  the Slot1 test effect (gain −6 dB, a 37-frame latency).
+- **The console** (`backline-test-offload-console --spin`) sends one stereo
+  block of 64 frames per period (48 kHz) and checks every returned sample
+  against g·x[n−37].
+- **Priority.** Normal: this box has no realtime limits yet (P5).
+
+Measured on 2026-11-13, 6,000 blocks (8 s) per run:
+
+| Run | Blocks served (primary / mirror) | Takeover | Gap blocks | Max error | Round trip p50 / p99 / max |
+|---|---|---|---|---|---|
+| One server, lockstep | 6000 / — | — | 0 | 3e-8 | 10 / 31 / 275 µs |
+| Primary server killed (`SIGKILL`) at block 3000 | 3000 / 3000 | at block 3000 | **0** | 3e-8 | 17 / 76 / 252 µs |
+| Primary's plugin crashes at block 3000 | 3000 / 3000 | at block 3000 | **0** | 3e-8 | 14 / 64 / 251 µs |
+
+- **The killed primary** costs no block: block 3000 comes from the mirror,
+  and so does every block after it.
+- **The crashed plugin.** The primary's chain is restarted on the same
+  memory 2.6 ms after the crash, with its saved gain. It answers `DRY` until
+  it is back, and the console stays on the mirror.
+- **Blocking waits miss.** With sleeping waits instead of `--spin`, the
+  same loop missed about 2% of blocks at normal priority. That matches the
+  first proof: spinning on a core of its own is how a server runs.
+- **An occasional miss.** In about one run in three, one block (in 6,000)
+  outside the failure window had no server answer. That happened while the
+  crashed primary was dumping core on a box with no realtime priority. The
+  console then played its dry, delayed by the latency, with every sample
+  still right. The test allows 0.1% of such blocks, and none in the failure
+  window.
+
+**Next:** the raw-Ethernet (AF_PACKET / AF_XDP) transport in the server, the
+`next-cycle` mode, the console's D-Bus control plane, and a run on two
+machines.

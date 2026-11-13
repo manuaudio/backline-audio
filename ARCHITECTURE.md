@@ -660,6 +660,22 @@ effect-insert component.
 - **Omarchy.** A panel row listing surfaces is plausible once a mixer uses
   them.
 
+### 2.10 Network DSP offload: `backline-offloadd` (Offload1)
+
+- **What it is.** A DSP server on its own box, adding plugin capacity over
+  Ethernet the way SoundGrid servers do
+  ([docs/api/Offload1.md](docs/api/Offload1.md)).
+- **How a slot runs.** Each slot is a plugin chain in a `backline-slot-host`
+  over Slot1, so the server hosts plugins exactly as a local engine does.
+- **The loop.** In lockstep with the console: a block in is processed and
+  sent straight back, and the server has no clock of its own. `--spin`
+  gives each slot a core and no sleeping wake-ups.
+- **The console's side** is `backline/offload1.h`. It sends to a primary and
+  a mirror and listens to one active server. A missing or dry block is taken
+  from the mirror, which then becomes active, so a takeover costs 0 blocks.
+- **Status.** Built and measured on one box (§4.15). The raw-Ethernet
+  transport and the console's D-Bus control plane are next.
+
 ## 3. What exists and is reused (not rebuilt)
 
 | Need | Reused | Why not more |
@@ -1154,6 +1170,18 @@ Numbers are in [Slot1.md §7](docs/api/Slot1.md); the full report is in
 - **Round trip** at 64 frames: p99 155–180 µs against a 667 µs deadline, at
   normal priority. The realtime run waits for the hold to lift and for the
   P5 realtime limits.
+
+### 4.15 Network offload (`offload/tests/failover-proof`)
+
+On one box with no sudo, the console and two servers each have their own
+network stack: user and network namespaces with veth pairs. The servers run
+at normal priority with `--spin`, each slot holding the test effect with
+37 frames of latency. In 6,000-block runs at 64 frames: the round trip is
+p50 10–17 µs and p99 31–76 µs. A primary killed with `SIGKILL`, and a
+primary whose plugin segfaults, are both taken over by the mirror on the
+failing block, with **0 gap blocks** and every sample within 3e-8 of
+g·x[n−37]. The crashed chain is back in 2.6 ms with its state. Full report:
+`docs/proofs/offload-failover-proof.txt`.
 
 ## 5. Build order
 

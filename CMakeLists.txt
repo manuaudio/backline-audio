@@ -68,6 +68,13 @@ if(BACKLINE_OFFLOAD_PROOF)
   endforeach()
 endif()
 
+# DSP offload server node (Offload1): slots hosted through Slot1 and
+# backline-slot-host, a lockstep UDP loop, a supervisor per slot.
+add_executable(backline-offloadd offload/offloadd.c)
+target_include_directories(backline-offloadd PRIVATE lib/include)
+target_link_libraries(backline-offloadd PRIVATE Threads::Threads)
+install(TARGETS backline-offloadd RUNTIME DESTINATION bin)
+
 # LV2 through lilv (ISC).
 pkg_check_modules(LILV IMPORTED_TARGET lilv-0)
 option(BACKLINE_LV2 "Host LV2 plugins in the worker (needs lilv)" ${LILV_FOUND})
@@ -312,6 +319,13 @@ if(BUILD_TESTING)
   string(REPLACE ";" "," _slot_formats "${_slot_formats}")
   add_test(NAME slot-proof COMMAND ${PROJECT_SOURCE_DIR}/tests/slot-proof ${CMAKE_BINARY_DIR} ${_slot_formats})
   set_tests_properties(slot-proof PROPERTIES TIMEOUT 300)
+  # Offload: two servers (primary, mirror) in their own network namespaces
+  # inside a user namespace (no sudo); skipped where user namespaces are off.
+  add_executable(backline-test-offload-console tests/tools/offload-console.c)
+  target_include_directories(backline-test-offload-console PRIVATE lib/include)
+  target_link_libraries(backline-test-offload-console PRIVATE Threads::Threads m)
+  add_test(NAME offload-failover COMMAND ${PROJECT_SOURCE_DIR}/offload/tests/failover-proof ${CMAKE_BINARY_DIR})
+  set_tests_properties(offload-failover PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 endif()
 
 # Clock service: transport, tempo, LTC/MTC, Ableton Link (clock/).

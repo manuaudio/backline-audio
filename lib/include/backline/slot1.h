@@ -286,6 +286,10 @@ enum bl_slot1_result {
 	BL_SLOT1_LATE = 1,       /* missed the deadline: dry, delayed by the chain's latency */
 	BL_SLOT1_STALLED = 2,    /* still waiting for a late request: dry, delayed */
 	BL_SLOT1_NOT_READY = 3,  /* no sandbox serving (starting, crashed, restarting): dry, delayed */
+	BL_SLOT1_RESUMED = 4,    /* the chain's output again, but it missed input before this block: until
+				  * `latency` frames after the gap it holds what it had before (or silence, after
+				  * a restart). An engine that wants it seamless crossfades; a mirror prefers the
+				  * other copy */
 };
 
 struct bl_slot1_engine {
@@ -306,6 +310,7 @@ struct bl_slot1_engine {
 	enum bl_slot1_result result;
 	uint32_t frames;
 	uint64_t t0, deadline_ns;
+	uint32_t resume_frames;  /* frames still inside the latency after a gap */
 };
 
 /* Creates the memory (memfd, sealed against resizing), maps and locks it, and
@@ -478,10 +483,13 @@ static inline enum bl_slot1_result bl_slot1_engine_begin(struct bl_slot1_engine 
 			e->stalled = 0;
 			e->seq = bl_slot1_load(&h->req);
 			h->e_recoveries++;
+			e->resume_frames = e->latency + 1;
 		}
 	}
-	if (state != BL_SLOT1_READY)
+	if (state != BL_SLOT1_READY) {
+		e->resume_frames = e->latency + 1;
 		return e->result = BL_SLOT1_NOT_READY;
+	}
 	if (e->stalled)
 		return e->result = BL_SLOT1_STALLED;
 
@@ -541,6 +549,11 @@ static inline enum bl_slot1_result bl_slot1_engine_end(struct bl_slot1_engine *e
 				memcpy(out[c], bl_slot1_audio(h, c), frames * sizeof(float));
 			h->steady += frames;
 			e->dly_pos = (e->dly_pos + frames) % len;
+			if (e->resume_frames) {
+				/* this block starts inside the window after a gap */
+				e->resume_frames = e->resume_frames > frames ? e->resume_frames - frames : 0;
+				return BL_SLOT1_RESUMED;
+			}
 			return BL_SLOT1_WET;
 		}
 		e->stalled = 1;
@@ -616,6 +629,25 @@ static inline uint32_t bl_slot1_sandbox_wait(struct bl_slot1_header *h, uint32_t
 			return seen;
 		bl_slot1_futex_wait(&h->req, seen, 0);
 	}
+}
+
+/* The same, spinning on `req` for up to spin_ns before sleeping: for a
+ * sandbox on a core of its own (a DSP server), where a sleeping wake-up costs
+ * more than the core. */
+static inline uint32_t bl_slot1_sandbox_wait_spin(struct bl_slot1_header *h, uint32_t seen, const volatile int *quit,
+						  uint64_t spin_ns)
+{
+	if (spin_ns) {
+		uint64_t until = bl_slot1_now_ns() + spin_ns;
+		do {
+			uint32_t r = bl_slot1_load(&h->req);
+			if (r != seen)
+				return r;
+			if (quit && *quit)
+				return seen;
+		} while (bl_slot1_now_ns() < until);
+	}
+	return bl_slot1_sandbox_wait(h, seen, quit);
 }
 
 static inline void bl_slot1_sandbox_done(struct bl_slot1_header *h, uint32_t seq)

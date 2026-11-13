@@ -265,7 +265,8 @@ static void settle(struct chain **cs, int n)
 		for (int i = 0; i < n; i++) {
 			cycle(cs[i], in, out, t);
 			uint32_t s = bl_slot1_load(&cs[i]->e.h->latency_serial);
-			if (bl_slot1_load(&cs[i]->e.h->state) != BL_SLOT1_READY || s != serial[i] || !s)
+			if (bl_slot1_load(&cs[i]->e.h->state) != BL_SLOT1_READY || s != serial[i] || !s ||
+			    cs[i]->e.resume_frames)
 				all = false;
 			serial[i] = s;
 		}
@@ -459,7 +460,7 @@ static int t_deadline(void)
 	uint64_t sleep_us = 3 * period_ns() / 1000; /* three periods: one miss, then stalled blocks */
 	static float ibuf[CH][1024], obuf[CH][1024];
 	float *in[CH] = { ibuf[0], ibuf[1] }, *out[CH] = { obuf[0], obuf[1] };
-	int wet = 0, late = 0, stalled = 0, notready = 0, first_late = -1, recovered_at = -1;
+	int wet = 0, late = 0, stalled = 0, notready = 0, first_late = -1, recovered_at = -1, resumed = 0;
 	float worst_wet = 0, worst_dry = 0;
 	int64_t skip_until = 0;
 	enum bl_slot1_result prev = BL_SLOT1_WET;
@@ -475,8 +476,10 @@ static int t_deadline(void)
 		if (k == slow_at + 1)
 			set_param(&c, 0, "sleep_us", 0); /* delivered with the first request after the stall */
 		enum bl_slot1_result r = cycle(&c, in, out, t);
-		bool is_wet = r == BL_SLOT1_WET;
-		if (is_wet && prev != BL_SLOT1_WET && k > 0) {
+		bool is_wet = r == BL_SLOT1_WET || r == BL_SLOT1_RESUMED;
+		if (r == BL_SLOT1_RESUMED)
+			resumed++;
+		if (is_wet && prev != BL_SLOT1_WET && prev != BL_SLOT1_RESUMED && k > 0) {
 			/* the chain missed the stalled blocks' input: its first L frames
 			 * after coming back are from before the gap */
 			skip_until = n0 + L;
@@ -512,6 +515,8 @@ static int t_deadline(void)
 	CHECK(worst_dry < 1e-6f, "a dry block differs from the input delayed by %u by %g", L, worst_dry);
 	CHECK(worst_wet < 1e-5f, "a wet block differs from g·x[n−L] by %g", worst_wet);
 	CHECK(notready == 0, "%d blocks not ready", notready);
+	CHECK(resumed == (int)((L + 1 + N - 1) / N), "%d blocks marked resumed, expected %u (the latency after the gap)", resumed,
+	      (L + 1 + N - 1) / N);
 	printf("{\"test\": \"deadline\", \"latency\": %u, \"blocks\": %d, \"wet\": %d, \"late\": %d, \"stalled\": %d, "
 	       "\"first_late\": %d, \"recovered_at\": %d, \"dry_max_error\": %g, \"wet_max_error\": %g, \"misses_header\": %llu}\n",
 	       L, total, wet, late, stalled, first_late, recovered_at, worst_dry, worst_wet,
@@ -625,8 +630,8 @@ static int t_crash(void)
 		bl_slot1_engine_begin(&b.e, (const float *const *)in, N, dl, NULL);
 		enum bl_slot1_result ra = bl_slot1_engine_end(&a.e, outa);
 		enum bl_slot1_result rb = bl_slot1_engine_end(&b.e, outb);
-		bool aw = ra == BL_SLOT1_WET, bw = rb == BL_SLOT1_WET;
-		if (aw && aprev != BL_SLOT1_WET && k > crash_at) {
+		bool aw = ra == BL_SLOT1_WET || ra == BL_SLOT1_RESUMED, bw = rb == BL_SLOT1_WET;
+		if (aw && aprev != BL_SLOT1_WET && aprev != BL_SLOT1_RESUMED && k > crash_at) {
 			a_skip = n0 + L; /* a new plugin: its delay line starts empty */
 			if (a_back < 0) {
 				a_back = k;
