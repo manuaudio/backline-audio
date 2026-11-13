@@ -909,9 +909,13 @@ const sd_bus_vtable vtable[] = {
 };
 
 // Housekeeping: publish what the process thread and Link changed.
-int on_tick(sd_event_source *s, uint64_t usec, void *)
+int on_tick(sd_event_source *s, uint64_t, void *)
 {
-	sd_event_source_set_time(s, usec + 50000);
+	// Re-arm 50 ms from now, not from the last deadline: the source starts at time 0, so
+	// "deadline + 50 ms" stays in the past for the whole uptime and the loop spins at 100% CPU.
+	uint64_t now = 0;
+	sd_event_now(sd_event_source_get_event(s), CLOCK_MONOTONIC, &now);
+	sd_event_source_set_time(s, now + 50000);
 	bool rolling = C.rolling.load();
 	int64_t f = C.frame.load();
 	bool moved = C.last_pub_frame >= 0 && !rolling && f != C.last_pub_frame;
