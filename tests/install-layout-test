@@ -46,6 +46,16 @@ if grep -q 'BL_MIDIPROF_DATADIR' "$build/build.ninja" 2>/dev/null; then
     || { echo "not ok - controld looks for the MIDI profiles in $datadir/backline/midi-profiles"; exit 1; }
   echo "ok - the MIDI profiles are installed where controld looks for them ($datadir/backline/midi-profiles)"
 fi
+# Every file the omarchy-backline-* commands read from their lib/ is installed
+# (omarchy-backline-src reads a .jq, omarchy-backline-setup a .py).
+src=$(cd "$(dirname "$0")/.." && pwd)
+omlib=$(find "$dest" -type d -path '*/backline-audio/omarchy/lib' -print -quit)
+if [[ -n $omlib ]]; then
+  for f in "$src"/omarchy/lib/*; do
+    [[ -f $omlib/${f##*/} ]] || { echo "not ok - omarchy lib file ${f##*/} is installed"; exit 1; }
+  done
+  echo "ok - every omarchy lib file is installed ($(ls "$src"/omarchy/lib | wc -l))"
+fi
 hook=$(find "$dest" -name backline-plugins.hook -print -quit)
 if [[ $prefix == /usr ]]; then
   [[ -n $hook ]] || { echo "not ok - a /usr install has the pacman hook"; exit 1; }

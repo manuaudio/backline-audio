@@ -16,10 +16,14 @@ out=$here/out
 rm -rf "$out"; mkdir -p "$out/pkg"
 cp "$here/PKGBUILD" "$here/backline-audio.install" "$out/pkg/"
 ver=$(sed -n 's/^pkgver=//p' "$here/PKGBUILD")
+proj=$(sed -n 's/^project(backline VERSION \([0-9.]*\).*/\1/p' "$repo/CMakeLists.txt")
+[[ $ver == "$proj" ]] || { echo "PKGBUILD pkgver=$ver, but CMakeLists.txt project() says $proj" >&2; exit 1; }
 if [[ ${1:-} == --local ]]; then
   git -C "$repo" archive --format=tar.gz --prefix="backline-audio-$ver/" HEAD >"$out/pkg/backline-audio-$ver.tar.gz"
   # the first source becomes the local tarball (checksum skipped for it)
   sed -i "s|^source=(\"\$pkgname-\$pkgver.tar.gz::[^\"]*\"|source=(\"\$pkgname-\$pkgver.tar.gz\"|" "$out/pkg/PKGBUILD"
+  sed -i "s|^sha256sums=('[0-9a-f]*'|sha256sums=('SKIP'|" "$out/pkg/PKGBUILD"
+  grep -q "^sha256sums=('SKIP'" "$out/pkg/PKGBUILD" || { echo "could not skip the local tarball's checksum" >&2; exit 1; }
   echo "source: HEAD of $repo ($(git -C "$repo" rev-parse --short HEAD)) as backline-audio-$ver.tar.gz"
 fi
 docker run --rm -v "$out/pkg:/pkg" archlinux:latest bash -euo pipefail -c '
