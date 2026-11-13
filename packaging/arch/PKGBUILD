@@ -2,18 +2,21 @@
 # SPDX-License-Identifier: MIT
 #
 # Backline for Arch Linux, for the AUR (docs/AUR.md). Checked in a clean
-# container with packaging/arch/container-check. On a release: tag
-# v$pkgver, then updpkgsums and a new .SRCINFO.
+# container with packaging/arch/container-check (which also checks that
+# pkgver is the version in CMakeLists.txt's project()). On a release: tag
+# v$pkgver, then updpkgsums and a new .SRCINFO. Before a tag exists,
+# `container-check --local` builds this checkout's HEAD instead.
 pkgname=backline-audio
 pkgver=0.4.0
 pkgrel=1
-pkgdesc='Mac-style pro audio for PipeWire and Omarchy: plugin host (CLAP, VST3, LV2), plugin index, recorder, player, clock (LTC, MTC, Link), OSC/MIDI control'
+pkgdesc='Mac-style pro audio for PipeWire and Omarchy: plugin host (CLAP, VST3, LV2), plugin index, recorder, player, clock (LTC, MTC, Link), OSC/MIDI control, control surfaces'
 arch=(x86_64 aarch64)
 url='https://github.com/manuaudio/backline-audio'
 # MIT for everything; backline-clockd is built with Ableton Link, which makes
 # that one binary GPL-2.0-or-later (docs/DECISIONS.md D3)
 license=('MIT' 'GPL-2.0-or-later')
 depends=(
+  avahi
   bash
   glibc
   json-c
@@ -30,7 +33,8 @@ depends=(
 )
 makedepends=(alsa-lib asio cmake ninja vst3sdk)
 optdepends=('clap-validator: deeper validation of CLAP plugins in the registry'
-            'jq: the omarchy-backline-* commands (an Omarchy default)')
+            'jq: the omarchy-backline-* commands (an Omarchy default)'
+            'python: omarchy-backline-setup, the menu rows and hotkeys (an Omarchy default)')
 install=backline-audio.install
 _link=4.1.1
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
@@ -48,7 +52,9 @@ build() {
 }
 
 check() {
-  ctest --test-dir build --output-on-failure
+  # autolink starts a private PipeWire and WirePlumber; it is a developer
+  # proof, not a build check (and a build chroot has no session for it).
+  ctest --test-dir build --output-on-failure -E '^autolink$'
 }
 
 package() {
