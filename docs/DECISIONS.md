@@ -207,3 +207,40 @@ exposes per-session state, or devices need the recovery journal for lossy
 links (Wi-Fi). surfaced sends no journal today, as the X-Touch's wired link
 doesn't lose packets in practice. The session code would then grow a journal
 writer, or the module would take over.
+
+## D11. Sample rate is agnostic to the user; SRC is shown, quietly (2026-11-12)
+
+Manu, verbatim:
+
+> "sample rate should be agnostic to the user, just letting you know in a subtle way as a user if you look for it that SRC is on, and that is a conversion process, but you should be able to play at whatever sample rate and digital audio should flow and flow cleanly"
+
+**Decision.** Nobody has to choose a sample rate to play something. Three
+things follow:
+
+- **The rate follows the source wherever the hardware allows.** That is
+  Omarchy's own PipeWire default once omacom/omarchy#17520 lands (allowed
+  rates 44.1, 48, 88.2 and 96 kHz). Backline doesn't duplicate it. Pro audio's
+  locked rate is the one deliberate exception, for recording, and it is a
+  choice the user makes.
+- **When conversion can't be avoided, it is transparent and silent.** That is
+  a core default proposed for Omarchy (`resample.quality = 10`, measured in
+  `manuaudio/omarchy-audio`: flat within 0.002 dB to 20 kHz, every artefact
+  below −140 dBFS, about 0.1% of one core per stereo stream on an i7-12650H).
+  There's no setting, toggle or warning for it.
+- **SRC is visible only to someone who looks.** `omarchy-backline-src` lists
+  every stream whose rate differs from its device's. The Audio Setup panel
+  shows the same in muted caption text under the pro-audio header ("SRC 44.1
+  → 48 kHz · Spotify") and on a combined device's row, only while it is
+  happening. There's no colour, icon, notification or badge on the bar.
+
+**How it is read.** From `pw-dump`: each stream's `Format` rate against the
+`Format` rate of the hardware device at the end of its links, through
+filters and combined devices by `node.link-group`. JACK clients run at the
+graph rate and never show. The panel reads it on open, and again when
+PipeWire's node list changes while it is open. Closed, it reads nothing.
+Tests use hand-written `pw-dump` fixtures (`omarchy/test/fixtures/pw-dump`).
+
+**Revisit when** Quickshell's PipeWire service exposes node formats (then the
+panel can drop the `pw-dump` read), or when a stream converted twice (stream
+and device both off the graph rate, at the same rate) turns out to matter:
+the stream-against-device comparison does not show that case.

@@ -340,11 +340,61 @@ function parseCombined(text) {
   return rows
 }
 
-// "Multi-output · running", "Aggregate · stopped".
-function combinedCaption(device, tr) {
+// "Multi-output · running", "Aggregate · stopped", and while one of its
+// devices is being converted, "Multi-output · running · SRC 48 → 44.1 kHz".
+function combinedCaption(device, tr, conversions, fmt) {
   var t = pick(tr)
   var kind = device.mirror ? t("setup.multiOutput", "Multi-output") : t("setup.aggregate", "Aggregate")
-  return kind + " · " + (device.active ? t("setup.running", "running") : t("setup.stopped", "stopped"))
+  var parts = [kind, device.active ? t("setup.running", "running") : t("setup.stopped", "stopped")]
+  var src = []
+  for (var i = 0; i < (conversions || []).length; i++) {
+    var c = conversions[i]
+    if (c.combined !== device.name) continue
+    var label = srcLabel(c, tr, fmt)
+    if (src.indexOf(label) < 0) src.push(label)
+  }
+  return parts.concat(src).join(" · ")
+}
+
+// ------------------------------------------------- sample-rate conversion
+
+// `omarchy-backline-src --json`: each stream PipeWire converts, with the
+// rates on either side. None when PipeWire is down or the output is not its own.
+function parseConversions(text) {
+  var data = parseJson(text, [])
+  if (!Array.isArray(data)) return []
+  var rows = []
+  for (var i = 0; i < data.length; i++) {
+    var c = data[i]
+    if (!c || typeof c !== "object") continue
+    var from = Number(c.from), to = Number(c.to)
+    if (!(from > 0) || !(to > 0) || from === to) continue
+    rows.push({ name: String(c.name || c.node || ""), from: from, to: to,
+      direction: c.direction === "capture" ? "capture" : "playback",
+      deviceName: String(c.deviceName || c.device || ""),
+      internal: c.internal === true, combined: c.combined ? String(c.combined) : null })
+  }
+  return rows
+}
+
+// "SRC 44.1 → 48 kHz": the conversion in the direction the audio flows.
+function srcLabel(conversion, tr, fmt) {
+  var t = pick(tr)
+  return fill(t("setup.src", "SRC %1 → %2 kHz"), [rateLabel(conversion.from, fmt), rateLabel(conversion.to, fmt)])
+}
+
+// The quiet lines under the sample rate, one per app being converted:
+// "SRC 44.1 → 48 kHz · Spotify". Filters' and combined devices' own streams are
+// left out; a combined device shows its conversion on its own row.
+function srcLines(conversions, tr, fmt) {
+  var lines = []
+  for (var i = 0; i < (conversions || []).length; i++) {
+    var c = conversions[i]
+    if (c.internal) continue
+    var line = c.name ? srcLabel(c, tr, fmt) + " · " + c.name : srcLabel(c, tr, fmt)
+    if (lines.indexOf(line) < 0) lines.push(line)
+  }
+  return lines
 }
 
 // `omarchy-backline-midi list --json`: the sequencer's ports, or none when the
@@ -431,7 +481,8 @@ if (typeof module !== "undefined" && module.exports) {
     syncLabel: syncLabel, chaseStatus: chaseStatus, FPS_CHOICES: FPS_CHOICES,
     PRO_BUFFERS: PRO_BUFFERS, PRO_RATES: PRO_RATES, parseProStatus: parseProStatus, proTitle: proTitle,
     rateLabel: rateLabel, rateTooltip: rateTooltip, bufferTooltip: bufferTooltip, pillIndex: pillIndex,
-    parseCombined: parseCombined, combinedCaption: combinedCaption, parseMidiPorts: parseMidiPorts,
+    parseCombined: parseCombined, combinedCaption: combinedCaption, parseConversions: parseConversions,
+    srcLabel: srcLabel, srcLines: srcLines, parseMidiPorts: parseMidiPorts,
     midiSources: midiSources, portLabel: portLabel, portCaption: portCaption, setupRows: setupRows
   }
 }

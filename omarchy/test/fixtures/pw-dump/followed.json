@@ -1,0 +1,21 @@
+[
+  {"id": 0, "type": "PipeWire:Interface:Core", "version": 4, "permissions": ["r", "w", "x", "m"],
+   "info": {"cookie": 1234, "user-name": "manu", "host-name": "studio", "version": "1.6.8", "name": "pipewire-0",
+            "props": {"default.clock.rate": 48000, "default.clock.allowed-rates": "[ 44100 48000 88200 96000 ]"}}},
+  {"id": 40, "type": "PipeWire:Interface:Device", "version": 3, "permissions": ["r", "w", "x", "m"],
+   "info": {"props": {"device.api": "alsa", "device.name": "alsa_card.pci-0000_00_1f.3", "media.class": "Audio/Device"}}},
+  {"id": 44, "type": "PipeWire:Interface:Node", "version": 3, "permissions": ["r", "w", "x", "m"],
+   "info": {"max-input-ports": 65, "max-output-ports": 0, "n-input-ports": 2, "n-output-ports": 2, "state": "running", "error": null,
+            "props": {"device.id": 40, "factory.name": "api.alsa.pcm.sink", "media.class": "Audio/Sink", "node.name": "alsa_output.pci-0000_00_1f.3.hdmi-stereo",
+                      "node.description": "Built-in Audio Digital Stereo (HDMI)", "node.nick": "HDMI", "object.serial": 51, "priority.driver": 632},
+            "params": {"EnumFormat": [{"mediaType": "audio", "mediaSubtype": "raw", "format": "S32LE", "rate": {"default": 48000, "min": 32000, "max": 192000}, "channels": 2}],
+                       "Format": [{"mediaType": "audio", "mediaSubtype": "raw", "format": "S32LE", "rate": 44100, "channels": 2, "position": ["FL", "FR"]}]}}},
+  {"id": 74, "type": "PipeWire:Interface:Node", "version": 3, "permissions": ["r", "w", "x", "m"],
+   "info": {"max-input-ports": 0, "max-output-ports": 64, "n-input-ports": 0, "n-output-ports": 2, "state": "running", "error": null,
+            "props": {"application.name": "pw-play", "media.class": "Stream/Output/Audio", "media.name": "album.flac", "node.name": "pw-play", "object.serial": 120},
+            "params": {"Format": [{"mediaType": "audio", "mediaSubtype": "raw", "format": "S16LE", "rate": 44100, "channels": 2, "position": ["FL", "FR"]}]}}},
+  {"id": 80, "type": "PipeWire:Interface:Link", "version": 3, "permissions": ["r", "w", "x", "m"],
+   "info": {"output-node-id": 74, "output-port-id": 75, "input-node-id": 44, "input-port-id": 45, "state": "active", "error": null, "props": {"link.output.node": 74, "link.input.node": 44}}},
+  {"id": 81, "type": "PipeWire:Interface:Link", "version": 3, "permissions": ["r", "w", "x", "m"],
+   "info": {"output-node-id": 74, "output-port-id": 76, "input-node-id": 44, "input-port-id": 46, "state": "active", "error": null, "props": {"link.output.node": 74, "link.input.node": 44}}}
+]

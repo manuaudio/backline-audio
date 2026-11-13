@@ -28,7 +28,7 @@ The jobs, and the fewest keystrokes for each (measured), are in [`ui/UX-FLOWS.md
 | `plugin/Backline.qml` | the bar widget: the five panels side by side, `Tab` between them |
 | `plugin/{Instruments,Record,Plugins,Transport,Setup}.qml` | the panels; Setup is Audio Setup (below) |
 | `plugin/Model.js`, `plugin/i18n/` | the panels' pure logic (picker order, filters, grades, sources, timecode, status tones) and their catalogs |
-| `bin/omarchy-backline-*` | commands: `instrument-add`, `instrument-remove`, `instrument-midi`, `record`, `soundcheck`, `transport`, `plugins-scan`, `mixer`, `pro`, `aggregate`, `midi`, `setup`, and the panels' `state` and `watch` |
+| `bin/omarchy-backline-*` | commands: `instrument-add`, `instrument-remove`, `instrument-midi`, `record`, `soundcheck`, `transport`, `plugins-scan`, `mixer`, `pro`, `aggregate`, `midi`, `src`, `setup`, and the panels' `state` and `watch` |
 | `lib/omarchy-backline.sh` | their shared D-Bus, MIDI and catalog helpers |
 | `i18n/en.json` | the commands' notification and prompt strings |
 | `extensions/omarchy-menu.jsonc` | the menu rows (Trigger › Backline, Trigger › Toggle › Pro Audio, Setup › Audio) |
@@ -46,8 +46,9 @@ The fifth panel is what macOS keeps in Audio MIDI Setup and Omarchy's own audio 
 | `omarchy-backline-pro on [--buffer N] [--rate R]`, `off`, `toggle`, `status [--json]` | Forces a small buffer (256 frames, or 128 once PipeWire runs realtime) and locks the sample rate in PipeWire's `settings` metadata, live, with nothing restarted. A user unit sets it again each time PipeWire starts; `off` removes it and never clears a buffer something else forced. |
 | `omarchy-backline-aggregate create [--mirror] <name> <device>...`, `remove`, `list [--json]` | An aggregate device (members' channels stacked in order) or, with `--mirror`, a multi-output device (the same stereo on every output). Each is PipeWire's `combine-stream` in its own PipeWire client and user unit, so making or removing one restarts nothing. With no arguments it asks through Omarchy's menu picker. |
 | `omarchy-backline-midi list [--all] [--json]`, `connect [<source> [<destination>]]`, `disconnect` | The ALSA sequencer's ports with kind, protocol (MIDI 1.0, MIDI 2.0) and connections; `connect <source>` opens the menu picker with its destinations ticked. |
+| `omarchy-backline-src [--json]` | Which streams PipeWire is sample-rate converting and between which rates, read from `pw-dump`. It changes nothing. Sample rate is meant to be invisible: PipeWire follows the source where the hardware can, and converts cleanly where it can't (DECISIONS.md D11). |
 
-The panel: the PRO AUDIO switch on its header line, with buffer and sample-rate pills while it is on; the combined devices, with Aggregate Device and Multi-Output Device; the MIDI ports that send, each with where it sends. `p` turns pro audio on or off, `x` removes a combined device, Enter on a MIDI port opens the picker, and right-clicking the bar icon turns pro audio on or off. `Super + Ctrl + Alt + A` is the quick action (pro audio on or off), and _Trigger › Toggle_ gets Pro Audio On and Off like Omarchy's own toggles.
+The panel: the PRO AUDIO switch on its header line, with buffer and sample-rate pills while it is on; the combined devices, with Aggregate Device and Multi-Output Device; the MIDI ports that send, each with where it sends. While a stream is being converted to its device's rate, a muted line under the pro-audio header says so ("SRC 44.1 → 48 kHz · Spotify"), and a combined device's row does the same; nothing shows when nothing is converted. `p` turns pro audio on or off, `x` removes a combined device, Enter on a MIDI port opens the picker, and right-clicking the bar icon turns pro audio on or off. `Super + Ctrl + Alt + A` is the quick action (pro audio on or off), and _Trigger › Toggle_ gets Pro Audio On and Off like Omarchy's own toggles.
 
 ## How it follows Omarchy
 

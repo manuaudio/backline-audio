@@ -79,6 +79,8 @@
   "setup.running": "running",
   "setup.sampleRate": "Sample rate",
   "setup.sendsTo": "to %1",
+  "setup.src": "SRC %1 → %2 kHz",
+  "setup.srcTooltip": "PipeWire converts this audio to the device's sample rate",
   "setup.stopped": "stopped",
   "setup.title": "Audio Setup",
   "setup.unconnected": "not connected",

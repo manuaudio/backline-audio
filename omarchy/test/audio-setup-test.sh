@@ -271,3 +271,49 @@ grep -qx -- '--selected' "$data/menu" && grep -qx $'Surge XT\tinput · 128:0' "$
   fail "unticked destinations are disconnected and ticked ones connected, and the bridge is left alone" "$(cat "$data/aconnect")"
 grep -q 'backline.setup refresh' "$data/shell" || fail "a MIDI change tells the Audio Setup panel"
 pass "midi connect makes the destinations picked in the menu the source's connections"
+
+# ------------------------------------------------- sample-rate conversion
+# pw-dump answers from hand-written fixtures in pw-dump's own shape
+# (test/fixtures/pw-dump), each a graph with known stream and device formats.
+fixtures=$ROOT/test/fixtures/pw-dump
+printf '#!/bin/bash\ncat "$TEST_DATA/pw-dump.json"\n' >"$stubs/pw-dump"
+chmod +x "$stubs/pw-dump"
+src_on() {
+  mkdir -p "$data"
+  cp "$fixtures/$1.json" "$data/pw-dump.json"
+}
+
+src_on followed
+[[ $(omarchy-backline-src --json) == "[]" ]] || fail "a stream the device follows is not converted" "$(omarchy-backline-src --json)"
+[[ $(omarchy-backline-src) == "No sample-rate conversion: everything plays at its device's rate." ]] ||
+  fail "src says plainly when nothing is converted" "$(omarchy-backline-src)"
+pass "src: a 44.1 kHz stream on a device that followed it to 44.1 kHz is not converted"
+
+src_on mixed
+json=$(omarchy-backline-src --json)
+[[ $(jq -c 'map({name, direction, from, to, deviceName})' <<<"$json") == \
+  '[{"name":"Spotify","direction":"playback","from":44100,"to":48000,"deviceName":"Scarlett 2i2 USB"},{"name":"Audacity","direction":"capture","from":48000,"to":44100,"deviceName":"Scarlett 2i2 USB"}]' ]] ||
+  fail "src finds the 44.1 kHz player and the 44.1 kHz recorder on a 48 kHz interface, and nothing else" "$json"
+[[ $(omarchy-backline-src) == $'Spotify: 44.1 → 48 kHz, to Scarlett 2i2 USB\nAudacity: 48 → 44.1 kHz, from Scarlett 2i2 USB' ]] ||
+  fail "src says each conversion in the direction the audio flows" "$(omarchy-backline-src)"
+pass "src: playback and capture conversions; a JACK client at the graph rate, an unlinked and an unsettled stream are not"
+
+src_on filter
+[[ $(omarchy-backline-src --json | jq -c 'map({name, from, to, device, internal})') == \
+  '[{"name":"Spotify","from":44100,"to":48000,"device":"alsa_output.pci-0000_00_1f.3.analog-stereo","internal":false}]' ]] ||
+  fail "src follows a stream through a filter to the hardware" "$(omarchy-backline-src --json)"
+pass "src: a stream through a filter is compared with the hardware behind it"
+
+src_on combined
+json=$(omarchy-backline-src --json)
+[[ $(jq -c 'map({name, to, deviceName, internal, combined})' <<<"$json") == \
+  '[{"name":"Everywhere output","to":44100,"deviceName":"KEF LSX II LT","internal":true,"combined":"Everywhere"},{"name":"Firefox","to":44100,"deviceName":"KEF LSX II LT","internal":false,"combined":null}]' ]] ||
+  fail "src finds the combined device's member at 44.1 kHz, and the app playing into it" "$json"
+pass "src: a combined device's member on a 44.1 kHz device is its own row's conversion"
+
+rm -f "$data/pw-dump.json"
+printf '#!/bin/bash\nexit 1\n' >"$stubs/pw-dump"
+if omarchy-backline-src --json >/dev/null 2>&1; then
+  fail "src fails while PipeWire is down"
+fi
+pass "src fails plainly while PipeWire is down"

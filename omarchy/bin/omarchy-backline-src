@@ -1,0 +1,46 @@
+#!/bin/bash
+
+# omarchy:summary=Show which audio PipeWire is sample-rate converting, and between which rates
+# omarchy:args=[--json]
+
+# Sample rate should be something nobody has to think about: PipeWire follows
+# the source's rate where the hardware allows, and converts cleanly where it
+# can't. Conversion is still a process the audio goes through, so this says
+# where it is happening, for anyone who looks: each stream whose rate differs
+# from the device it plays to or records from, as "44.1 → 48 kHz". The Audio
+# Setup panel shows the same, quietly, and only while it happens.
+#
+# Read from pw-dump: a stream's format against the device's at the end of its
+# path, through filters and combined devices. It never changes anything.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+bl_help "$@"
+
+json=false
+case "${1:-}" in
+  "") ;;
+  --json) json=true ;;
+  *)
+    echo "Usage: omarchy-backline-src [--json]" >&2
+    exit 2
+    ;;
+esac
+
+if ! dump=$(pw-dump 2>/dev/null) || [[ -z $dump ]]; then
+  echo "PipeWire is not running, so nothing is playing or being converted." >&2
+  exit 1
+fi
+
+conversions=$(jq -c -f "$BL_ROOT/lib/omarchy-backline-src.jq" <<<"$dump") || exit 1
+
+if [[ $json == "true" ]]; then
+  echo "$conversions"
+elif [[ $conversions == "[]" ]]; then
+  echo "No sample-rate conversion: everything plays at its device's rate."
+else
+  jq -r '
+    def khz: ./1000 | tostring;
+    .[] | "\(.name): \(.from | khz) → \(.to | khz) kHz, \(if .direction == "playback" then "to" else "from" end) \(.deviceName)"
+  ' <<<"$conversions"
+fi

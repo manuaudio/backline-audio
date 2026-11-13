@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
+import Quickshell.Services.Pipewire
 import qs.Ui
 import qs.Commons
 import qs.Commons as Commons
@@ -18,6 +19,11 @@ import "Model.js" as Model
 // and omarchy-backline-midi list --json, read when the panel opens and when a
 // command pushes `backline.setup refresh` after a change. No timer. The pro
 // audio status is also read once at startup, so the bar icon is true.
+//
+// Sample-rate conversion is shown only while it happens and only here, in
+// muted text under the sample rate and on a combined device's row: "SRC 44.1 →
+// 48 kHz". omarchy-backline-src reads it from pw-dump when the panel opens, and
+// again when PipeWire's nodes change while it is open; closed, it reads nothing.
 Panel {
   id: root
   moduleName: "backline.setup"
@@ -43,6 +49,10 @@ Panel {
   property var proQueued: null
   property var combined: []
   property var midiPorts: []
+  // Streams PipeWire is converting to or from their device's rate, while open.
+  property var conversions: []
+  property bool srcStale: false
+  readonly property var srcLines: Model.srcLines(conversions, root.t, Commons.I18n.formatNumber)
   readonly property var midiRows: Model.midiSources(midiPorts)
 
   // ---- Cursor ----
@@ -108,9 +118,16 @@ Panel {
     proStatusProc.running = true
   }
 
+  function readSrc() {
+    if (!opened) return
+    if (srcProc.running) { srcStale = true; return }
+    srcProc.running = true
+  }
+
   function refresh() {
     if (!proActionProc.running) readPro()
     if (!opened) return
+    readSrc()
     if (!combinedProc.running) combinedProc.running = true
     if (!midiProc.running) midiProc.running = true
   }
@@ -147,8 +164,19 @@ Panel {
     if (opened) {
       selectedIndex = 0
       refresh()
+    } else {
+      conversions = []
     }
   }
+
+  // A stream starting or stopping is when a conversion starts or stops; the
+  // short wait lets the device settle on its rate first.
+  Connections {
+    target: Pipewire.nodes
+    function onValuesChanged() { if (root.opened) srcTimer.restart() }
+  }
+
+  Timer { id: srcTimer; interval: 300; onTriggered: root.readSrc() }
 
   Component.onCompleted: readPro()
 
@@ -171,11 +199,23 @@ Panel {
     id: proActionProc
     onExited: {
       root.readPro()
+      // A locked rate changes what has to be converted.
+      srcTimer.restart()
       if (!root.proQueued) return
       var command = root.proQueued
       root.proQueued = null
       Qt.callLater(function() { root.runPro(command.slice(1)) })
     }
+  }
+
+  Process {
+    id: srcProc
+    command: ["omarchy-backline-src", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: if (root.opened) root.conversions = Model.parseConversions(text)
+    }
+    onExited: if (root.srcStale) { root.srcStale = false; Qt.callLater(root.readSrc) }
   }
 
   Process {
@@ -213,6 +253,7 @@ Panel {
       return JSON.stringify({ opened: root.opened, row: root.currentRow.kind, index: root.currentRow.index,
         pro: root.proStatus, bufferPill: Model.PRO_BUFFERS[root.bufferPill], ratePill: Model.PRO_RATES[root.ratePill],
         combined: root.combined.map(function(d) { return d.name }),
+        src: root.srcLines,
         midi: root.midiRows.map(function(p) { return p.address }) })
     }
   }
@@ -319,6 +360,30 @@ Panel {
             font.pixelSize: Style.font.caption
           }
 
+          // Sample-rate conversion, only while it happens: quiet, for whoever
+          // looks next to the sample rate.
+          Repeater {
+            model: root.srcLines
+
+            Text {
+              required property string modelData
+              width: parent.width
+              textFormat: Text.PlainText
+              text: modelData
+              elide: Text.ElideRight
+              color: Qt.darker(root.bar.foreground, 1.6)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+
+              HoverHandler { id: srcHover }
+              PanelToolTip {
+                visible: srcHover.hovered
+                text: root.t("setup.srcTooltip", "PipeWire converts this audio to the device's sample rate")
+                fontFamily: root.bar.fontFamily
+              }
+            }
+          }
+
           // Collapses with the switch, the way the network panel's band pills do.
           Item {
             width: parent.width
@@ -404,7 +469,7 @@ Panel {
               rowIndexInKind: index
               glyph: modelData.mirror ? "󰓃" : "󰴸"
               title: modelData.name
-              caption: Model.combinedCaption(modelData, root.t)
+              caption: Model.combinedCaption(modelData, root.t, root.conversions, Commons.I18n.formatNumber)
               tip: root.t("setup.removeHint", "x removes it")
             }
           }

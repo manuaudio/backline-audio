@@ -132,3 +132,23 @@ assert.strictEqual(kinds(Model.setupRows({ enabled: false }, [], [])), 'pro add'
 // PipeWire not answering: no pro audio rows, the rest stays.
 assert.strictEqual(kinds(Model.setupRows(null, [{}], [])), 'device0 add')
 JS
+
+run_node_test <<'JS' && pass "audio setup: SRC shows quietly per app, and on a combined device's row"
+const conversions = Model.parseConversions(JSON.stringify([
+  { name: 'Spotify', direction: 'playback', from: 44100, to: 48000, deviceName: 'Scarlett', internal: false, combined: null },
+  { name: 'Spotify', direction: 'playback', from: 44100, to: 48000, deviceName: 'Scarlett', internal: false, combined: null },
+  { name: 'Audacity', direction: 'capture', from: 48000, to: 88200, deviceName: 'Scarlett', internal: false, combined: null },
+  { name: 'Everywhere output', direction: 'playback', from: 48000, to: 44100, deviceName: 'KEF', internal: true, combined: 'Everywhere' },
+  { name: 'same rate', from: 48000, to: 48000 },
+  { name: 'no rate', from: 0, to: 48000 }
+]))
+assert.strictEqual(conversions.length, 4)
+assert.strictEqual(Model.srcLabel({ from: 44100, to: 48000 }), 'SRC 44.1 → 48 kHz')
+assert.strictEqual(Model.srcLabel({ from: 96000, to: 48000 }), 'SRC 96 → 48 kHz')
+assert.deepStrictEqual(Model.srcLines(conversions), ['SRC 44.1 → 48 kHz · Spotify', 'SRC 48 → 88.2 kHz · Audacity'])
+assert.strictEqual(Model.combinedCaption({ name: 'Everywhere', active: true, mirror: true }, null, conversions), 'Multi-output · running · SRC 48 → 44.1 kHz')
+assert.strictEqual(Model.combinedCaption({ name: 'Studio', active: true, mirror: false }, null, conversions), 'Aggregate · running')
+// Nothing converted, or PipeWire down: no lines at all.
+assert.deepStrictEqual(Model.srcLines(Model.parseConversions('[]')), [])
+assert.deepStrictEqual(Model.srcLines(Model.parseConversions('PipeWire is not running')), [])
+JS
