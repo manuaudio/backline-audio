@@ -33,7 +33,7 @@ extern "C" {
 #endif
 
 #define BACKLINE_VERSION_MAJOR 0
-#define BACKLINE_VERSION_MINOR 3
+#define BACKLINE_VERSION_MINOR 4
 #define BACKLINE_VERSION_MICRO 0
 
 const char *bl_version(void);

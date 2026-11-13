@@ -48,7 +48,7 @@
 #define OBJ_PATH "/io/github/manuaudio/Backline/Host"
 #define IFACE "io.github.manuaudio.Backline.Host1"
 #define ERR_PREFIX "io.github.manuaudio.Backline.Error."
-#define VERSION "0.2.0"
+#define VERSION BACKLINE_PROJECT_VERSION
 
 enum inst_state { ST_STARTING, ST_RUNNING, ST_BACKOFF, ST_STOPPING, ST_FAILED };
 static const char *state_names[] = { "starting", "running", "restarting", "stopping", "failed" };

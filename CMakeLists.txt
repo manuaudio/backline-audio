@@ -10,6 +10,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
+# One version for everything: the library, the CLI, every daemon's Version.
+add_compile_definitions(BACKLINE_PROJECT_VERSION="${PROJECT_VERSION}")
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wno-format-truncation)
 
 find_package(PkgConfig REQUIRED)

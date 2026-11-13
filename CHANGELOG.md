@@ -11,6 +11,9 @@ WirePlumber 0.5.17).
 
 ### Fixed
 
+- **One version everywhere**: `bl_version()`, `backline version` and Host1's
+  `Version` reported 0.3.0, 0.3.0 and 0.2.0 for the 0.4.0 release. All of
+  them now come from `project()`; `test_libbackline` checks it.
 - **Surface profiles install under the prefix's `share/backline/surfaces`**,
   where surfaced looks for them. `GNUInstallDirs` was included after the
   `surface/` subdirectory, so the profiles went to `/backline/surfaces` (a
