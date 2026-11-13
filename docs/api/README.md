@@ -15,6 +15,7 @@ all of them:
 | A program's parameter tree | `io.github.manuaudio.Backline.Control` | `/io/github/manuaudio/Backline/Params` | `io.github.manuaudio.Backline.Params1` ([Params1.md](Params1.md)) |
 | Slot chains (shared memory, not D-Bus) | — | — | `backline/slot1.h` ([Slot1.md](Slot1.md)); supervised through `Host1.LoadSlot` |
 | Control surfaces | `io.github.manuaudio.Backline.Surface` | `/io/github/manuaudio/Backline/Surface` | `io.github.manuaudio.Backline.Surface1` ([Surface1.md](Surface1.md)) |
+| Network DSP offload (server built; console control plane a draft) | `io.github.manuaudio.Backline.Offload` | `/io/github/manuaudio/Backline/Offload` | `io.github.manuaudio.Backline.Offload1` ([Offload1.md](Offload1.md)); data plane `backline/offload1.h` |
 
 The **bus name has no version number; the interface does.** A later,
 incompatible `Recorder2` would be served on the same bus name and object,

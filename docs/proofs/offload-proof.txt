@@ -1,0 +1,89 @@
+== offload-proof + capacity 2026-11-12, ai-nab6
+i7-12650H (6 P-cores with SMT = cpus 0-11, 4 E-cores = cpus 12-15), 62 GB
+kernel 7.2.5-3-omarchy (PREEMPT_DYNAMIC, full preemption, NOT PREEMPT_RT), HZ=1000
+governor powersave + EPP performance, C-states up to C10 (exit latency 230 us)
+NO realtime priority: RLIMIT_RTPRIO 0, no rtkit; RLIMIT_MEMLOCK 8 MB
+shared box (other workloads running; load1 noted per row)
+period: 64 frames @ 48 kHz = 1333.3 us. Raw rows: offload/results/*.jsonl
+
+-- 0. cost of one instance, back to back, 64 frames, white noise -18 dBFS (dspbench --cost, 3 s)
+  LSP Parametric EQ x8 stereo, 8 bells on   0.90 us mean   (0.07 % of the period)
+  LSP Compressor stereo                      0.99 us
+  LSP Gate stereo                            1.16 us
+  LSP Limiter stereo                         0.89 us
+  LSP Multiband Compressor stereo x8        25.9 us
+  CHOWTapeModel                             40.0 us        (3.0 %)
+  Dragonfly Hall Reverb                     14.8 us
+  Dragonfly Room Reverb                     15.8 us
+  Dragonfly Plate / Early Reflections        2.6 / 2.8 us
+  Airwindows Consolidated (default)          4.5 us
+  Surge XT Effects (default)                 1.7 us
+
+-- 1. in-process capacity (offload/tests/capacity.sh, dspbench, 20 s per row)
+  unit = EQ8 -> Comp -> CHOWTape -> Dragonfly Hall (about 57 us back to back; about 59 us per
+  unit when woken each period, because the caches go cold between periods)
+  "miss" = the block finished after the next period began (a device would xrun)
+  label          inst  misses/min/thread  work p50  p99.9  max   wake p99  wake max (us)
+  1thread-sleep    4        87               72      157    170    426      1672
+  1thread-sleep   32       108              506      756    840    198      1674
+  1thread-sleep   48       150              750     1343   1651    113      1776
+  1thread-sleep   64      2025             1007     2045   2736    198      1666
+  1thread-spin     4         0               50      141    214      0         2
+  1thread-spin    32         0              474     1059   1220      0         2
+  1thread-spin    48        30              705     1301   1445      0         6
+  1thread-spin    64       222              948     1653   1882      0        73
+  6P-sleep       192       214  (6 threads, one per physical P-core)
+  6P-spin        192         4              623     1129   2766      0      1399
+  6P-spin        288       467
+  12Pht-spin     384       141              991     1729   5950   (SMT siblings: about 1.9x slower per thread)
+  16all-spin     256       436   (E-cores plus contention with other tenants)
+  light strip = Gate + EQ8 + Comp, 1 thread, spin:
+     30 strips (90 inst)   0 misses   p50 151 us  p99.9 386  max 620
+     60 strips (180 inst)  6 misses   p50 316 us  p99.9 834  max 1670
+    100 strips (300 inst)  746 misses p50 577 us  p99.9 2865
+  RESULT: with normal (sleeping, non-RT) waits, xruns at ANY load (about 90/min, from wake-ups up
+  to 1.7 ms late). Busy-waiting on a pinned P-core (a stand-in for an isolated RT core): 0 misses up
+  to 32 mixed instances per core (p50 36 % of the period, p99.9 80 %).
+
+-- 2. Backline's real host: backline-plugin-worker, one process per plugin, on a private PipeWire
+   daemon (offload/tests/pw-bltest.conf: own socket, dummy driver, quantum 64, no module-rt) at
+   48 kHz. Manu's PipeWire and the running Backline demo were not touched. Judged from pw-profiler
+   per cycle against the hardware deadline (offload/tests/pwprof.py), 30 s = 22500 cycles per row.
+  chains x len  workers  late cycles  late/min  graph end p50  p99.9   max     hop wake p50  p99   max (us)
+   1 x  4          4         0          0           240        639    1111        7.3    135    961
+   1 x  8          8         0          0           371        820    1049        5.5    126    253
+   1 x 16         16         0          0           553       1035    1285        4.1    111    242
+   1 x 24         24        24         48           760         late             4.1     53    447
+   1 x 32         32      2062       4124           977         late             4.1     38   2844
+   4 x  4         16         2          4           229        559    late        6.4    107    960
+   8 x  4         32         2          4           219        544    late        5.9     64    986
+  12 x  4         48        27         54           252         late             7.0     75    999
+  16 x  4         64        63        126           282         late             9.4     93   1147
+   4 x  8         32         0          0           354        720    1117        5.5     46    745
+   8 x  8         64       160        320           377         late             6.0     56    928
+  24 x 4, 12 x 8  96     the profiler returned no cycles (unverified: profiler limit or stall)
+  memory: about 47 MB RSS per worker process
+  RESULT: about 16 plugins in one serial chain, or about 32 in parallel chains, before xruns; each
+  process hop costs 4-9 us at p50 but 40-135 us at p99 and up to 1 ms without RT.
+
+-- 3. offload loop (offload/tests/offload-proof.sh): user netns (unshare -rn), no sudo.
+   client = console (cpu 6) sends one 64-frame stereo block per period; server (cpu 4) runs a CLAP
+   chain on it and returns it. 22500 blocks (30 s) per row, after 500 warm-up blocks.
+   light = LSP EQ8 + Comp; heavy = 6 x (EQ8, Comp, CHOWTape, Dragonfly Hall) = 24 plugins.
+   verify = the client runs the same chain locally on the same input and compares.
+  label                rtt min   p50    p99    p99.9    max   server p50  >budget  missed  diff
+  udp lo, blocking       7.0    61.1   193.6   952.9  2105.7      7       168/250us   2     0 (bit exact)
+  udp lo, busy-poll      4.4     5.9    17.9    30.3    37.9      2         0/250us   0     0 (bit exact)
+  L2 veth, blocking      6.2    52.7   424.0  1451.2  2212.4      7       333/250us  13     0 (bit exact)
+  L2 veth, busy-poll     3.6     4.7    14.8    30.6   248.3      2         0/250us   0     0 (bit exact)
+  L2 veth, busy, heavy 359.4   389.3   447.0   508.0   714.9    386         0/1333us  0     (not verified)
+  L2 veth, block, heavy 341.8  519.2   729.0  1444.0  2007.4    384        31/1333us  1     (not verified)
+  RESULT: PASS for the busy-polled L2 path: 22500/22500 blocks back inside a 250 us same-period
+  budget, so 0 frames of added latency, and bit-exact against the local chain. With 24 plugins
+  remote, every block came back inside its own period (max 715 us). Blocking sockets without RT
+  miss periods. NOTE: veth and loopback have no wire, no NIC and no switch (see the design doc for
+  the real-link budget).
+
+-- clean up
+  private PipeWire daemon, its sockets, test workers, servers and the netns are all gone after each
+  run; the default PipeWire graph had 0 bltest nodes throughout.

@@ -55,6 +55,19 @@ if(BL_HAVE_SPA_PARSER_BODY)
   target_compile_definitions(backline-plugin-worker PRIVATE BL_HAVE_SPA_PARSER_BODY=1)
 endif()
 
+# DSP offload proof (offload/, docs/api/Offload1.md): an in-process CLAP rack,
+# the capacity bench and the lockstep client/server loop. Proof code, not the
+# service yet.
+option(BACKLINE_OFFLOAD_PROOF "Build the DSP-offload proof tools" ON)
+if(BACKLINE_OFFLOAD_PROOF)
+  foreach(t dspbench offload-proof)
+    add_executable(backline-${t} offload/${t}.cpp)
+    target_include_directories(backline-${t} PRIVATE third_party/clap/include)
+    target_compile_options(backline-${t} PRIVATE -Wno-address-of-packed-member)
+    target_link_libraries(backline-${t} PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+  endforeach()
+endif()
+
 # LV2 through lilv (ISC).
 pkg_check_modules(LILV IMPORTED_TARGET lilv-0)
 option(BACKLINE_LV2 "Host LV2 plugins in the worker (needs lilv)" ${LILV_FOUND})
