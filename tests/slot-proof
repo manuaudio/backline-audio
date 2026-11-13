@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# slot-proof: Slot1, offline. backline-test-slot-driver plays the mixing
+# engine's role against backline-slot-host over Slot1 shared memory, with no
+# audio server anywhere (the slot host never connects to one; the proof
+# points PipeWire at an empty runtime directory to make sure).
+#
+# Per format (CLAP, VST3, LV2, as built), with the slot test effect
+# (tests/plugins/slotfx.h):
+#   align     zero-latency chain: the impulse comes out in the same cycle, at
+#             the same frame (+0); a 37-frame insert: at +37 exactly, the
+#             latency the chain reports
+#   deadline  an insert that sleeps three periods: that block and the stalled
+#             ones play the input delayed by the latency, sample-exact; the
+#             chain comes back
+#   crash     two chains; chain A's plugin segfaults: A plays delayed dry
+#             until a new sandbox (the driver acts as supervisor) takes over;
+#             chain B never plays a dry block
+#   allocs    four inserts, 5,000 cycles with parameter traffic: no heap call
+#             on either audio thread; then an allocating plugin is caught
+#   timing    request → done round trips at 64 frames / 48 kHz, paced like the
+#             real period, 1 and 4 inserts (and 128 frames)
+#
+# Usage: tests/slot-proof BUILD_DIR [clap,vst3,lv2]
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+B=$(cd "${1:-$here/../build}" && pwd)
+formats=${2:-clap,vst3,lv2}
+out=$here/out/slot
+rm -rf "$out"; mkdir -p "$out"
+D=$B/backline-test-slot-driver
+H=$B/backline-slot-host
+P=$B/slot-plugins
+export LV2_PATH=$P/lv2
+# no audio server: an empty runtime directory, and no remote to find
+empty=$(mktemp -d)
+trap 'rm -rf "$empty"' EXIT
+export PIPEWIRE_RUNTIME_DIR=$empty PIPEWIRE_REMOTE=$empty/none
+log=$out/slot-host.log
+results=$out/results.jsonl
+: >"$results"
+
+spec() { # format variant -> plugin spec
+  local f=$1 v=$2
+  case $f in
+    clap) echo "$P/backline-test-slotfx.clap#backline.test.slotfx$v" ;;
+    vst3)
+      local n="Backline Test Slot FX"
+      [[ $v == -lat37 ]] && n="$n (37 frames)"
+      [[ $v == -lat300 ]] && n="$n (300 frames)"
+      echo "$P/backline-test-slotfx.vst3#$n" ;;
+    lv2) echo "https://github.com/manuaudio/backline-audio/test/slotfx$v" ;;
+  esac
+}
+
+rc=0
+run() { # label test args...
+  local label=$1; shift
+  local line
+  if line=$("$D" "$@" --host "$H" --log "$log" 2>>"$out/driver.log"); then
+    echo "  ok   $label: $line"
+  else
+    echo "  FAIL $label: $line"; tail -5 "$out/driver.log" | sed 's/^/       /'; rc=1
+  fi
+  [[ -n $line ]] && echo "{\"label\": \"$label\", \"result\": $line}" >>"$results"
+  return 0
+}
+
+echo "slot-proof: Slot1 offline, no audio server ($(nproc) CPUs, $(uname -r))"
+IFS=, read -ra fl <<<"$formats"
+for f in "${fl[@]}"; do
+  echo "[$f]"
+  run "$f align, latency 0" align --plugin "$(spec "$f" "")"
+  run "$f align, 37 frames" align --plugin "$(spec "$f" -lat37)"
+  run "$f align, 0+37+300 chain" align --plugin "$(spec "$f" "")" --plugin "$(spec "$f" -lat37)" --plugin "$(spec "$f" -lat300)"
+  run "$f deadline miss" deadline --plugin "$(spec "$f" -lat37)"
+  run "$f crash isolation" crash --plugin "$(spec "$f" -lat37)"
+  run "$f allocations, 4 inserts" allocs --plugin "$(spec "$f" "")" --plugin "$(spec "$f" -lat37)" \
+    --plugin "$(spec "$f" "")" --plugin "$(spec "$f" "")"
+done
+# a mixed chain: one process, three formats
+if [[ $formats == *vst3* && $formats == *lv2* ]]; then
+  echo "[mixed]"
+  run "clap+vst3+lv2 align" align --plugin "$(spec clap -lat37)" --plugin "$(spec vst3 "")" --plugin "$(spec lv2 -lat300)"
+fi
+# Under the real supervisor: backline-hostd LoadSlot on a private bus with no
+# service directories (nothing can be activated on it), workers as plain
+# children (no systemd scope). hostd restarts the crashed chain on the same
+# memory, with the state it saved.
+if command -v dbus-daemon >/dev/null && command -v busctl >/dev/null; then
+  echo "[hostd]"
+  hs=$(mktemp -d)
+  cat >"$hs/bus.conf" <<CONF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig><type>session</type><listen>unix:dir=$hs</listen><auth>EXTERNAL</auth>
+<policy context="default"><allow send_destination="*" eavesdrop="true"/><allow eavesdrop="true"/><allow own="*"/></policy>
+</busconfig>
+CONF
+  dbus-daemon --config-file="$hs/bus.conf" --nofork --print-address=3 3>"$hs/addr" & busp=$!
+  for _ in $(seq 100); do [[ -s $hs/addr ]] && break; sleep 0.05; done
+  export DBUS_SESSION_BUS_ADDRESS=$(head -1 "$hs/addr")
+  "$B/backline-hostd" --no-scope --slot-host "$H" --worker /nonexistent --state-dir "$hs/state" --log-dir "$hs/log" \
+    --registry '' 2>"$out/hostd.log" & hostdp=$!
+  for _ in $(seq 100); do busctl --user list 2>/dev/null | grep -q 'io.github.manuaudio.Backline.Host ' && break; sleep 0.05; done
+  for f in "${fl[@]}"; do
+    run "$f crash isolation, hostd restarts it" crash --hostd "$hs/state" --plugin "$(spec "$f" -lat37)"
+  done
+  kill $hostdp 2>/dev/null; wait $hostdp 2>/dev/null || true
+  kill $busp 2>/dev/null; wait $busp 2>/dev/null || true
+  unset DBUS_SESSION_BUS_ADDRESS
+  cp "$hs"/log/*.log "$out/" 2>/dev/null || true
+  rm -rf "$hs"
+else
+  echo "[hostd] skipped: no dbus-daemon or busctl"
+fi
+echo "[timing]"
+f=${fl[0]}
+run "timing, 1 insert, 64 frames" timing --cycles 20000 --plugin "$(spec "$f" "")"
+run "timing, 4 inserts, 64 frames" timing --cycles 20000 --plugin "$(spec "$f" "")" --plugin "$(spec "$f" -lat37)" \
+  --plugin "$(spec "$f" "")" --plugin "$(spec "$f" "")"
+run "timing, 4 inserts, 128 frames" timing --cycles 10000 --frames 128 --plugin "$(spec "$f" "")" \
+  --plugin "$(spec "$f" -lat37)" --plugin "$(spec "$f" "")" --plugin "$(spec "$f" "")"
+echo "results: $results"
+exit $rc

@@ -49,6 +49,7 @@
 #define IFACE "io.github.manuaudio.Backline.Host1"
 #define ERR_PREFIX "io.github.manuaudio.Backline.Error."
 #define VERSION BACKLINE_PROJECT_VERSION
+#define BL_SLOT_MAX_INSERTS 16 /* BL_SLOT1_MAX_SLOTS */
 
 enum inst_state { ST_STARTING, ST_RUNNING, ST_BACKOFF, ST_STOPPING, ST_FAILED };
 static const char *state_names[] = { "starting", "running", "restarting", "stopping", "failed" };
@@ -71,6 +72,13 @@ struct instance {
 	char tasks_max[16];
 	char state_path[1200];
 	char log_path[1200];
+	/* a slot chain (LoadSlot): backline-slot-host over the engine's Slot1
+	 * memory, every insert of one strip in one process */
+	bool slot;
+	char shm[256];
+	char chain[BL_SLOT_MAX_INSERTS][1024];
+	unsigned n_chain;
+	int rt_priority;          /* -1: the slot host's default */
 
 	/* runtime */
 	enum inst_state st;
@@ -104,6 +112,7 @@ static struct {
 	sd_bus *bus;
 	struct instance *instances;
 	char worker[PATH_MAX];
+	char slot_host[PATH_MAX];
 	char state_dir[PATH_MAX];
 	char log_dir[PATH_MAX];
 	bool use_scope;
@@ -394,7 +403,7 @@ static void stop_worker(struct instance *in);
 
 static void became_ready(struct instance *in, const struct bl_ready *r)
 {
-	if (!in->ever_ready && !in->force) {
+	if (!in->ever_ready && !in->force && !in->slot) {
 		char grade[16] = "", reasons[512] = "";
 		if (registry_grade(r->format[0] ? r->format : "clap", r->plugin_path, r->plugin, grade, sizeof(grade), reasons,
 				   sizeof(reasons)) == 1 &&
@@ -476,7 +485,10 @@ static void build_argv(struct instance *in, char **argv, int max, char store[][1
 		ARG("--quiet");
 		ARG("--collect");
 		ARG("--unit=%s", in->unit);
-		ARG("--description=Backline plugin worker %s (%s)", in->id, in->plugin);
+		if (in->slot)
+			ARG("--description=Backline slot chain %s (%u inserts)", in->id, in->n_chain);
+		else
+			ARG("--description=Backline plugin worker %s (%s)", in->id, in->plugin);
 		if (in->memory_max[0])
 			ARG("--property=MemoryMax=%s", in->memory_max);
 		if (in->cpu_quota[0])
@@ -484,6 +496,18 @@ static void build_argv(struct instance *in, char **argv, int max, char store[][1
 		if (in->tasks_max[0])
 			ARG("--property=TasksMax=%s", in->tasks_max);
 		ARG("--");
+	}
+	if (in->slot) {
+		ARG("%s", H.slot_host);
+		ARG("--shm=%s", in->shm);
+		ARG("--name=%s", in->id);
+		ARG("--state-dir=%s", in->state_path);
+		if (in->rt_priority >= 0)
+			ARG("--rt-priority=%d", in->rt_priority);
+		for (unsigned i = 0; i < in->n_chain && a + 2 < max; i++)
+			ARG("--plugin=%s", in->chain[i]);
+		argv[a] = NULL;
+		return;
 	}
 	ARG("%s", H.worker);
 	ARG("--plugin=%s", in->plugin);
@@ -510,12 +534,12 @@ static void build_argv(struct instance *in, char **argv, int max, char store[][1
 
 static int spawn(struct instance *in)
 {
-	char store[32][1400];
-	char *argv[33];
+	static char store[48][1400];
+	char *argv[49];
 	/* A new unit name per generation: the dead worker's scope may still be
 	 * winding down when its successor starts. */
-	snprintf(in->unit, sizeof(in->unit), "backline-worker-%s-%u", in->id, in->generation);
-	build_argv(in, argv, 32, store);
+	snprintf(in->unit, sizeof(in->unit), "backline-%s-%s-%u", in->slot ? "slot" : "worker", in->id, in->generation);
+	build_argv(in, argv, 48, store);
 
 	int pfd[2];
 	if (pipe2(pfd, O_CLOEXEC) < 0)
@@ -685,6 +709,9 @@ static int append_info(sd_bus_message *r, const struct instance *in)
 	KV("log-file", "s", in->log_path);
 	KV("restart", "b", (int)in->restart);
 	KV("fail-reason", "s", in->fail_reason);
+	KV("kind", "s", in->slot ? "slot" : "node");
+	KV("shm", "s", in->shm);
+	KV("inserts", "u", (uint32_t)in->n_chain);
 	e |= sd_bus_message_close_container(r);
 #undef KV
 	return e < 0 ? -EINVAL : 0;
@@ -870,6 +897,178 @@ out:
 	return r < 0 ? r : -EINVAL;
 }
 
+/* LoadSlot(s shm, as plugins, a{sv} options): one strip's insert chain in
+ * one backline-slot-host, serving the engine's Slot1 memory (docs/api/Slot1.md).
+ * Supervised like Load: a crash restarts it on the same memory, with state. */
+static int m_load_slot(sd_bus_message *m, void *userdata, sd_bus_error *err)
+{
+	const char *shm;
+	int r = sd_bus_message_read(m, "s", &shm);
+	if (r < 0)
+		return r;
+	if (shm[0] != '/')
+		return sd_bus_error_set(err, SD_BUS_ERROR_INVALID_ARGS, "shm must be a path (/proc/<pid>/fd/<n>)");
+	struct instance *in = calloc(1, sizeof(*in));
+	if (!in)
+		return -ENOMEM;
+	in->out_fd = -1;
+	in->autoconnect = -1;
+	in->restart = true;
+	in->slot = true;
+	in->rt_priority = -1;
+	snprintf(in->shm, sizeof(in->shm), "%s", shm);
+	snprintf(in->memory_max, sizeof(in->memory_max), "%s", H.default_memory_max);
+	snprintf(in->tasks_max, sizeof(in->tasks_max), "512");
+	bl_restart_policy_init(&in->policy);
+
+	if ((r = sd_bus_message_enter_container(m, 'a', "s")) < 0)
+		goto bad;
+	const char *spec;
+	while ((r = sd_bus_message_read(m, "s", &spec)) > 0) {
+		if (in->n_chain >= BL_SLOT_MAX_INSERTS) {
+			sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "at most %d inserts in a chain", BL_SLOT_MAX_INSERTS);
+			r = -EINVAL;
+			goto out;
+		}
+		if (!spec[0]) {
+			sd_bus_error_set(err, SD_BUS_ERROR_INVALID_ARGS, "an empty insert");
+			r = -EINVAL;
+			goto out;
+		}
+		snprintf(in->chain[in->n_chain++], sizeof(in->chain[0]), "%s", spec);
+	}
+	if (r < 0)
+		goto bad;
+	sd_bus_message_exit_container(m);
+	if (!in->n_chain) {
+		sd_bus_error_set(err, SD_BUS_ERROR_INVALID_ARGS, "a chain needs at least one insert");
+		r = -EINVAL;
+		goto out;
+	}
+	snprintf(in->plugin, sizeof(in->plugin), "%s", in->chain[0]);
+
+	if ((r = sd_bus_message_enter_container(m, 'a', "{sv}")) < 0)
+		goto bad;
+	while ((r = sd_bus_message_enter_container(m, 'e', "sv")) > 0) {
+		const char *key, *contents;
+		if ((r = sd_bus_message_read(m, "s", &key)) < 0 || (r = sd_bus_message_peek_type(m, NULL, &contents)) < 0 ||
+		    (r = sd_bus_message_enter_container(m, 'v', contents)) < 0)
+			goto bad;
+		bool known = true;
+		if (!strcmp(contents, "s")) {
+			const char *v;
+			if ((r = sd_bus_message_read(m, "s", &v)) < 0)
+				goto bad;
+			if (!strcmp(key, "id")) snprintf(in->id, sizeof(in->id), "%s", v);
+			else if (!strcmp(key, "memory-max")) snprintf(in->memory_max, sizeof(in->memory_max), "%s", v);
+			else if (!strcmp(key, "cpu-quota")) snprintf(in->cpu_quota, sizeof(in->cpu_quota), "%s", v);
+			else known = false;
+		} else if (!strcmp(contents, "b")) {
+			int v;
+			if ((r = sd_bus_message_read(m, "b", &v)) < 0)
+				goto bad;
+			if (!strcmp(key, "restart")) in->restart = v;
+			else if (!strcmp(key, "force")) in->force = v;
+			else known = false;
+		} else if (!strcmp(contents, "i") || !strcmp(contents, "u")) {
+			int32_t v;
+			if ((r = sd_bus_message_read_basic(m, contents[0], &v)) < 0)
+				goto bad;
+			if (!strcmp(key, "rt-priority") && v >= 0 && v <= 99) in->rt_priority = v;
+			else known = false;
+		} else {
+			known = false;
+		}
+		if (!known) {
+			sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "unknown option '%s' (%s)", key, contents);
+			r = -EINVAL;
+			goto out;
+		}
+		sd_bus_message_exit_container(m);
+		sd_bus_message_exit_container(m);
+	}
+	if (r < 0)
+		goto bad;
+	sd_bus_message_exit_container(m);
+
+	if (access(in->shm, R_OK | W_OK) != 0) {
+		sd_bus_error_setf(err, ERR_PREFIX "NotFound", "the Slot1 memory %s can't be opened: %s", in->shm, strerror(errno));
+		r = -ENOENT;
+		goto out;
+	}
+	if (in->id[0]) {
+		char slug[64];
+		if (bl_slug(in->id, slug, sizeof(slug)) == 0 || strcmp(slug, in->id)) {
+			sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "id '%s' must be lower-case [a-z0-9-] (try '%s')", in->id, slug);
+			r = -EINVAL;
+			goto out;
+		}
+	} else {
+		do
+			snprintf(in->id, sizeof(in->id), "slot-%u", ++H.counter);
+		while (find(in->id));
+	}
+	if (find(in->id)) {
+		sd_bus_error_setf(err, ERR_PREFIX "Exists", "instance '%s' already exists", in->id);
+		r = -EEXIST;
+		goto out;
+	}
+	/* every insert through the registry gate */
+	if (!in->force)
+		for (unsigned i = 0; i < in->n_chain; i++) {
+			char p[1024], id[256] = "", rpath[PATH_MAX], rfmt[8], grade[16] = "", reasons[512] = "";
+			snprintf(p, sizeof(p), "%s", in->chain[i]);
+			char *hash = strstr(p, "://") ? NULL : strchr(p, '#');
+			if (hash) {
+				snprintf(id, sizeof(id), "%s", hash + 1);
+				*hash = 0;
+			}
+			resolve_plugin(p, "", rpath, sizeof(rpath), rfmt, sizeof(rfmt));
+			const char *gid = id[0] ? id : !rpath[0] && !strcmp(rfmt, "lv2") ? p : NULL;
+			if (registry_grade(rfmt, rpath, gid, grade, sizeof(grade), reasons, sizeof(reasons)) == 1 &&
+			    !strcmp(grade, "fail")) {
+				sd_bus_error_setf(err, ERR_PREFIX "GradedFail",
+						  "the registry grades insert %u (%s) fail: %s (load with force=true to run it anyway)",
+						  i + 1, rpath[0] ? rpath : p, reasons);
+				r = -EPERM;
+				goto out;
+			}
+		}
+	snprintf(in->node, sizeof(in->node), "%s", in->id);
+	snprintf(in->plugin_format, sizeof(in->plugin_format), "slot");
+	/* the inserts' states: <id>.slot/insert<k>.<format>state; a new chain starts from defaults */
+	snprintf(in->state_path, sizeof(in->state_path), "%s/%s.slot", H.state_dir, in->id);
+	{
+		char cmd[1400];
+		snprintf(cmd, sizeof(cmd), "rm -rf -- '%s'", in->state_path);
+		if (system(cmd) != 0)
+			logf_("%s: could not clear %s", in->id, in->state_path);
+	}
+	if (mkdir_p(in->state_path) < 0) {
+		sd_bus_error_set_errnof(err, errno, "cannot create %s: %m", in->state_path);
+		r = -errno;
+		goto out;
+	}
+	snprintf(in->log_path, sizeof(in->log_path), "%s/%s.log", H.log_dir, in->id);
+	unlink(in->log_path);
+
+	in->next = H.instances;
+	H.instances = in;
+	if (spawn(in) < 0) {
+		r = -errno;
+		H.instances = in->next;
+		sd_bus_error_set_errnof(err, -r, "could not start the slot host: %m");
+		goto out;
+	}
+	in->pending_load = sd_bus_message_ref(m);
+	return 1;
+bad:
+	sd_bus_error_set(err, SD_BUS_ERROR_INVALID_ARGS, "LoadSlot(s shm, as plugins, a{sv} options)");
+out:
+	free(in);
+	return r < 0 ? r : -EINVAL;
+}
+
 static int m_unload(sd_bus_message *m, void *userdata, sd_bus_error *err)
 {
 	const char *id;
@@ -971,6 +1170,8 @@ static const sd_bus_vtable vtable[] = {
 	SD_BUS_VTABLE_START(0),
 	SD_BUS_METHOD_WITH_ARGS("Load", SD_BUS_ARGS("s", plugin, "a{sv}", options), SD_BUS_RESULT("s", id), m_load,
 				SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("LoadSlot", SD_BUS_ARGS("s", shm, "as", plugins, "a{sv}", options), SD_BUS_RESULT("s", id),
+				m_load_slot, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Unload", SD_BUS_ARGS("s", id), SD_BUS_NO_RESULT, m_unload, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Restart", SD_BUS_ARGS("s", id), SD_BUS_NO_RESULT, m_restart, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Get", SD_BUS_ARGS("s", id), SD_BUS_RESULT("a{sv}", info), m_get, SD_BUS_VTABLE_UNPRIVILEGED),
@@ -1017,6 +1218,7 @@ static void usage(FILE *f)
 {
 	fputs("usage: backline-hostd [options]\n"
 	      "  --worker PATH        backline-plugin-worker to run (default: next to this binary, then $PATH)\n"
+	      "  --slot-host PATH     backline-slot-host for LoadSlot chains (default: next to the worker)\n"
 	      "  --state-dir DIR      per-instance plugin state (default: $XDG_STATE_HOME/backline/instances)\n"
 	      "  --log-dir DIR        per-instance worker logs (default: $XDG_RUNTIME_DIR/backline/workers)\n"
 	      "  --no-scope           run workers as plain child processes, not systemd user scopes\n"
@@ -1035,7 +1237,7 @@ int main(int argc, char **argv)
 		{ "log-dir", required_argument, NULL, 'l' }, { "no-scope", no_argument, NULL, 'S' },
 		{ "memory-max", required_argument, NULL, 'm' }, { "ready-timeout", required_argument, NULL, 't' },
 		{ "replace", no_argument, NULL, 'r' }, { "registry", required_argument, NULL, 'g' },
-		{ "help", no_argument, NULL, 'h' }, { 0 } };
+		{ "slot-host", required_argument, NULL, 'H' }, { "help", no_argument, NULL, 'h' }, { 0 } };
 	bool replace = false;
 	int c;
 	H.use_scope = true;
@@ -1044,6 +1246,7 @@ int main(int argc, char **argv)
 	while ((c = getopt_long(argc, argv, "h", opts, NULL)) != -1) {
 		switch (c) {
 		case 'w': snprintf(H.worker, sizeof(H.worker), "%s", optarg); break;
+		case 'H': snprintf(H.slot_host, sizeof(H.slot_host), "%s", optarg); break;
 		case 's': snprintf(H.state_dir, sizeof(H.state_dir), "%s", optarg); break;
 		case 'l': snprintf(H.log_dir, sizeof(H.log_dir), "%s", optarg); break;
 		case 'S': H.use_scope = false; break;
@@ -1068,6 +1271,15 @@ int main(int argc, char **argv)
 		}
 		if (access(H.worker, X_OK) != 0)
 			snprintf(H.worker, sizeof(H.worker), "backline-plugin-worker");
+	}
+	if (!H.slot_host[0]) {
+		/* next to the worker */
+		snprintf(H.slot_host, sizeof(H.slot_host), "%s", H.worker);
+		char *slash = strrchr(H.slot_host, '/');
+		if (slash)
+			snprintf(slash + 1, sizeof(H.slot_host) - (size_t)(slash + 1 - H.slot_host), "backline-slot-host");
+		else
+			snprintf(H.slot_host, sizeof(H.slot_host), "backline-slot-host");
 	}
 	const char *home = getenv("HOME");
 	bool registry_set = false;

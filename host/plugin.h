@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct pw_loop;
@@ -130,6 +131,11 @@ public:
     // A set from D-Bus/OSC, already clamped. Returns the value to send to the
     // audio thread (VST3: normalized; others: as is).
     virtual double prepare_set(const ParamInfo &p, double value) { return value; }
+    // Main: a value the audio thread already gave the plugin without
+    // prepare_set (the slot host's same-cycle events), in the units process()
+    // took; keeps the adapter's main-side view (state saves, VST3's
+    // controller) current.
+    virtual void applied(const ParamInfo &p, double adapter_value) {}
     // A set while not active (no audio thread to deliver it).
     virtual bool set_param_inactive(const ParamInfo &p, double value) = 0;
     // A value the plugin reported (audio thread units), back on main; returns
@@ -139,6 +145,9 @@ public:
     virtual bool activate(uint32_t rate, uint32_t max_frames) = 0;
     virtual void deactivate() = 0;
     virtual void on_main_thread() {}            // after Host::request_callback
+    // Main thread, while active: the frames of delay the plugin reports
+    // (CLAP latency, VST3 getLatencySamples, LV2's lv2:latency output port).
+    virtual uint32_t latency() { return 0; }
 
     virtual bool save_state(std::vector<uint8_t> &out, std::string *err) = 0;
     virtual bool load_state(const std::vector<uint8_t> &in, std::string *err) = 0;
@@ -178,7 +187,14 @@ std::unique_ptr<PluginInstance> load_vst3(Host *h, const std::string &path, cons
 std::unique_ptr<PluginInstance> load_lv2(Host *h, const std::string &uri_or_bundle, const std::string &plugin_id, bool list_only);
 #endif
 
-// Shared helpers
+// Shared helpers (common.cpp)
+enum class Fmt { Auto, Clap, Vst3, Lv2 };
+// The plugin argument -> (format, path or URI): a path decides by its suffix;
+// a bare name is looked up in the standard directories, CLAP first, then
+// VST3, then LV2 (or only in `want`'s). Dies if nothing is found.
+std::pair<Fmt, std::string> resolve_plugin(std::string p, Fmt want);
+std::unique_ptr<PluginInstance> load_plugin(Host *h, Fmt f, const std::string &path, const std::string &plugin_id, bool list_only);
+extern const char *prog;                        // for die(): "backline-plugin-worker"
 // The worker's real stdout (machine-readable output: --list, the ready line).
 // fd 1 itself goes to stderr, so a plugin that prints can't corrupt it.
 extern FILE *out;

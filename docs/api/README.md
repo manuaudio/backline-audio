@@ -13,6 +13,7 @@ all of them:
 | Clock and transport | `io.github.manuaudio.Backline.Clock` | `/io/github/manuaudio/Backline/Clock` | `io.github.manuaudio.Backline.Clock1` ([Clock1.md](Clock1.md)) |
 | OSC and MIDI control | `io.github.manuaudio.Backline.Control` | `/io/github/manuaudio/Backline/Control` | `io.github.manuaudio.Backline.Control1` ([Control1.md](Control1.md)) |
 | A program's parameter tree | `io.github.manuaudio.Backline.Control` | `/io/github/manuaudio/Backline/Params` | `io.github.manuaudio.Backline.Params1` ([Params1.md](Params1.md)) |
+| Slot chains (shared memory, not D-Bus) | — | — | `backline/slot1.h` ([Slot1.md](Slot1.md)); supervised through `Host1.LoadSlot` |
 | Control surfaces | `io.github.manuaudio.Backline.Surface` | `/io/github/manuaudio/Backline/Surface` | `io.github.manuaudio.Backline.Surface1` ([Surface1.md](Surface1.md)) |
 
 The **bus name has no version number; the interface does.** A later,

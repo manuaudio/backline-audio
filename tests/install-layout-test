@@ -44,3 +44,8 @@ else
   [[ -z $hook ]] || { echo "not ok - no pacman hook outside /usr (${hook#"$dest"})"; exit 1; }
 fi
 echo "ok - the pacman hook only under /usr"
+# hostd runs LoadSlot chains with the slot host next to the worker
+w=$(find "$dest" -name backline-plugin-worker -type f -print -quit)
+[[ -n $w && -x $(dirname "$w")/backline-slot-host ]] || { echo "not ok - backline-slot-host is installed next to the worker"; exit 1; }
+[[ -f $(find "$dest" -path '*include/backline/slot1.h' -print -quit) ]] || { echo "not ok - the Slot1 header is installed"; exit 1; }
+echo "ok - the slot host sits next to the worker, and backline/slot1.h is installed"

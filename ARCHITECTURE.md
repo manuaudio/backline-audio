@@ -66,7 +66,7 @@ effect-insert component.
 | Component | One line | Language | Status |
 |---|---|---|---|
 | `backline-registry` + `backline-probe` | The system plugin index (CLAP, VST3, LV2), with crash-proof scanning and validation on install | C | **Built and measured** (§4.4): sandboxed probes, grades, cache, `Registry1` |
-| `backline-hostd` + `backline-plugin-worker` | Out-of-process plugin host: each instance one process and one PipeWire node, with MIDI in, params and presets over D-Bus and OSC | C (hostd), C++ (worker) | **Built and measured** (§4.1, §4.3, §4.5): CLAP, VST3 and LV2; presets; supervisor with restart-with-state |
+| `backline-hostd` + `backline-plugin-worker` + `backline-slot-host` | Out-of-process plugin host: each instance one process and one PipeWire node, with MIDI in, params and presets over D-Bus and OSC; or, in slot mode, a strip's whole insert chain in one process inside an engine's cycle (`Slot1`) | C (hostd), C++ (worker, slot host) | **Built and measured** (§4.1, §4.3, §4.5, §4.14): CLAP, VST3 and LV2; presets; supervisor with restart-with-state; slot mode offline |
 | `backline-recorderd` | Records any set of nodes to sample-aligned, timestamped multitrack WAV/BWF (RF64 past 4 GB) or FLAC; virtual soundcheck | C | **Built and measured** (§4.2, §4.6, §4.7): `Recorder1`, markers, takes, input-latency compensation, stall-proof disk thread, soundcheck |
 | `backline-playerd` | Plays files into the graph on the shared timeline: each file a node, starting on an exact transport frame, with its own gain | C | **Built and measured** (§4.9): `Player1`, sample-exact starts, streaming past an in-memory head |
 | `backline-clockd` | Transport, tempo and timecode: the PipeWire timeline owner, Ableton Link, LTC/MTC generation and chase | C++ (Link is C++) | **Built and measured** (§4.8): `Clock1`, LTC/MTC to the sample, Link |
@@ -196,6 +196,19 @@ effect-insert component.
     its format (path for CLAP and VST3, URI for LV2). One graded `fail` is
     refused unless loaded with `force`.
   - The supervisor never loads plugin code itself.
+  - **Slot mode** (built, §4.14; [docs/api/Slot1.md](docs/api/Slot1.md)).
+    For a mixing engine's inserts, one PipeWire node per plugin costs a
+    quantum per hop. `backline-slot-host` instead runs **one strip's whole
+    insert chain in one process, inside the engine's own cycle**. The
+    engine creates a sealed memfd and copies the strip's audio in. It wakes
+    the chain with a futex and waits on another until a deadline. If the
+    chain is late, the engine plays the dry signal delayed by the chain's
+    reported latency, so alignment holds. The chain is then stalled until
+    it catches up or a new sandbox takes over. `Host1.LoadSlot(s shm, as
+    plugins, a{sv})` supervises it like a worker: a scope, the registry
+    gate, restart with state on the same memory. The slot host needs no
+    PipeWire server; its loop serves only plugin timers. The contract is a
+    header-only C file, `backline/slot1.h`, so an engine links nothing.
 - **Threads (implemented in the worker).**
   - *Main* is the PipeWire main loop. It makes every main-thread call of
     the plugin (CLAP `[main-thread]`: `init`, `activate`,
@@ -1115,6 +1128,33 @@ devices (`tools/mcu-sim.c --net`). 50 checks; full report in
   nothing. The X-Touch (one session) refuses it. When the main stops, the
   standby gets the X-Touch 2.5 s later, and `backline surfaces activate`
   draws both in about 1 s. Their faders then move the standby's mixer.
+### 4.14 Slot mode (`tests/slot-proof`, `tests/unit/test_slot1.c`)
+
+Offline, with no audio server. `backline-test-slot-driver` plays the
+engine, against the real `backline-slot-host` and a test effect built as
+CLAP, VST3 and LV2 (`tests/plugins/slotfx.h`). The effect is a gain with a
+fixed, reported latency, and switches that crash, oversleep or allocate.
+Numbers are in [Slot1.md §7](docs/api/Slot1.md); the full report is in
+`docs/proofs/slot-proof.txt`.
+
+- **+0 frames.** An impulse through a 0-latency chain comes out at the same
+  frame of the same cycle. Through 37-frame and 0+37+300 chains, it comes
+  out at exactly the reported latency. This holds in every format and in a
+  mixed CLAP+VST3+LV2 chain.
+- **Deadline.** An insert that sleeps three periods gives one late block and
+  three stalled ones. Every one of them is the input delayed by 37 frames,
+  sample-exact. The chain is back on the fourth block.
+- **Crash.** Chain A's plugin segfaults. A plays delayed dry until a new
+  sandbox takes the memory over: the driver restarts it, and so does hostd
+  through `LoadSlot`, in 3 ms, with the saved gain. Chain B, in its own
+  process, plays every sample wet and right.
+- **Allocations.** Zero heap calls on the sandbox's audio thread or in the
+  engine's cycle over 5,000 cycles of four inserts with parameter traffic.
+  A plugin that allocates is counted.
+- **Round trip** at 64 frames: p99 155–180 µs against a 667 µs deadline, at
+  normal priority. The realtime run waits for the hold to lift and for the
+  P5 realtime limits.
+
 ## 5. Build order
 
 1. **Host supervisor and client skeleton.** *Done (§4.3).*

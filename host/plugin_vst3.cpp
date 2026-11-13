@@ -237,6 +237,8 @@ public:
         return n;
     }
 
+    void applied(const ParamInfo &p, double n) override { controller->setParamNormalized(p.id, n); }
+
     bool set_param_inactive(const ParamInfo &p, double v) override
     {
         // no process() to deliver it now: the controller has it already
@@ -481,6 +483,7 @@ public:
         return r == kResultOk || r == kNotImplemented;
     }
     void stop_processing() override { processor->setProcessing(false); }
+    uint32_t latency() override { return active && processor ? processor->getLatencySamples() : 0; }
 
     void add_param_change(ParamID id, int32 offset, double v)
     {

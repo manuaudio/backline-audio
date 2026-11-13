@@ -1,0 +1,34 @@
+slot-proof: Slot1 offline, no audio server (16 CPUs, 7.2.5-3-omarchy)
+[clap]
+  ok   clap align, latency 0: {"test": "align", "inserts": 1, "latency": 0, "in_frame": 17, "out_frame": 17, "offset": 0, "same_cycle": true, "amplitude": 0.501187, "tries": 1}
+  ok   clap align, 37 frames: {"test": "align", "inserts": 1, "latency": 37, "in_frame": 17, "out_frame": 54, "offset": 0, "same_cycle": true, "amplitude": 0.501187, "tries": 1}
+  ok   clap align, 0+37+300 chain: {"test": "align", "inserts": 3, "latency": 337, "in_frame": 17, "out_frame": 354, "offset": 0, "same_cycle": false, "amplitude": 0.501187, "tries": 1}
+  ok   clap deadline miss: {"test": "deadline", "latency": 37, "blocks": 400, "wet": 396, "late": 1, "stalled": 3, "first_late": 150, "recovered_at": 154, "dry_max_error": 0, "wet_max_error": 2.98023e-08, "misses_header": 1}
+  ok   clap crash isolation: {"test": "crash", "supervisor": "driver", "latency": 37, "signal": 11, "a_dry_blocks": 72, "a_back_at": 172, "restart_ms": 2.3, "crash_to_wet_ms": 96.0, "b_wet": 374, "b_dry": 0, "b_misses": 0, "a_max_error": 2.98023e-08, "b_max_error": 2.98023e-08}
+  ok   clap allocations, 4 inserts: {"test": "allocs", "inserts": 4, "cycles": 5000, "wet": 5000, "sandbox_allocs": 0, "sandbox_frees": 0, "engine_heap_calls": 0, "control_allocs_seen": 100}
+[vst3]
+  ok   vst3 align, latency 0: {"test": "align", "inserts": 1, "latency": 0, "in_frame": 17, "out_frame": 17, "offset": 0, "same_cycle": true, "amplitude": 0.501187, "tries": 1}
+  ok   vst3 align, 37 frames: {"test": "align", "inserts": 1, "latency": 37, "in_frame": 17, "out_frame": 54, "offset": 0, "same_cycle": true, "amplitude": 0.501187, "tries": 1}
+  ok   vst3 align, 0+37+300 chain: {"test": "align", "inserts": 3, "latency": 337, "in_frame": 17, "out_frame": 354, "offset": 0, "same_cycle": false, "amplitude": 0.501187, "tries": 1}
+  ok   vst3 deadline miss: {"test": "deadline", "latency": 37, "blocks": 400, "wet": 396, "late": 1, "stalled": 3, "first_late": 150, "recovered_at": 154, "dry_max_error": 0, "wet_max_error": 2.98023e-08, "misses_header": 1}
+  ok   vst3 crash isolation: {"test": "crash", "supervisor": "driver", "latency": 37, "signal": 11, "a_dry_blocks": 113, "a_back_at": 213, "restart_ms": 2.6, "crash_to_wet_ms": 150.7, "b_wet": 415, "b_dry": 0, "b_misses": 0, "a_max_error": 2.98023e-08, "b_max_error": 2.98023e-08}
+  ok   vst3 allocations, 4 inserts: {"test": "allocs", "inserts": 4, "cycles": 5000, "wet": 5000, "sandbox_allocs": 0, "sandbox_frees": 0, "engine_heap_calls": 0, "control_allocs_seen": 100}
+[lv2]
+  ok   lv2 align, latency 0: {"test": "align", "inserts": 1, "latency": 0, "in_frame": 17, "out_frame": 17, "offset": 0, "same_cycle": true, "amplitude": 0.501187, "tries": 1}
+  ok   lv2 align, 37 frames: {"test": "align", "inserts": 1, "latency": 37, "in_frame": 17, "out_frame": 54, "offset": 0, "same_cycle": true, "amplitude": 0.501187, "tries": 1}
+  ok   lv2 align, 0+37+300 chain: {"test": "align", "inserts": 3, "latency": 337, "in_frame": 17, "out_frame": 354, "offset": 0, "same_cycle": false, "amplitude": 0.501187, "tries": 1}
+  ok   lv2 deadline miss: {"test": "deadline", "latency": 37, "blocks": 400, "wet": 397, "late": 1, "stalled": 2, "first_late": 150, "recovered_at": 153, "dry_max_error": 0, "wet_max_error": 2.98023e-08, "misses_header": 1}
+  ok   lv2 crash isolation: {"test": "crash", "supervisor": "driver", "latency": 37, "signal": 11, "a_dry_blocks": 73, "a_back_at": 173, "restart_ms": 2.7, "crash_to_wet_ms": 97.4, "b_wet": 375, "b_dry": 0, "b_misses": 0, "a_max_error": 2.98023e-08, "b_max_error": 2.98023e-08}
+  ok   lv2 allocations, 4 inserts: {"test": "allocs", "inserts": 4, "cycles": 5000, "wet": 5000, "sandbox_allocs": 0, "sandbox_frees": 0, "engine_heap_calls": 0, "control_allocs_seen": 100}
+[mixed]
+  ok   clap+vst3+lv2 align: {"test": "align", "inserts": 3, "latency": 337, "in_frame": 17, "out_frame": 354, "offset": 0, "same_cycle": false, "amplitude": 0.501187, "tries": 1}
+[hostd]
+{"bus": "io.github.manuaudio.Backline.Host", "pid": 180766, "worker": "/nonexistent", "scopes": false, "state_dir": "/tmp/tmp.6XFUeL3wL1/state", "registry": ""}
+  ok   clap crash isolation, hostd restarts it: {"test": "crash", "supervisor": "hostd", "latency": 37, "signal": 11, "a_dry_blocks": 70, "a_back_at": 170, "restart_ms": -1.0, "crash_to_wet_ms": 93.3, "b_wet": 372, "b_dry": 0, "b_misses": 0, "a_max_error": 2.98023e-08, "b_max_error": 2.98023e-08}
+  ok   vst3 crash isolation, hostd restarts it: {"test": "crash", "supervisor": "hostd", "latency": 37, "signal": 11, "a_dry_blocks": 68, "a_back_at": 168, "restart_ms": -1.0, "crash_to_wet_ms": 90.7, "b_wet": 370, "b_dry": 0, "b_misses": 0, "a_max_error": 2.98023e-08, "b_max_error": 2.98023e-08}
+  ok   lv2 crash isolation, hostd restarts it: {"test": "crash", "supervisor": "hostd", "latency": 37, "signal": 11, "a_dry_blocks": 73, "a_back_at": 173, "restart_ms": -1.0, "crash_to_wet_ms": 97.4, "b_wet": 375, "b_dry": 0, "b_misses": 0, "a_max_error": 2.98023e-08, "b_max_error": 2.98023e-08}
+[timing]
+  ok   timing, 1 insert, 64 frames: {"test": "timing", "inserts": 1, "frames": 64, "rate": 48000, "period_us": 1333.3, "deadline_us": 666.7, "cycles": 20000, "wet": 20000, "misses": 0, "rtt_us": {"p50": 113.2, "p99": 174.2, "p999": 249.0, "max": 305.5}, "sandbox_us": {"p50": 1.3, "p99": 7.9, "max": 134.6}}
+  ok   timing, 4 inserts, 64 frames: {"test": "timing", "inserts": 4, "frames": 64, "rate": 48000, "period_us": 1333.3, "deadline_us": 666.7, "cycles": 20000, "wet": 20000, "misses": 0, "rtt_us": {"p50": 111.8, "p99": 170.3, "p999": 198.7, "max": 295.3}, "sandbox_us": {"p50": 2.4, "p99": 19.8, "max": 123.4}}
+  ok   timing, 4 inserts, 128 frames: {"test": "timing", "inserts": 4, "frames": 128, "rate": 48000, "period_us": 2666.7, "deadline_us": 1333.3, "cycles": 10000, "wet": 10000, "misses": 0, "rtt_us": {"p50": 125.7, "p99": 232.1, "p999": 282.4, "max": 565.6}, "sandbox_us": {"p50": 6.7, "p99": 28.0, "max": 142.9}}
+results: /home/ai/Developer-lab/backline/tests/out/slot/results.jsonl

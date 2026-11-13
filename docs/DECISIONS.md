@@ -244,3 +244,43 @@ Tests use hand-written `pw-dump` fixtures (`omarchy/test/fixtures/pw-dump`).
 panel can drop the `pw-dump` read), or when a stream converted twice (stream
 and device both off the graph rate, at the same rate) turns out to matter:
 the stream-against-device comparison does not show that case.
+
+## D12. Slot mode: one process per strip chain, a futex pair, delayed dry on a miss (2026-11-12)
+
+**Decision.** A mixing engine's same-cycle inserts run in
+`backline-slot-host`, one process per strip chain. The engine owns the
+cycle and the memory: a sealed memfd with a 4 KiB header, two event rings
+and the audio, in place. It wakes the chain through a shared futex (`req`)
+and waits on another (`done`) until a deadline it picks. If the chain is
+late, the block plays the dry input delayed by the chain's reported latency,
+and the chain is stalled: no new request goes out until the sandbox has
+caught up or a new one has taken the memory over (`generation` changed). The
+contract is one header-only C file, `lib/include/backline/slot1.h`, holding
+both sides.
+
+**Why.**
+
+- **One process per chain, not per plugin.** One round trip per strip
+  instead of one per insert, and a crash still costs one strip, never the
+  mix. One process per plugin would multiply the wake-ups. One process for
+  every strip would make a crash cost the mix.
+- **Futexes on shared memory, not a socket or eventfd.** A wake and a wait
+  are one syscall each. The engine can spin briefly first, and the wait takes
+  an absolute deadline (`FUTEX_WAIT_BITSET`, `CLOCK_MONOTONIC`).
+- **Stall instead of overlap.** After a miss the sandbox may still be
+  reading the buffer, so the engine must not write it. Stalling until
+  `done == req` keeps one buffer and no locks, at the cost of the stalled
+  blocks also being dry.
+- **Delayed dry, not silence.** The strip keeps playing, and stays aligned
+  with every other path through the engine's PDC.
+- **Begin and end are separate calls,** so an engine sends every chain's
+  request before it waits on any. The first crash proof waited chain by
+  chain, and one dead chain used up the next chain's deadline.
+- **A takeover generation, not a reset handshake.** A restarted sandbox
+  sets `done = req` and adds one to `generation`. The engine needs no
+  message from the supervisor.
+
+**Revisit when** the console's engine runs it live (verify when the hold
+lifts). Two signs would call for a change: deadline misses at realtime
+priority, or a need for a second buffer, so a slow chain could keep
+running while the engine moves on.

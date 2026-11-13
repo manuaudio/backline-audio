@@ -44,9 +44,13 @@ target_link_libraries(bl_graph PUBLIC PkgConfig::PIPEWIRE)
 # Plugin host: one plugin instance per process, as one PipeWire node. The
 # format sits behind one interface (host/plugin.h): CLAP always; VST3 when the
 # VST3 SDK is found; LV2 when lilv is.
-add_executable(backline-plugin-worker host/worker.cpp host/plugin_clap.cpp)
-target_include_directories(backline-plugin-worker PRIVATE third_party/clap/include)
-target_link_libraries(backline-plugin-worker PRIVATE bl_graph PkgConfig::PIPEWIRE PkgConfig::SYSTEMD ${CMAKE_DL_LIBS})
+# The adapters are one static library, shared by the worker (one plugin, one
+# node) and the slot host (one strip's chain over Slot1 shared memory).
+add_library(bl_plugins STATIC host/common.cpp host/plugin_clap.cpp)
+target_include_directories(bl_plugins PUBLIC third_party/clap/include host)
+target_link_libraries(bl_plugins PUBLIC PkgConfig::PIPEWIRE ${CMAKE_DL_LIBS})
+add_executable(backline-plugin-worker host/worker.cpp)
+target_link_libraries(backline-plugin-worker PRIVATE bl_plugins bl_graph PkgConfig::PIPEWIRE PkgConfig::SYSTEMD)
 if(BL_HAVE_SPA_PARSER_BODY)
   target_compile_definitions(backline-plugin-worker PRIVATE BL_HAVE_SPA_PARSER_BODY=1)
 endif()
@@ -58,9 +62,9 @@ if(BACKLINE_LV2)
   if(NOT LILV_FOUND)
     message(FATAL_ERROR "BACKLINE_LV2=ON but lilv-0 was not found")
   endif()
-  target_sources(backline-plugin-worker PRIVATE host/plugin_lv2.cpp)
-  target_compile_definitions(backline-plugin-worker PRIVATE BL_HAVE_LV2=1)
-  target_link_libraries(backline-plugin-worker PRIVATE PkgConfig::LILV)
+  target_sources(bl_plugins PRIVATE host/plugin_lv2.cpp)
+  target_compile_definitions(bl_plugins PUBLIC BL_HAVE_LV2=1)
+  target_link_libraries(bl_plugins PUBLIC PkgConfig::LILV)
 endif()
 
 # VST3 through the VST3 SDK's hosting classes (MIT since 3.8). Only the
@@ -119,11 +123,20 @@ if(BACKLINE_VST3)
   target_compile_options(bl_vst3sdk PRIVATE -w)
   set_target_properties(bl_vst3sdk PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(bl_vst3sdk PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
-  target_sources(backline-plugin-worker PRIVATE host/plugin_vst3.cpp)
-  target_compile_definitions(backline-plugin-worker PRIVATE BL_HAVE_VST3=1)
-  target_link_libraries(backline-plugin-worker PRIVATE bl_vst3sdk)
+  target_sources(bl_plugins PRIVATE host/plugin_vst3.cpp)
+  target_compile_definitions(bl_plugins PUBLIC BL_HAVE_VST3=1)
+  target_link_libraries(bl_plugins PUBLIC bl_vst3sdk)
 endif()
 message(STATUS "plugin worker formats: CLAP yes, VST3 ${BACKLINE_VST3}, LV2 ${BACKLINE_LV2}")
+
+# Slot host: one strip's insert chain in one process, same cycle, over Slot1
+# shared memory (docs/api/Slot1.md). It needs no PipeWire server (only its
+# loop, for plugin timers). bl_rtalloc counts heap calls on its audio thread.
+add_library(bl_rtalloc STATIC common/bl_rtalloc.c)
+target_include_directories(bl_rtalloc PUBLIC common)
+add_executable(backline-slot-host host/slot_host.cpp)
+target_include_directories(backline-slot-host PRIVATE lib/include)
+target_link_libraries(backline-slot-host PRIVATE bl_plugins bl_rtalloc Threads::Threads)
 
 # Recorder: N nodes into sample-aligned, timestamped files.
 add_library(bl_rec_align STATIC recorder/rec_align.c)
@@ -232,6 +245,62 @@ if(BUILD_TESTING)
   endif()
 endif()
 
+# Slot1 proof (tests/slot-proof): the slot test effect in all three formats
+# (tests/plugins/slotfx.h) and the driver that plays the engine's role.
+if(BUILD_TESTING)
+  set(_sp ${CMAKE_BINARY_DIR}/slot-plugins)
+  add_library(backline-test-slotfx-clap MODULE tests/plugins/slotfx-clap.c)
+  target_include_directories(backline-test-slotfx-clap PRIVATE third_party/clap/include)
+  target_link_libraries(backline-test-slotfx-clap PRIVATE m)
+  set_target_properties(backline-test-slotfx-clap PROPERTIES PREFIX "" OUTPUT_NAME backline-test-slotfx SUFFIX ".clap"
+    C_VISIBILITY_PRESET hidden LIBRARY_OUTPUT_DIRECTORY ${_sp})
+  if(BACKLINE_LV2)
+    set(_sl ${_sp}/lv2/backline-test-slotfx.lv2)
+    add_library(backline-test-slotfx-lv2 MODULE tests/plugins/slotfx-lv2.c)
+    target_include_directories(backline-test-slotfx-lv2 PRIVATE ${LILV_INCLUDE_DIRS})
+    target_link_libraries(backline-test-slotfx-lv2 PRIVATE m)
+    set_target_properties(backline-test-slotfx-lv2 PROPERTIES PREFIX "" OUTPUT_NAME backline-test-slotfx
+      C_VISIBILITY_PRESET hidden LIBRARY_OUTPUT_DIRECTORY ${_sl})
+    configure_file(tests/plugins/slotfx.lv2/manifest.ttl.in ${_sl}/manifest.ttl @ONLY)
+    configure_file(tests/plugins/slotfx.lv2/slotfx.ttl ${_sl}/slotfx.ttl COPYONLY)
+  endif()
+  if(BACKLINE_VST3)
+    set(_s ${BACKLINE_VST3SDK_DIR})
+    add_library(backline-test-slotfx-vst3 MODULE tests/plugins/slotfx-vst3.cpp
+      ${_s}/public.sdk/source/main/pluginfactory.cpp
+      ${_s}/public.sdk/source/main/linuxmain.cpp
+      ${_s}/public.sdk/source/vst/vstsinglecomponenteffect.cpp
+      ${_s}/public.sdk/source/vst/vstcomponentbase.cpp
+      ${_s}/public.sdk/source/vst/vstbus.cpp
+      ${_s}/public.sdk/source/vst/vstparameters.cpp
+      ${_s}/public.sdk/source/common/pluginview.cpp
+      ${_s}/public.sdk/source/common/commoniids.cpp)
+    target_include_directories(backline-test-slotfx-vst3 PRIVATE tests/plugins)
+    target_compile_options(backline-test-slotfx-vst3 PRIVATE -w)
+    target_link_libraries(backline-test-slotfx-vst3 PRIVATE bl_vst3sdk)
+    set_target_properties(backline-test-slotfx-vst3 PROPERTIES PREFIX "" OUTPUT_NAME backline-test-slotfx
+      CXX_VISIBILITY_PRESET hidden
+      LIBRARY_OUTPUT_DIRECTORY ${_sp}/backline-test-slotfx.vst3/Contents/${CMAKE_SYSTEM_PROCESSOR}-linux)
+  endif()
+  add_executable(backline-test-slot-driver tests/tools/slot-driver.c)
+  target_include_directories(backline-test-slot-driver PRIVATE lib/include)
+  target_link_libraries(backline-test-slot-driver PRIVATE bl_rtalloc PkgConfig::JSONC Threads::Threads m)
+  add_executable(test_slot1 tests/unit/test_slot1.c)
+  target_include_directories(test_slot1 PRIVATE lib/include)
+  target_link_libraries(test_slot1 PRIVATE bl_rtalloc Threads::Threads)
+  add_test(NAME slot1_contract COMMAND test_slot1)
+  set(_slot_formats "clap")
+  if(BACKLINE_VST3)
+    list(APPEND _slot_formats vst3)
+  endif()
+  if(BACKLINE_LV2)
+    list(APPEND _slot_formats lv2)
+  endif()
+  string(REPLACE ";" "," _slot_formats "${_slot_formats}")
+  add_test(NAME slot-proof COMMAND ${PROJECT_SOURCE_DIR}/tests/slot-proof ${CMAKE_BINARY_DIR} ${_slot_formats})
+  set_tests_properties(slot-proof PROPERTIES TIMEOUT 300)
+endif()
+
 # Clock service: transport, tempo, LTC/MTC, Ableton Link (clock/).
 option(BACKLINE_CLOCK "Build the clock service (needs jack from pipewire-jack, and libltc)" ON)
 if(BACKLINE_CLOCK)
@@ -278,7 +347,7 @@ if(BUILD_TESTING AND BACKLINE_REGISTRY)
     ENVIRONMENT "BL_BIN=${CMAKE_BINARY_DIR};BL_OUT=${CMAKE_BINARY_DIR}/tests-out/autolink")
 endif()
 
-install(TARGETS backline-plugin-worker backline-recorder backline-recorderd backline-hostd backline-cli RUNTIME DESTINATION bin)
+install(TARGETS backline-plugin-worker backline-slot-host backline-recorder backline-recorderd backline-hostd backline-cli RUNTIME DESTINATION bin)
 install(TARGETS backline LIBRARY DESTINATION lib)
 install(DIRECTORY lib/include/backline DESTINATION include)
 

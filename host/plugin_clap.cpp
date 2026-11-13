@@ -38,6 +38,7 @@ public:
     const clap_plugin_state *ext_state = nullptr;
     const clap_plugin_timer_support *ext_timer = nullptr;
     const clap_plugin_preset_load *ext_preset_load = nullptr;
+    const clap_plugin_latency *ext_latency = nullptr;
     bool dialect_midi = false, dialect_clap = false;
     uint16_t note_port = 0;
     bool active = false;
@@ -203,6 +204,8 @@ public:
             plugin->deactivate(plugin);
         active = false;
     }
+
+    uint32_t latency() override { return ext_latency && active ? ext_latency->get(plugin) : 0; }
 
     void on_main_thread() override
     {
@@ -647,6 +650,7 @@ std::unique_ptr<PluginInstance> load_clap(Host *h, const std::string &path, cons
     I->ext_state = (const clap_plugin_state *)p->get_extension(p, CLAP_EXT_STATE);
     I->ext_timer = (const clap_plugin_timer_support *)p->get_extension(p, CLAP_EXT_TIMER_SUPPORT);
     I->ext_preset_load = (const clap_plugin_preset_load *)p->get_extension(p, CLAP_EXT_PRESET_LOAD);
+    I->ext_latency = (const clap_plugin_latency *)p->get_extension(p, CLAP_EXT_LATENCY);
     if (!I->ext_preset_load)
         I->ext_preset_load = (const clap_plugin_preset_load *)p->get_extension(p, CLAP_EXT_PRESET_LOAD_COMPAT);
 

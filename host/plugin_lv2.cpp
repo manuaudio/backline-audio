@@ -118,6 +118,7 @@ public:
     std::vector<std::vector<uint32_t>> audio_in, audio_out;   // port indices, by bus (port group)
     std::vector<float> zeros = std::vector<float>(kMaxFrames, 0.f), trash = std::vector<float>(kMaxFrames, 0.f);
     Port *midi_port = nullptr;
+    Port *latency_port = nullptr;       // control output designated lv2:latency (or lv2:reportsLatency)
 
     // worker extension
     const LV2_Worker_Interface *worker_iface = nullptr;
@@ -322,11 +323,19 @@ public:
         return v;
     }
 
+    void applied(const ParamInfo &p, double v) override { ports[p.id]->mirror.store((float)v); }
+
     bool set_param_inactive(const ParamInfo &p, double v) override
     {
         ports[p.id]->mirror.store((float)v);
         ports[p.id]->value = (float)v; // the audio thread isn't running the plugin
         return true;
+    }
+
+    uint32_t latency() override
+    {
+        float v = latency_port ? latency_port->value : 0.f;
+        return v > 0 && v < 1e7f ? (uint32_t)v : 0;
     }
 
     bool activate(uint32_t rate, uint32_t) override
@@ -606,6 +615,7 @@ public:
                  *n_optional = lilv_new_uri(world, LV2_CORE__connectionOptional),
                  *n_group = lilv_new_uri(world, "http://lv2plug.in/ns/ext/port-groups#group"),
                  *n_designation = lilv_new_uri(world, LV2_CORE__designation),
+                 *n_reports_latency = lilv_new_uri(world, LV2_CORE__reportsLatency),
                  *n_time = lilv_new_uri(world, LV2_TIME__Position);
         // audio ports go into buses by port group (pg:group), in order of
         // first appearance; ungrouped ports share one bus per direction
@@ -641,8 +651,12 @@ public:
                 p->value = std::isnan(defs[i]) ? 0.f : defs[i];
                 if (LilvNode *d = lilv_port_get(plugin, lp, n_designation)) {
                     p->freewheel = !strcmp(lilv_node_as_uri(d), LV2_CORE__freeWheeling);
+                    if (!p->input && !strcmp(lilv_node_as_uri(d), LV2_CORE__latency))
+                        latency_port = p.get();
                     lilv_node_free(d);
                 }
+                if (!p->input && !latency_port && lilv_port_has_property(plugin, lp, n_reports_latency))
+                    latency_port = p.get();
                 p->mirror.store(p->value);
             } else if (lilv_port_is_a(plugin, lp, n_atom)) {
                 p->kind = Port::Atom;
@@ -673,7 +687,7 @@ public:
             }
             ports.push_back(std::move(p));
         }
-        for (LilvNode *x : {n_audio, n_control, n_input, n_atom, n_cv, n_midi, n_min_size, n_optional, n_group, n_designation, n_time})
+        for (LilvNode *x : {n_audio, n_control, n_input, n_atom, n_cv, n_midi, n_min_size, n_optional, n_group, n_designation, n_time, n_reports_latency})
             lilv_node_free(x);
         for (size_t b = 0; b < audio_in.size(); b++)
             inputs.push_back({in_keys[b], (uint32_t)audio_in[b].size()});
