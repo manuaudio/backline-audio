@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(backline VERSION 0.4.0 LANGUAGES C CXX)
+# Before any subdirectory: surface/ installs its profiles under
+# CMAKE_INSTALL_DATADIR and compiles CMAKE_INSTALL_FULL_DATADIR in.
+include(GNUInstallDirs)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
@@ -278,7 +281,6 @@ install(TARGETS backline LIBRARY DESTINATION lib)
 install(DIRECTORY lib/include/backline DESTINATION include)
 
 # D-Bus activation files (session bus).
-include(GNUInstallDirs)
 set(bindir ${CMAKE_INSTALL_FULL_BINDIR})
 set(_svcs Recorder)
 if(TARGET backline-registry)

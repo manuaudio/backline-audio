@@ -29,6 +29,13 @@ if [[ -f $dest$dir/backline-surfaced.service ]] || grep -q 'backline-surfaced' "
   grep -q '^SystemdService=backline-surfaced.service' "$(find "$dest" -name io.github.manuaudio.Backline.Surface.service -path '*dbus-1*' -print -quit)" \
     || { echo "not ok - D-Bus activation goes through the unit"; exit 1; }
   echo "ok - surfaced starts at login: its unit, enabled in default.target.wants, and D-Bus activation through it"
+  datadir=$(sed -n 's/^CMAKE_INSTALL_DATAROOTDIR:PATH=//p' "$build/CMakeCache.txt")
+  [[ $datadir == /* ]] || datadir=$prefix/${datadir:-share}
+  [[ -f $dest$datadir/backline/surfaces/behringer-xtouch.surface.json ]] \
+    || { echo "not ok - the surface profiles are installed under $datadir/backline/surfaces"; find "$dest" -name '*.surface.json'; exit 1; }
+  grep -q "BL_SURFACE_DATADIR=\\\\\"$datadir/backline/surfaces\\\\\"" "$build/build.ninja" \
+    || { echo "not ok - surfaced looks for its profiles in $datadir/backline/surfaces"; exit 1; }
+  echo "ok - the surface profiles are installed where surfaced looks for them ($datadir/backline/surfaces)"
 fi
 hook=$(find "$dest" -name backline-plugins.hook -print -quit)
 if [[ $prefix == /usr ]]; then

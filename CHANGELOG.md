@@ -11,6 +11,11 @@ WirePlumber 0.5.17).
 
 ### Fixed
 
+- **Surface profiles install under the prefix's `share/backline/surfaces`**,
+  where surfaced looks for them. `GNUInstallDirs` was included after the
+  `surface/` subdirectory, so the profiles went to `/backline/surfaces` (a
+  user-local install failed) and surfaced searched there. Test:
+  `tests/install-layout-test`.
 - **Instruments play to the default output again** (DECISIONS D2).
   WirePlumber rejected the node ("no usable format found"), so an instrument
   loaded without `--target` stayed silent. The node now shows its main
