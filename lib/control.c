@@ -337,3 +337,78 @@ int bl_control_get_status(bl_client *c, bl_control_status *st)
 	sd_bus_message_unref(reply);
 	return done(c, r < 0 ? r : 0, &e, "Control status");
 }
+
+/* ---------------------------------------------------------------- MIDI profiles */
+static int json_call(bl_client *c, const char *method, const char *arg, char **json)
+{
+	sd_bus_message *reply = NULL;
+	sd_bus_error e = SD_BUS_ERROR_NULL;
+	const char *s;
+	int r = arg ? sd_bus_call_method(bl__bus(c), CTL_NAME, CTL_PATH, CTL_IFACE, method, &e, &reply, "s", arg)
+		    : sd_bus_call_method(bl__bus(c), CTL_NAME, CTL_PATH, CTL_IFACE, method, &e, &reply, "");
+	if (r >= 0) r = sd_bus_message_read(reply, "s", &s);
+	if (r >= 0 && !(*json = strdup(s))) r = -ENOMEM;
+	sd_bus_message_unref(reply);
+	return done(c, r, &e, method);
+}
+
+int bl_control_profiles(bl_client *c, char **json) { return json_call(c, "Profiles", NULL, json); }
+int bl_control_profile(bl_client *c, const char *profile, char **json) { return json_call(c, "Profile", profile, json); }
+
+int bl_control_save_profile(bl_client *c, const char *profile, const bl_profile_options *o, char *path, size_t n)
+{
+	sd_bus_message *m = NULL, *reply = NULL;
+	sd_bus_error e = SD_BUS_ERROR_NULL;
+	int r = sd_bus_message_new_method_call(bl__bus(c), &m, CTL_NAME, CTL_PATH, CTL_IFACE, "SaveProfile");
+	if (r >= 0) r = sd_bus_message_append(m, "s", profile);
+	if (r >= 0) r = sd_bus_message_open_container(m, 'a', "{sv}");
+	if (r >= 0 && o && o->name) r = sd_bus_message_append(m, "{sv}", "name", "s", o->name);
+	if (r >= 0 && o && o->match) r = sd_bus_message_append(m, "{sv}", "match", "s", o->match);
+	if (r >= 0 && o && o->autoload >= 0) r = sd_bus_message_append(m, "{sv}", "auto", "b", o->autoload);
+	if (r >= 0 && o && o->mappings) {
+		r = sd_bus_message_open_container(m, 'e', "sv");
+		if (r >= 0) r = sd_bus_message_append(m, "s", "mappings");
+		if (r >= 0) r = sd_bus_message_open_container(m, 'v', "as");
+		if (r >= 0) r = sd_bus_message_open_container(m, 'a', "s");
+		for (size_t i = 0; r >= 0 && i < o->n_mappings; i++)
+			r = sd_bus_message_append(m, "s", o->mappings[i]);
+		if (r >= 0) r = sd_bus_message_close_container(m);
+		if (r >= 0) r = sd_bus_message_close_container(m);
+		if (r >= 0) r = sd_bus_message_close_container(m);
+	}
+	if (r >= 0) r = sd_bus_message_close_container(m);
+	if (r >= 0) r = sd_bus_call(bl__bus(c), m, 0, &e, &reply);
+	if (r >= 0) r = reply_str(reply, path, n);
+	sd_bus_message_unref(m);
+	sd_bus_message_unref(reply);
+	return done(c, r, &e, "Control SaveProfile");
+}
+
+int bl_control_load_profile(bl_client *c, const char *profile)
+{
+	sd_bus_message *reply = NULL;
+	sd_bus_error e = SD_BUS_ERROR_NULL;
+	int r = sd_bus_call_method(bl__bus(c), CTL_NAME, CTL_PATH, CTL_IFACE, "LoadProfile", &e, &reply, "s", profile);
+	int k = 0;
+	if (r >= 0) r = sd_bus_message_enter_container(reply, 'a', "s");
+	const char *s;
+	while (r >= 0 && (r = sd_bus_message_read(reply, "s", &s)) > 0)
+		k++;
+	sd_bus_message_unref(reply);
+	r = done(c, r, &e, "Control LoadProfile");
+	return r < 0 ? r : k;
+}
+
+int bl_control_unload_profile(bl_client *c, const char *profile)
+{
+	sd_bus_error e = SD_BUS_ERROR_NULL;
+	int r = sd_bus_call_method(bl__bus(c), CTL_NAME, CTL_PATH, CTL_IFACE, "UnloadProfile", &e, NULL, "s", profile);
+	return done(c, r, &e, "Control UnloadProfile");
+}
+
+int bl_control_delete_profile(bl_client *c, const char *profile)
+{
+	sd_bus_error e = SD_BUS_ERROR_NULL;
+	int r = sd_bus_call_method(bl__bus(c), CTL_NAME, CTL_PATH, CTL_IFACE, "DeleteProfile", &e, NULL, "s", profile);
+	return done(c, r, &e, "Control DeleteProfile");
+}

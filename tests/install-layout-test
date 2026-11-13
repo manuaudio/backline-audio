@@ -37,6 +37,15 @@ if [[ -f $dest$dir/backline-surfaced.service ]] || grep -q 'backline-surfaced' "
     || { echo "not ok - surfaced looks for its profiles in $datadir/backline/surfaces"; exit 1; }
   echo "ok - the surface profiles are installed where surfaced looks for them ($datadir/backline/surfaces)"
 fi
+if grep -q 'BL_MIDIPROF_DATADIR' "$build/build.ninja" 2>/dev/null; then
+  datadir=$(sed -n 's/^CMAKE_INSTALL_DATAROOTDIR:PATH=//p' "$build/CMakeCache.txt")
+  [[ $datadir == /* ]] || datadir=$prefix/${datadir:-share}
+  [[ -f $dest$datadir/backline/midi-profiles/korg-nanokontrol2.json ]] \
+    || { echo "not ok - the MIDI profiles are installed under $datadir/backline/midi-profiles"; find "$dest" -path '*midi-profiles*'; exit 1; }
+  grep -q "BL_MIDIPROF_DATADIR=\\\\\"$datadir/backline/midi-profiles\\\\\"" "$build/build.ninja" \
+    || { echo "not ok - controld looks for the MIDI profiles in $datadir/backline/midi-profiles"; exit 1; }
+  echo "ok - the MIDI profiles are installed where controld looks for them ($datadir/backline/midi-profiles)"
+fi
 hook=$(find "$dest" -name backline-plugins.hook -print -quit)
 if [[ $prefix == /usr ]]; then
   [[ -n $hook ]] || { echo "not ok - a /usr install has the pacman hook"; exit 1; }

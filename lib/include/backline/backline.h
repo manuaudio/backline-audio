@@ -315,6 +315,24 @@ int bl_control_set_midi_follow(bl_client *c, const char *regex);
 int bl_control_set_midi_out(bl_client *c, const char *regex);
 int bl_control_save(bl_client *c, char *path, size_t n);
 
+/* MIDI learn profiles (Control1.md "MIDI profiles"). JSON results are
+ * released with bl_free. */
+int bl_control_profiles(bl_client *c, char **json);
+int bl_control_profile(bl_client *c, const char *profile, char **json);
+typedef struct bl_profile_options {
+	const char *name;           /* NULL: keep (a new profile: its id) */
+	const char *match;          /* a new profile: required */
+	int autoload;               /* -1: keep (default on); 0 or 1 */
+	const char *const *mappings;/* NULL: every MIDI mapping that is the device's */
+	size_t n_mappings;
+} bl_profile_options;
+#define BL_PROFILE_OPTIONS_INIT { NULL, NULL, -1, NULL, 0 }
+int bl_control_save_profile(bl_client *c, const char *profile, const bl_profile_options *o, char *path, size_t n);
+/* Returns the number of mappings made, or a negative errno. */
+int bl_control_load_profile(bl_client *c, const char *profile);
+int bl_control_unload_profile(bl_client *c, const char *profile);
+int bl_control_delete_profile(bl_client *c, const char *profile);
+
 typedef struct bl_control_status {
 	uint32_t mappings;
 	char learning[600], midi_follow[256], node[128], config_dir[600];

@@ -50,6 +50,7 @@
 #include "bl_midibuf.h"
 #include "bl_midi_pw.h"
 #include "mapping.h"
+#include "midiprof.h"
 #include "osc.h"
 #include "params.h"
 #include "paramsd.h"
@@ -170,6 +171,16 @@ struct vnode {
 	float pend_gain;
 };
 
+#define MAX_ACTIVE_PROFILES 16
+struct active_profile {
+	bool used;
+	char id[MP_NAME_MAX];
+	char device[700];        /* the port that matched; "" = loaded by hand with no device */
+	bool manual;             /* LoadProfile: stays when the device goes */
+	regex_t re;              /* its match, for linking the device */
+	bool re_ok;
+};
+
 struct midi_ev {
 	uint64_t ns;
 	uint8_t size;
@@ -227,6 +238,12 @@ static struct {
 
 	char config_dir[600];
 	bool no_config;
+
+	/* MIDI learn profiles (docs/api/Control1.md "MIDI profiles") */
+	struct mp_set profiles;
+	char profile_dirs[2][700];      /* the user's, then the system's */
+	int n_profile_dirs;
+	struct active_profile active[MAX_ACTIVE_PROFILES];
 	int idle_exit;
 	uint64_t idle_since;
 	bool verbose;
@@ -1106,6 +1123,15 @@ static void mapping_defaults(struct mapping *m)
 	snprintf(m->role, sizeof(m->role), "all");
 }
 
+/* true: hay is a port of a device whose profile is active */
+static bool profile_port(const char *hay)
+{
+	for (int i = 0; i < MAX_ACTIVE_PROFILES; i++)
+		if (D.active[i].used && D.active[i].re_ok && regexec(&D.active[i].re, hay, 0, NULL, 0) == 0)
+			return true;
+	return false;
+}
+
 /* Fills the parsed fields and the output range; 0 or -1 with err. */
 static int mapping_finish(struct mapping *m, char *err, size_t n)
 {
@@ -1238,7 +1264,7 @@ static int mapping_from_json(json_object *o, struct mapping *m, char *err, size_
 			}
 			m->gesture_auto = !strcmp(g, "auto");
 		} else if (!strcmp(key, "role")) snprintf(m->role, sizeof(m->role), "%s", json_object_get_string(val));
-		else if (!strcmp(key, "sends") || !strcmp(key, "origin")) {
+		else if (!strcmp(key, "sends") || !strcmp(key, "origin") || !strcmp(key, "profile") || !strcmp(key, "control")) {
 			/* output-only fields of Mappings() */
 		} else {
 			snprintf(err, n, "unknown mapping key '%s'", key);
@@ -1253,6 +1279,7 @@ static int mapping_from_json(json_object *o, struct mapping *m, char *err, size_
 	return mapping_finish(m, err, n);
 }
 
+static bool mapping_control(const struct ctl_source *src, const char **profile, const char **control);
 static json_object *mapping_to_json(const struct mapping *m, bool runtime)
 {
 	json_object *o = json_object_new_object();
@@ -1284,6 +1311,11 @@ static json_object *mapping_to_json(const struct mapping *m, bool runtime)
 		json_object_object_add(o, "sends", json_object_new_int64((int64_t)m->sends));
 		if (m->origin[0])
 			json_object_object_add(o, "origin", json_object_new_string(m->origin));
+		const char *prof, *ctl;
+		if (mapping_control(&m->src, &prof, &ctl)) {
+			json_object_object_add(o, "profile", json_object_new_string(prof));
+			json_object_object_add(o, "control", json_object_new_string(ctl));
+		}
 	}
 	return o;
 }
@@ -1906,11 +1938,12 @@ static json_object *spec_to_json(const struct listener *l, bool with_secret)
 /* ============================================================ MIDI follow */
 static int follow_port(void *data, const struct bl_port *p)
 {
-	if (!D.follow_on || D.midi_port_id == SPA_ID_INVALID || !p->midi || !p->output)
+	if (D.midi_port_id == SPA_ID_INVALID || !p->midi || !p->output || p->node_id == D.node_id)
 		return 0;
 	char hay[700];
 	snprintf(hay, sizeof(hay), "%s:%s | %s", p->node_name, p->name, p->alias);
-	if (regexec(&D.follow_re, hay, 0, NULL, 0) == 0 && !bl_graph_is_linked(D.graph, p->id, D.midi_port_id)) {
+	bool want = (D.follow_on && regexec(&D.follow_re, hay, 0, NULL, 0) == 0) || profile_port(hay);
+	if (want && !bl_graph_is_linked(D.graph, p->id, D.midi_port_id)) {
 		LOG("midi-follow: linking %s\n", hay);
 		bl_graph_link(D.graph, p->id, D.midi_port_id);
 		if (D.n_followed < 64)
@@ -1923,11 +1956,12 @@ static int follow_port(void *data, const struct bl_port *p)
  * playback side) that matches the out regex. */
 static int out_follow_port(void *data, const struct bl_port *p)
 {
-	if (!D.out_on || D.midi_out_port_id == SPA_ID_INVALID || !p->midi || p->output || p->node_id == D.node_id)
+	if (D.midi_out_port_id == SPA_ID_INVALID || !p->midi || p->output || p->node_id == D.node_id)
 		return 0;
 	char hay[700];
 	snprintf(hay, sizeof(hay), "%s:%s | %s", p->node_name, p->name, p->alias);
-	if (regexec(&D.out_re, hay, 0, NULL, 0) == 0 && !bl_graph_is_linked(D.graph, D.midi_out_port_id, p->id)) {
+	bool want = (D.out_on && regexec(&D.out_re, hay, 0, NULL, 0) == 0) || profile_port(hay);
+	if (want && !bl_graph_is_linked(D.graph, D.midi_out_port_id, p->id)) {
 		LOG("midi-out: linking to %s\n", hay);
 		bl_graph_link(D.graph, D.midi_out_port_id, p->id);
 		if (D.n_out_linked < 64)
@@ -1948,6 +1982,9 @@ static int find_own_port(void *data, const struct bl_port *p)
 	return 0;
 }
 
+static void profiles_port_added(const struct bl_port *p);
+static void profiles_port_removed(void);
+
 static void on_port_added(void *data, const struct bl_port *p)
 {
 	if ((D.midi_port_id == SPA_ID_INVALID || D.midi_out_port_id == SPA_ID_INVALID) && find_own_port(NULL, p)) {
@@ -1955,6 +1992,7 @@ static void on_port_added(void *data, const struct bl_port *p)
 		bl_graph_for_each_port(D.graph, out_follow_port, NULL);
 		return;
 	}
+	profiles_port_added(p); /* first: an auto profile links its device */
 	follow_port(NULL, p);
 	out_follow_port(NULL, p);
 }
@@ -1975,6 +2013,7 @@ static void on_port_removed(void *data, uint32_t id)
 			D.followed[i] = D.followed[--D.n_followed];
 			break;
 		}
+	profiles_port_removed();
 }
 
 static const struct bl_graph_events graph_events = {
@@ -2035,6 +2074,506 @@ static int set_out_follow(const char *re, char *err, size_t n)
 	return 0;
 }
 
+/* ============================================================ MIDI profiles */
+/* A device's controls under abstract names, and what was learned for them
+ * (midiprof.h; docs/api/Control1.md "MIDI profiles"). A profile is active
+ * while its device is there (or after LoadProfile): its bindings are
+ * mappings with origin "profile:<id>", and its device's MIDI ports are
+ * linked to controld's input and output. */
+static void relink_follow(void)
+{
+	for (int i = 0; i < D.n_followed; i++)
+		if (D.midi_port_id != SPA_ID_INVALID)
+			bl_graph_unlink(D.graph, D.followed[i], D.midi_port_id);
+	D.n_followed = 0;
+	for (int i = 0; i < D.n_out_linked; i++)
+		if (D.midi_out_port_id != SPA_ID_INVALID)
+			bl_graph_unlink(D.graph, D.midi_out_port_id, D.out_linked[i]);
+	D.n_out_linked = 0;
+	bl_graph_for_each_port(D.graph, follow_port, NULL);
+	bl_graph_for_each_port(D.graph, out_follow_port, NULL);
+}
+
+static void profile_warn(void *ud, const char *path, const char *why)
+{
+	LOG("%s: not a usable MIDI profile, skipped: %s\n", path, why);
+}
+
+static void profiles_reload(void)
+{
+	mp_set_free(&D.profiles);
+	const char *dirs[2];
+	bool sys[2] = { false, true };
+	for (int i = 0; i < D.n_profile_dirs; i++)
+		dirs[i] = D.profile_dirs[i];
+	mp_set_load(&D.profiles, dirs, D.n_profile_dirs, sys, profile_warn, NULL);
+}
+
+static struct active_profile *active_find(const char *id)
+{
+	for (int i = 0; i < MAX_ACTIVE_PROFILES; i++)
+		if (D.active[i].used && !strcmp(D.active[i].id, id))
+			return &D.active[i];
+	return NULL;
+}
+
+struct present_ctx {
+	const struct mp_profile *p;
+	char *out;
+	size_t n;
+	bool found;
+};
+
+static int present_port(void *data, const struct bl_port *port)
+{
+	struct present_ctx *c = data;
+	if (!port->midi || !port->output || port->node_id == D.node_id)
+		return 0;
+	char hay[700];
+	snprintf(hay, sizeof(hay), "%s:%s | %s", port->node_name, port->name, port->alias);
+	if (mp_matches_device(c->p, hay)) {
+		snprintf(c->out, c->n, "%s", hay);
+		c->found = true;
+		return 1;
+	}
+	return 0;
+}
+
+/* The device's MIDI output port, if one is in the graph. */
+static bool profile_present(const struct mp_profile *p, char *dev, size_t n)
+{
+	struct present_ctx c = { p, dev, n, false };
+	if (n)
+		dev[0] = 0;
+	if (D.graph)
+		bl_graph_for_each_port(D.graph, present_port, &c);
+	return c.found;
+}
+
+static void origin_of(const char *id, char *out, size_t n) { snprintf(out, n, "profile:%s", id); }
+
+static int remove_profile_mappings(const char *id)
+{
+	char origin[MP_NAME_MAX + 16];
+	origin_of(id, origin, sizeof(origin));
+	int k = 0;
+	for (int i = 0; i < MAX_MAPPINGS; i++)
+		if (D.maps[i].used && !strcmp(D.maps[i].origin, origin)) {
+			D.maps[i].used = false;
+			k++;
+		}
+	return k;
+}
+
+static void profile_deactivate(struct active_profile *a, const char *reason)
+{
+	char id[MP_NAME_MAX];
+	snprintf(id, sizeof(id), "%s", a->id);
+	int k = remove_profile_mappings(id);
+	if (a->re_ok)
+		regfree(&a->re);
+	memset(a, 0, sizeof(*a));
+	relink_follow();
+	LOG("profile %s unloaded (%s): %d mappings removed\n", id, reason, k);
+	sd_bus_emit_signal(D.bus, OBJ_PATH, IFACE, "ProfileUnloaded", "ss", id, reason);
+	props_changed("ActiveProfiles", "MappingCount", NULL);
+}
+
+/* Makes the profile's bindings mappings, all or none. ids (may be NULL)
+ * gets the mapping ids. */
+static int profile_activate(const struct mp_profile *p, const char *device, bool manual, sd_bus_message *ids, char *err,
+			    size_t n)
+{
+	struct active_profile *a = active_find(p->id);
+	if (a)
+		profile_deactivate(a, "reloaded");
+	for (int i = 0; i < MAX_ACTIVE_PROFILES && !a; i++)
+		if (!D.active[i].used)
+			a = &D.active[i];
+	if (!a) {
+		snprintf(err, n, "too many active profiles (%d)", MAX_ACTIVE_PROFILES);
+		return -1;
+	}
+	char origin[MP_NAME_MAX + 16];
+	origin_of(p->id, origin, sizeof(origin));
+	size_t nb = json_object_array_length(p->bindings);
+	for (size_t i = 0; i < nb; i++) {
+		char e[400];
+		json_object *mo = mp_binding_mapping(p, i, e, sizeof(e));
+		struct mapping m;
+		struct mapping *nm = NULL;
+		if (mo && mapping_from_json(mo, &m, e, sizeof(e)) == 0) {
+			snprintf(m.origin, sizeof(m.origin), "%s", origin);
+			nm = mapping_insert(&m, e, sizeof(e));
+		}
+		if (mo)
+			json_object_put(mo);
+		if (!nm) {
+			snprintf(err, n, "profile %s, binding %zu: %s", p->id, i, e);
+			remove_profile_mappings(p->id);
+			return -1;
+		}
+		ctl_format_source(&nm->src, nm->source_str, sizeof(nm->source_str));
+		if (ids)
+			sd_bus_message_append(ids, "s", nm->id);
+	}
+	memset(a, 0, sizeof(*a));
+	a->used = true;
+	a->manual = manual;
+	snprintf(a->id, sizeof(a->id), "%s", p->id);
+	snprintf(a->device, sizeof(a->device), "%s", device ? device : "");
+	a->re_ok = regcomp(&a->re, p->match, REG_EXTENDED | REG_ICASE | REG_NOSUB) == 0;
+	relink_follow();
+	LOG("profile %s loaded%s%s: %zu mappings\n", p->id, a->device[0] ? " for " : "", a->device, nb);
+	sd_bus_emit_signal(D.bus, OBJ_PATH, IFACE, "ProfileLoaded", "ssu", p->id, a->device, (uint32_t)nb);
+	props_changed("ActiveProfiles", "MappingCount", NULL);
+	return 0;
+}
+
+/* A device appeared: the first profile (the user's before the system's,
+ * then by name) that matches it and loads by itself becomes active. */
+static void profiles_port_added(const struct bl_port *port)
+{
+	if (!port->midi || !port->output || port->node_id == D.node_id)
+		return;
+	char hay[700];
+	snprintf(hay, sizeof(hay), "%s:%s | %s", port->node_name, port->name, port->alias);
+	for (int i = 0; i < D.profiles.n; i++) {
+		const struct mp_profile *p = D.profiles.p[i];
+		if (!mp_matches_device(p, hay))
+			continue;
+		if (!p->autoload || active_find(p->id))
+			return;
+		char e[400];
+		if (profile_activate(p, hay, false, NULL, e, sizeof(e)) < 0)
+			LOG("%s\n", e);
+		return;
+	}
+}
+
+/* A port went: profiles that came with their device go with it. */
+static void profiles_port_removed(void)
+{
+	for (int i = 0; i < MAX_ACTIVE_PROFILES; i++) {
+		struct active_profile *a = &D.active[i];
+		if (!a->used || a->manual)
+			continue;
+		const struct mp_profile *p = mp_set_find(&D.profiles, a->id);
+		char dev[700];
+		if (!p || !profile_present(p, dev, sizeof(dev)))
+			profile_deactivate(a, "device-gone");
+	}
+}
+
+static int auto_port(void *data, const struct bl_port *port)
+{
+	profiles_port_added(port);
+	return 0;
+}
+
+/* Every device already in the graph (at start, after a delete). */
+static void profiles_scan(void)
+{
+	if (D.graph)
+		bl_graph_for_each_port(D.graph, auto_port, NULL);
+}
+
+static json_object *profile_summary(const struct mp_profile *p)
+{
+	json_object *o = json_object_new_object();
+	json_object_object_add(o, "id", json_object_new_string(p->id));
+	json_object_object_add(o, "name", json_object_new_string(p->name));
+	if (p->vendor[0]) json_object_object_add(o, "vendor", json_object_new_string(p->vendor));
+	if (p->model[0]) json_object_object_add(o, "model", json_object_new_string(p->model));
+	if (p->mode[0]) json_object_object_add(o, "mode", json_object_new_string(p->mode));
+	json_object_object_add(o, "match", json_object_new_string(p->match));
+	json_object_object_add(o, "verified", json_object_new_boolean(p->verified));
+	json_object_object_add(o, "auto", json_object_new_boolean(p->autoload));
+	json_object_object_add(o, "system", json_object_new_boolean(p->system));
+	json_object_object_add(o, "path", json_object_new_string(p->path));
+	json_object_object_add(o, "controls", json_object_new_int(p->n_controls));
+	json_object_object_add(o, "bindings", json_object_new_int((int)json_object_array_length(p->bindings)));
+	struct active_profile *a = active_find(p->id);
+	char dev[700];
+	bool present = profile_present(p, dev, sizeof(dev));
+	json_object_object_add(o, "active", json_object_new_boolean(a != NULL));
+	json_object_object_add(o, "present", json_object_new_boolean(present));
+	json_object_object_add(o, "device", json_object_new_string(a && a->device[0] ? a->device : dev));
+	return o;
+}
+
+/* The active profile control a MIDI source is, for Mappings(). */
+static bool mapping_control(const struct ctl_source *src, const char **profile, const char **control)
+{
+	for (int i = 0; i < MAX_ACTIVE_PROFILES; i++) {
+		if (!D.active[i].used)
+			continue;
+		const struct mp_profile *p = mp_set_find(&D.profiles, D.active[i].id);
+		const struct mp_control *c = p ? mp_control_for_source(p, src) : NULL;
+		if (c) {
+			*profile = p->id;
+			*control = c->name;
+			return true;
+		}
+	}
+	return false;
+}
+
+static int m_profiles(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	profiles_reload();
+	json_object *o = json_object_new_object();
+	json_object_object_add(o, "schema", json_object_new_string(MP_SCHEMA));
+	json_object *ps = json_object_new_array();
+	for (int i = 0; i < D.profiles.n; i++)
+		json_object_array_add(ps, profile_summary(D.profiles.p[i]));
+	json_object_object_add(o, "profiles", ps);
+	json_object *ds = json_object_new_array();
+	for (int i = 0; i < D.n_profile_dirs; i++)
+		json_object_array_add(ds, json_object_new_string(D.profile_dirs[i]));
+	json_object_object_add(o, "dirs", ds);
+	int r = sd_bus_reply_method_return(m, "s", json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
+	json_object_put(o);
+	return r;
+}
+
+static int m_profile(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *id;
+	int r = sd_bus_message_read(m, "s", &id);
+	if (r < 0)
+		return r;
+	profiles_reload();
+	const struct mp_profile *p = mp_set_find(&D.profiles, id);
+	if (!p)
+		return sd_bus_error_setf(err, ERR_NOTFOUND, "no MIDI profile '%s'", id);
+	json_object *o = mp_to_json(p), *s = profile_summary(p);
+	json_object_object_foreach(s, key, val) {
+		if (!strcmp(key, "system") || !strcmp(key, "path") || !strcmp(key, "active") || !strcmp(key, "present") ||
+		    !strcmp(key, "device"))
+			json_object_object_add(o, key, json_object_get(val));
+	}
+	json_object_put(s);
+	r = sd_bus_reply_method_return(m, "s", json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
+	json_object_put(o);
+	return r;
+}
+
+static int m_load_profile(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *id;
+	int r = sd_bus_message_read(m, "s", &id);
+	if (r < 0)
+		return r;
+	profiles_reload();
+	const struct mp_profile *p = mp_set_find(&D.profiles, id);
+	if (!p)
+		return sd_bus_error_setf(err, ERR_NOTFOUND, "no MIDI profile '%s'", id);
+	sd_bus_message *reply = NULL;
+	if ((r = sd_bus_message_new_method_return(m, &reply)) < 0 || (r = sd_bus_message_open_container(reply, 'a', "s")) < 0)
+		return r;
+	char dev[700], e[500];
+	profile_present(p, dev, sizeof(dev));
+	if (profile_activate(p, dev, true, reply, e, sizeof(e)) < 0) {
+		sd_bus_message_unref(reply);
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s", e);
+	}
+	if ((r = sd_bus_message_close_container(reply)) >= 0)
+		r = sd_bus_send(NULL, reply, NULL);
+	sd_bus_message_unref(reply);
+	return r;
+}
+
+static int m_unload_profile(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *id;
+	int r = sd_bus_message_read(m, "s", &id);
+	if (r < 0)
+		return r;
+	struct active_profile *a = active_find(id);
+	if (!a)
+		return sd_bus_error_setf(err, ERR_NOTFOUND, "MIDI profile '%s' is not loaded", id);
+	profile_deactivate(a, "unloaded");
+	return sd_bus_reply_method_return(m, "");
+}
+
+static bool mapping_is_midi(const struct mapping *mp) { return mp->src.kind != CTL_SRC_OSC; }
+
+static int m_save_profile(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *id;
+	int r = sd_bus_message_read(m, "s", &id);
+	if (r < 0)
+		return r;
+	if (D.n_profile_dirs < 1 || D.no_config)
+		return sd_bus_error_setf(err, ERR_STATE, "started with --no-config: nothing is saved");
+	if (!mp_name_valid(id))
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+					 "'%s' is not a profile id (a-z, 0-9, '.', '_', '-'; at most 63)", id);
+	char name[128] = "", match[256] = "";
+	int autoload = -1;
+	const char *sel[MAX_MAPPINGS];
+	int n_sel = -1;
+	if ((r = sd_bus_message_enter_container(m, 'a', "{sv}")) < 0)
+		return r;
+	while ((r = sd_bus_message_enter_container(m, 'e', "sv")) > 0) {
+		const char *key, *sig = NULL, *sv;
+		if ((r = sd_bus_message_read(m, "s", &key)) < 0)
+			return r;
+		sd_bus_message_peek_type(m, NULL, &sig);
+		if ((!strcmp(key, "name") || !strcmp(key, "match")) && sig && !strcmp(sig, "s")) {
+			sd_bus_message_read(m, "v", "s", &sv);
+			snprintf(key[0] == 'n' ? name : match, key[0] == 'n' ? sizeof(name) : sizeof(match), "%s", sv);
+		} else if (!strcmp(key, "auto") && sig && !strcmp(sig, "b")) {
+			int b;
+			sd_bus_message_read(m, "v", "b", &b);
+			autoload = b;
+		} else if (!strcmp(key, "mappings") && sig && !strcmp(sig, "as")) {
+			n_sel = 0;
+			sd_bus_message_enter_container(m, 'v', "as");
+			sd_bus_message_enter_container(m, 'a', "s");
+			while (sd_bus_message_read(m, "s", &sv) > 0)
+				if (n_sel < MAX_MAPPINGS)
+					sel[n_sel++] = sv;
+			sd_bus_message_exit_container(m);
+			sd_bus_message_exit_container(m);
+		} else {
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+						 "unknown option '%s' (name s, match s, auto b, mappings as)", key);
+		}
+		sd_bus_message_exit_container(m);
+	}
+	if ((r = sd_bus_message_exit_container(m)) < 0)
+		return r;
+
+	profiles_reload();
+	const struct mp_profile *base = mp_set_find(&D.profiles, id);
+	struct mp_profile p;
+	char e[500];
+	if (base) {
+		if (mp_load_file(base->path, &p, e, sizeof(e)) < 0)
+			return sd_bus_error_setf(err, SD_BUS_ERROR_FAILED, "%s: %s", base->path, e);
+	} else {
+		if (!match[0])
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+						 "'%s' is a new profile: give match, a regular expression for its MIDI port", id);
+		if (mp_init(&p, id, name, match, e, sizeof(e)) < 0)
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s", e);
+	}
+	if (name[0])
+		snprintf(p.name, sizeof(p.name), "%s", name);
+	if (match[0] && base) {
+		mp_free(&p);
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+					 "'%s' exists: its match is in its file (DeleteProfile and save again to change it)", id);
+	}
+	if (autoload >= 0)
+		p.autoload = autoload;
+
+	/* the mappings to bind: the ones named, or every MIDI mapping that is
+	 * this profile's, made at run time or from control.json */
+	char origin[MP_NAME_MAX + 16];
+	origin_of(id, origin, sizeof(origin));
+	struct mapping *picked[MAX_MAPPINGS];
+	int n_picked = 0;
+	if (n_sel >= 0) {
+		for (int i = 0; i < n_sel; i++) {
+			struct mapping *mp = find_mapping(sel[i]);
+			if (!mp) {
+				mp_free(&p);
+				return sd_bus_error_setf(err, ERR_NOTFOUND, "no mapping '%s'", sel[i]);
+			}
+			picked[n_picked++] = mp;
+		}
+	} else {
+		for (int i = 0; i < MAX_MAPPINGS; i++) {
+			struct mapping *mp = &D.maps[i];
+			if (mp->used && mapping_is_midi(mp) &&
+			    (!mp->origin[0] || !strcmp(mp->origin, "control.json") || !strcmp(mp->origin, origin)))
+				picked[n_picked++] = mp;
+		}
+	}
+	json_object *arr = json_object_new_array();
+	for (int i = 0; i < n_picked; i++)
+		json_object_array_add(arr, mapping_to_json(picked[i], false));
+	bool add_controls = n_sel >= 0 || p.n_controls == 0;
+	int skipped = 0;
+	int bound = mp_bind_mappings(&p, arr, add_controls, &skipped, e, sizeof(e));
+	json_object_put(arr);
+	if (bound < 0) {
+		mp_free(&p);
+		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s", e);
+	}
+	char path[800];
+	snprintf(path, sizeof(path), "%s/%s%s", D.profile_dirs[0], id, MP_FILE_SUFFIX);
+	if (mp_save_file(&p, path, e, sizeof(e)) < 0) {
+		mp_free(&p);
+		return sd_bus_error_setf(err, SD_BUS_ERROR_FAILED, "%s", e);
+	}
+	/* the bound mappings are the profile's now: they go when it is unloaded
+	 * and are no longer written to control.json */
+	for (int i = 0; i < n_picked; i++)
+		if (mp_control_for_source(&p, &picked[i]->src))
+			snprintf(picked[i]->origin, sizeof(picked[i]->origin), "%s", origin);
+	if (!active_find(id)) {
+		struct active_profile *a = NULL;
+		for (int i = 0; i < MAX_ACTIVE_PROFILES && !a; i++)
+			if (!D.active[i].used)
+				a = &D.active[i];
+		if (a) {
+			a->used = true;
+			snprintf(a->id, sizeof(a->id), "%s", id);
+			a->manual = !profile_present(&p, a->device, sizeof(a->device));
+			a->re_ok = regcomp(&a->re, p.match, REG_EXTENDED | REG_ICASE | REG_NOSUB) == 0;
+			relink_follow();
+			props_changed("ActiveProfiles", NULL);
+		}
+	}
+	LOG("saved MIDI profile %s: %d bindings (%d mappings not this device's) in %s\n", id, bound, skipped, path);
+	mp_free(&p);
+	profiles_reload();
+	return sd_bus_reply_method_return(m, "s", path);
+}
+
+static int m_delete_profile(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *id;
+	int r = sd_bus_message_read(m, "s", &id);
+	if (r < 0)
+		return r;
+	profiles_reload();
+	const struct mp_profile *p = mp_set_find(&D.profiles, id);
+	if (!p)
+		return sd_bus_error_setf(err, ERR_NOTFOUND, "no MIDI profile '%s'", id);
+	if (p->system)
+		return sd_bus_error_setf(err, ERR_STATE, "'%s' is a system profile (%s): it can't be deleted, only hidden by a "
+				       "profile of the same id in %s", id, p->path, D.profile_dirs[0]);
+	if (unlink(p->path) < 0)
+		return sd_bus_error_setf(err, SD_BUS_ERROR_FAILED, "cannot delete %s: %s", p->path, strerror(errno));
+	LOG("deleted MIDI profile %s (%s)\n", id, p->path);
+	struct active_profile *a = active_find(id);
+	if (a)
+		profile_deactivate(a, "deleted");
+	profiles_reload();
+	profiles_scan(); /* a system profile of the same id may now take its device */
+	return sd_bus_reply_method_return(m, "");
+}
+
+static int p_active_profiles(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply,
+			     void *ud, sd_bus_error *err)
+{
+	int r = sd_bus_message_open_container(reply, 'a', "s");
+	if (!strcmp(prop, "ProfileDirs")) {
+		for (int i = 0; r >= 0 && i < D.n_profile_dirs; i++)
+			r = sd_bus_message_append(reply, "s", D.profile_dirs[i]);
+	} else {
+		for (int i = 0; r >= 0 && i < MAX_ACTIVE_PROFILES; i++)
+			if (D.active[i].used)
+				r = sd_bus_message_append(reply, "s", D.active[i].id);
+	}
+	return r < 0 ? r : sd_bus_message_close_container(reply);
+}
+
 /* ============================================================ config */
 static void default_config_dir(void)
 {
@@ -2047,6 +2586,29 @@ static void default_config_dir(void)
 		snprintf(D.config_dir, sizeof(D.config_dir), "%s/backline/control", x);
 	else
 		snprintf(D.config_dir, sizeof(D.config_dir), "%s/.config/backline/control", h ? h : ".");
+}
+
+/* The user's profiles: --profile-dir, or MP_DIR_NAME beside the config dir
+ * ($XDG_CONFIG_HOME/<product>/midi-profiles). The system's: the installed
+ * datadir, or the source tree's when running from a build. */
+static void default_profile_dirs(const char *user)
+{
+	char buf[700];
+	if (user) {
+		snprintf(buf, sizeof(buf), "%s", user);
+	} else {
+		snprintf(buf, sizeof(buf), "%s", D.config_dir);
+		char *sl = strrchr(buf, '/');
+		if (sl && sl != buf)
+			snprintf(sl + 1, sizeof(buf) - (size_t)(sl + 1 - buf), "%s", MP_DIR_NAME);
+		else
+			snprintf(buf, sizeof(buf), "%s", MP_DIR_NAME);
+	}
+	snprintf(D.profile_dirs[0], sizeof(D.profile_dirs[0]), "%s", buf);
+	struct stat st;
+	snprintf(D.profile_dirs[1], sizeof(D.profile_dirs[1]), "%s",
+		 stat(BL_MIDIPROF_DATADIR, &st) == 0 ? BL_MIDIPROF_DATADIR : BL_MIDIPROF_SRCDIR);
+	D.n_profile_dirs = 2;
 }
 
 static int name_cmp(const struct dirent **a, const struct dirent **b) { return strcmp((*a)->d_name, (*b)->d_name); }
@@ -2587,7 +3149,15 @@ static const sd_bus_vtable vtable[] = {
 	SD_BUS_METHOD_WITH_ARGS("SetMidiFollow", SD_BUS_ARGS("s", regex), SD_BUS_NO_RESULT, m_set_follow, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Save", SD_BUS_NO_ARGS, SD_BUS_RESULT("s", path), m_save, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("SetMidiOut", SD_BUS_ARGS("s", regex), SD_BUS_NO_RESULT, m_set_out, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("Profiles", SD_BUS_NO_ARGS, SD_BUS_RESULT("s", json), m_profiles, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("Profile", SD_BUS_ARGS("s", profile), SD_BUS_RESULT("s", json), m_profile, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("SaveProfile", SD_BUS_ARGS("s", profile, "a{sv}", options), SD_BUS_RESULT("s", path), m_save_profile, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("LoadProfile", SD_BUS_ARGS("s", profile), SD_BUS_RESULT("as", ids), m_load_profile, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("UnloadProfile", SD_BUS_ARGS("s", profile), SD_BUS_NO_RESULT, m_unload_profile, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("DeleteProfile", SD_BUS_ARGS("s", profile), SD_BUS_NO_RESULT, m_delete_profile, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_PROPERTY("MappingCount", "u", p_num, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+	SD_BUS_PROPERTY("ActiveProfiles", "as", p_active_profiles, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+	SD_BUS_PROPERTY("ProfileDirs", "as", p_active_profiles, 0, SD_BUS_VTABLE_PROPERTY_CONST),
 	SD_BUS_PROPERTY("Listeners", "as", p_listeners, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("Learning", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("MidiFollow", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
@@ -2605,6 +3175,8 @@ static const sd_bus_vtable vtable[] = {
 	SD_BUS_PROPERTY("TargetErrors", "t", p_num, 0, 0),
 	SD_BUS_SIGNAL_WITH_ARGS("Learned", SD_BUS_ARGS("s", id, "s", source, "s", target), 0),
 	SD_BUS_SIGNAL_WITH_ARGS("LearnCancelled", SD_BUS_ARGS("s", id, "s", reason), 0),
+	SD_BUS_SIGNAL_WITH_ARGS("ProfileLoaded", SD_BUS_ARGS("s", profile, "s", device, "u", mappings), 0),
+	SD_BUS_SIGNAL_WITH_ARGS("ProfileUnloaded", SD_BUS_ARGS("s", profile, "s", reason), 0),
 	SD_BUS_VTABLE_END
 };
 
@@ -2657,6 +3229,7 @@ static void usage(FILE *f)
 	      "  It opens no network socket unless a listener is configured or asked for (docs/api/Control1.md).\n"
 	      "  --config-dir DIR  mappings and listeners (default $XDG_CONFIG_HOME/backline/control)\n"
 	      "  --no-config       start empty and never write a file\n"
+	      "  --profile-dir DIR the user's MIDI profiles (default: " MP_DIR_NAME " next to the config dir)\n"
 	      "  --idle-exit N     exit after N s with nothing mapped (default 60; 0 = never)\n", f);
 }
 
@@ -2666,6 +3239,7 @@ int main(int argc, char **argv)
 		{ "name", required_argument, NULL, 'n' },
 		{ "config-dir", required_argument, NULL, 'c' },
 		{ "no-config", no_argument, NULL, 'N' },
+		{ "profile-dir", required_argument, NULL, 'P' },
 		{ "midi-follow", required_argument, NULL, 'm' },
 		{ "idle-exit", required_argument, NULL, 'i' },
 		{ "replace", no_argument, NULL, 'r' },
@@ -2677,11 +3251,13 @@ int main(int argc, char **argv)
 	const char *follow = NULL;
 	D.idle_exit = 60;
 	snprintf(D.node_name, sizeof(D.node_name), "backline.control");
-	while ((c = getopt_long(argc, argv, "n:c:Nm:i:rvh", opts, NULL)) != -1) {
+	const char *profile_dir = NULL;
+	while ((c = getopt_long(argc, argv, "n:c:NP:m:i:rvh", opts, NULL)) != -1) {
 		switch (c) {
 		case 'n': snprintf(D.node_name, sizeof(D.node_name), "%s", optarg); break;
 		case 'c': snprintf(D.config_dir, sizeof(D.config_dir), "%s", optarg); break;
 		case 'N': D.no_config = true; break;
+		case 'P': profile_dir = optarg; break;
 		case 'm': follow = optarg; break;
 		case 'i': D.idle_exit = atoi(optarg); break;
 		case 'r': replace = 1; break;
@@ -2691,6 +3267,7 @@ int main(int argc, char **argv)
 		}
 	}
 	default_config_dir();
+	default_profile_dirs(profile_dir);
 	D.node_id = D.midi_port_id = D.midi_out_port_id = SPA_ID_INVALID;
 
 	pw_init(&argc, &argv);
@@ -2763,6 +3340,8 @@ int main(int argc, char **argv)
 		pw_loop_iterate(D.l, 10);
 	if (!D.no_config)
 		load_config();
+	profiles_reload();
+	profiles_scan();
 	if (follow) {
 		char e[300];
 		if (set_follow(follow, e, sizeof(e)) < 0) {
@@ -2793,6 +3372,10 @@ int main(int argc, char **argv)
 		regfree(&D.follow_re);
 	if (D.out_on)
 		regfree(&D.out_re);
+	for (int i = 0; i < MAX_ACTIVE_PROFILES; i++)
+		if (D.active[i].used && D.active[i].re_ok)
+			regfree(&D.active[i].re);
+	mp_set_free(&D.profiles);
 	pd_fini();
 	pw_filter_destroy(D.filter);
 	bl_midi_ring_free(&D.out_ring);

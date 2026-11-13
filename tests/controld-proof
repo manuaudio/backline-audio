@@ -23,6 +23,11 @@
 #     rate limit, blocking after repeated failures, and that nothing received
 #     over the network can create a mapping. Then Save, a restart from the
 #     saved file, and no socket left when controld exits.
+#  8. MIDI learn profiles: the shipped profiles are listed (and unverified);
+#     a learned CC is saved as a profile for the test keyboard; after a
+#     restart with no mappings, the keyboard appearing loads the profile by
+#     itself (its MIDI linked, the binding a mapping that moves the sink's
+#     volume), and the keyboard leaving unloads it.
 #
 # Throwaway: own network namespace (only loopback plus test addresses
 # 10.77.0.1, 10.77.0.2 and 10.88.0.5 on it, so no listener can reach a real
@@ -47,7 +52,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-want() { [[ " ${SECTIONS:-1 2 3 4 5 6 7} " == *" $1 "* ]]; }
+want() { [[ " ${SECTIONS:-1 2 3 4 5 6 7 8} " == *" $1 "* ]]; }
 C=(io.github.manuaudio.Backline.Control /io/github/manuaudio/Backline/Control io.github.manuaudio.Backline.Control1)
 K=(io.github.manuaudio.Backline.Clock /io/github/manuaudio/Backline/Clock io.github.manuaudio.Backline.Clock1)
 R=(io.github.manuaudio.Backline.Recorder /io/github/manuaudio/Backline/Recorder io.github.manuaudio.Backline.Recorder1)
@@ -92,7 +97,7 @@ echo "default sink: $default_before; other nodes: $(wc -l <"$out/nodes-before.tx
       ([.[] | select(.type=="PipeWire:Interface:Node") | {key: (.id|tostring), value: (.info.props["node.name"] // "")}] | from_entries) as $n
       | .[] | select(.type=="PipeWire:Interface:Link")
       | [$n[(.info["output-node-id"]|tostring)] // "?", $n[(.info["input-node-id"]|tostring)] // "?"]
-      | select((.[0] | test("^backline(-test)?\\.ctl")) and (.[1] | test("^backline") | not)
+      | select((.[0] | test("^backline(-test)?\\.ctl")) and ((.[1] | test("^backline")) or .[1] == "Midi-Bridge" | not)
             or (.[1] | test("^backline(-test)?\\.ctl")) and ((.[0] | test("^backline")) or .[0] == "Midi-Bridge" | not))
       | join(" -> ")' 2>/dev/null)
     if [[ -n $l ]]; then echo "LEAK: $l" >>"$out/leaks.txt"; kill -TERM $$; exit; fi
@@ -468,6 +473,53 @@ s_end=$(sockets)
 echo "  controld stopped; sockets now: '${s_end}'"
 [[ $(stat -c %a "$path") == 600 && $mafter == "$mbefore" && $lafter == "$before" && -n $s_run && -z $s_end ]] &&
   echo "  RESULT: PASS (saved 0600 with its secret, restored the same mappings and listeners on the same ports, no socket after exit)" || echo "  RESULT: FAIL"
+fi
+
+########################################################################## 8
+if want 8; then
+echo; echo "-- 8. MIDI learn profiles"
+[[ -n $CTL ]] && stop_controld
+pdir=$out/profiles
+jcall() { busctl --user --json=short call "${C[@]}" "$@" | jq -r '.data[0]'; }
+start_controld --config-dir "$out/config8" --profile-dir "$pdir" --midi-follow '^Midi-Bridge:backline-test-ctlkbd'
+wait_log "$out/controld.log" "on the session bus"
+jcall Profiles >"$out/profiles-list.json"
+echo "  profiles: $(jq -r '[.profiles[] | "\(.id) (\(if .system then "system" else "user" end), \(if .verified then "verified" else "unverified" end), \(.controls) controls)"] | join("; ")' "$out/profiles-list.json")"
+n_sys=$(jq '[.profiles[] | select(.system and (.verified | not))] | length' "$out/profiles-list.json")
+"$BL" --json map learn volume:backline-test.ctl-vol --from midi --timeout 10 >"$out/learn-p.json" 2>&1 &
+lp=$!; sleep 0.5
+"$BL_BIN/backline-test-keyboard" --name backline-test-ctlkbd wait=0.3 cc=22,90 wait=0.5 >/dev/null 2>&1
+wait $lp || true
+echo "  learned: $(cat "$out/learn-p.json")"
+ppath=$("$BL" --json map profile save test-ctlkbd --name "Test keyboard" --match 'backline-test-ctlkbd' | jq -r .path)
+echo "  saved ${ppath#"$out"/}: $(jq -c '{controls: [.controls[].name], bindings: [.bindings[] | {control, target}]}' "$ppath")"
+echo "  ActiveProfiles after the save: $(cprop ActiveProfiles)"
+stop_controld
+# a new config dir: no control.json, so the only way the mapping comes back is the profile
+start_controld --config-dir "$out/config8b" --profile-dir "$pdir"
+wait_log "$out/controld.log" "on the session bus"
+m0=$(cprop MappingCount)
+v0=$(wpctl get-volume "$(pw-dump | jq -r '.[] | select(.info.props["node.name"]=="backline-test.ctl-vol") | .id')" 2>/dev/null || echo "?")
+"$BL_BIN/backline-test-keyboard" --name backline-test-ctlkbd wait=1.5 cc=22,64 wait=1.0 >/dev/null 2>&1 &
+kp=$!
+sleep 1.0
+a1=$(cprop ActiveProfiles); m1=$(cprop MappingCount)
+sleep 1.0
+v1=$(wpctl get-volume "$(pw-dump | jq -r '.[] | select(.info.props["node.name"]=="backline-test.ctl-vol") | .id')" 2>/dev/null || echo "?")
+jcall Mappings >"$out/mappings-p.json"
+sends=$(jq '[.mappings[] | select(.id == "test-ctlkbd.cc.1.22") | .sends] | add // 0' "$out/mappings-p.json")
+wait $kp || true
+sleep 0.5
+a2=$(cprop ActiveProfiles); m2=$(cprop MappingCount)
+echo "  restarted with no mappings ($m0); the keyboard appears: ActiveProfiles $a1, mappings $m1; CC 22 = 64 sent: mapping test-ctlkbd.cc.1.22 sends $sends, volume $v0 -> $v1"
+echo "  the keyboard goes: ActiveProfiles $a2, mappings $m2; $(grep -c 'profile test-ctlkbd' "$out/controld.log") log lines: $(grep 'profile test-ctlkbd' "$out/controld.log" | sed 's/^backline-controld: //' | tr '\n' ';')"
+del=$(busctl --user call "${C[@]}" DeleteProfile s korg-nanokontrol2 2>&1 | sed 's/^Call failed: //')
+echo "  deleting a system profile: $del"
+ctl DeleteProfile s test-ctlkbd >/dev/null
+[[ $n_sys -ge 3 && $(jq -r .source "$out/learn-p.json") == midi:cc:1:22 && $(jq '.bindings | length' "$ppath") == 1 &&
+   $m0 == 0 && $a1 == *test-ctlkbd* && $m1 == 1 && $sends -ge 1 && $m2 == 0 && $a2 == "0" && ! -e $ppath ]] &&
+  echo "  RESULT: PASS (a learned control saved as a device profile came back by itself when the device appeared, worked, and went with it)" || echo "  RESULT: FAIL"
+stop_controld
 fi
 
 ########################################################################## end

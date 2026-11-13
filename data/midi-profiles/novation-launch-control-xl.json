@@ -1,0 +1,346 @@
+{
+  "schema": "backline.midi-profile/1",
+  "id": "novation-launch-control-xl",
+  "name": "Novation Launch Control XL (factory template 1)",
+  "vendor": "Novation",
+  "model": "Launch Control XL (mk1, mk2)",
+  "mode": "factory template 1 (hold FACTORY and press the first TRACK CONTROL button), MIDI channel 9",
+  "match": "Launch Control XL",
+  "verified": false,
+  "note": "built from the published chart, not tried on hardware. Factory templates 1-8 are MIDI channels 9-16; this is template 1. Knob rows a, b, c are top to bottom. The button LEDs take a colour code as the note-on velocity (Programmer's Reference Guide: 16 x green + red + 12), not a 0-127 level, so no binding gets feedback by default.",
+  "sources": [
+    "Novation Launch Control XL Programmer's Reference Guide (Focusrite, 2014): factory templates on channels 9-16, the LED protocol",
+    "Ardour share/midi_maps/Novation_LaunchControl_XL.map (factory template 1, channel 9)"
+  ],
+  "controls": [
+    {
+      "name": "knob.a.1",
+      "source": "midi:cc:9:13",
+      "kind": "knob",
+      "label": "SEND A"
+    },
+    {
+      "name": "knob.a.2",
+      "source": "midi:cc:9:14",
+      "kind": "knob",
+      "label": "SEND A"
+    },
+    {
+      "name": "knob.a.3",
+      "source": "midi:cc:9:15",
+      "kind": "knob",
+      "label": "SEND A"
+    },
+    {
+      "name": "knob.a.4",
+      "source": "midi:cc:9:16",
+      "kind": "knob",
+      "label": "SEND A"
+    },
+    {
+      "name": "knob.a.5",
+      "source": "midi:cc:9:17",
+      "kind": "knob",
+      "label": "SEND A"
+    },
+    {
+      "name": "knob.a.6",
+      "source": "midi:cc:9:18",
+      "kind": "knob",
+      "label": "SEND A"
+    },
+    {
+      "name": "knob.a.7",
+      "source": "midi:cc:9:19",
+      "kind": "knob",
+      "label": "SEND A"
+    },
+    {
+      "name": "knob.a.8",
+      "source": "midi:cc:9:20",
+      "kind": "knob",
+      "label": "SEND A"
+    },
+    {
+      "name": "knob.b.1",
+      "source": "midi:cc:9:29",
+      "kind": "knob",
+      "label": "SEND B"
+    },
+    {
+      "name": "knob.b.2",
+      "source": "midi:cc:9:30",
+      "kind": "knob",
+      "label": "SEND B"
+    },
+    {
+      "name": "knob.b.3",
+      "source": "midi:cc:9:31",
+      "kind": "knob",
+      "label": "SEND B"
+    },
+    {
+      "name": "knob.b.4",
+      "source": "midi:cc:9:32",
+      "kind": "knob",
+      "label": "SEND B"
+    },
+    {
+      "name": "knob.b.5",
+      "source": "midi:cc:9:33",
+      "kind": "knob",
+      "label": "SEND B"
+    },
+    {
+      "name": "knob.b.6",
+      "source": "midi:cc:9:34",
+      "kind": "knob",
+      "label": "SEND B"
+    },
+    {
+      "name": "knob.b.7",
+      "source": "midi:cc:9:35",
+      "kind": "knob",
+      "label": "SEND B"
+    },
+    {
+      "name": "knob.b.8",
+      "source": "midi:cc:9:36",
+      "kind": "knob",
+      "label": "SEND B"
+    },
+    {
+      "name": "knob.c.1",
+      "source": "midi:cc:9:49",
+      "kind": "knob",
+      "label": "PAN / DEVICE"
+    },
+    {
+      "name": "knob.c.2",
+      "source": "midi:cc:9:50",
+      "kind": "knob",
+      "label": "PAN / DEVICE"
+    },
+    {
+      "name": "knob.c.3",
+      "source": "midi:cc:9:51",
+      "kind": "knob",
+      "label": "PAN / DEVICE"
+    },
+    {
+      "name": "knob.c.4",
+      "source": "midi:cc:9:52",
+      "kind": "knob",
+      "label": "PAN / DEVICE"
+    },
+    {
+      "name": "knob.c.5",
+      "source": "midi:cc:9:53",
+      "kind": "knob",
+      "label": "PAN / DEVICE"
+    },
+    {
+      "name": "knob.c.6",
+      "source": "midi:cc:9:54",
+      "kind": "knob",
+      "label": "PAN / DEVICE"
+    },
+    {
+      "name": "knob.c.7",
+      "source": "midi:cc:9:55",
+      "kind": "knob",
+      "label": "PAN / DEVICE"
+    },
+    {
+      "name": "knob.c.8",
+      "source": "midi:cc:9:56",
+      "kind": "knob",
+      "label": "PAN / DEVICE"
+    },
+    {
+      "name": "fader.1",
+      "source": "midi:cc:9:77",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.2",
+      "source": "midi:cc:9:78",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.3",
+      "source": "midi:cc:9:79",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.4",
+      "source": "midi:cc:9:80",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.5",
+      "source": "midi:cc:9:81",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.6",
+      "source": "midi:cc:9:82",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.7",
+      "source": "midi:cc:9:83",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.8",
+      "source": "midi:cc:9:84",
+      "kind": "fader"
+    },
+    {
+      "name": "button.focus.1",
+      "source": "midi:note:9:41",
+      "kind": "button",
+      "label": "TRACK FOCUS"
+    },
+    {
+      "name": "button.focus.2",
+      "source": "midi:note:9:42",
+      "kind": "button",
+      "label": "TRACK FOCUS"
+    },
+    {
+      "name": "button.focus.3",
+      "source": "midi:note:9:43",
+      "kind": "button",
+      "label": "TRACK FOCUS"
+    },
+    {
+      "name": "button.focus.4",
+      "source": "midi:note:9:44",
+      "kind": "button",
+      "label": "TRACK FOCUS"
+    },
+    {
+      "name": "button.focus.5",
+      "source": "midi:note:9:57",
+      "kind": "button",
+      "label": "TRACK FOCUS"
+    },
+    {
+      "name": "button.focus.6",
+      "source": "midi:note:9:58",
+      "kind": "button",
+      "label": "TRACK FOCUS"
+    },
+    {
+      "name": "button.focus.7",
+      "source": "midi:note:9:59",
+      "kind": "button",
+      "label": "TRACK FOCUS"
+    },
+    {
+      "name": "button.focus.8",
+      "source": "midi:note:9:60",
+      "kind": "button",
+      "label": "TRACK FOCUS"
+    },
+    {
+      "name": "button.control.1",
+      "source": "midi:note:9:73",
+      "kind": "button",
+      "label": "TRACK CONTROL"
+    },
+    {
+      "name": "button.control.2",
+      "source": "midi:note:9:74",
+      "kind": "button",
+      "label": "TRACK CONTROL"
+    },
+    {
+      "name": "button.control.3",
+      "source": "midi:note:9:75",
+      "kind": "button",
+      "label": "TRACK CONTROL"
+    },
+    {
+      "name": "button.control.4",
+      "source": "midi:note:9:76",
+      "kind": "button",
+      "label": "TRACK CONTROL"
+    },
+    {
+      "name": "button.control.5",
+      "source": "midi:note:9:89",
+      "kind": "button",
+      "label": "TRACK CONTROL"
+    },
+    {
+      "name": "button.control.6",
+      "source": "midi:note:9:90",
+      "kind": "button",
+      "label": "TRACK CONTROL"
+    },
+    {
+      "name": "button.control.7",
+      "source": "midi:note:9:91",
+      "kind": "button",
+      "label": "TRACK CONTROL"
+    },
+    {
+      "name": "button.control.8",
+      "source": "midi:note:9:92",
+      "kind": "button",
+      "label": "TRACK CONTROL"
+    },
+    {
+      "name": "button.device",
+      "source": "midi:note:9:105",
+      "kind": "button",
+      "label": "DEVICE"
+    },
+    {
+      "name": "button.mute",
+      "source": "midi:note:9:106",
+      "kind": "button",
+      "label": "MUTE"
+    },
+    {
+      "name": "button.solo",
+      "source": "midi:note:9:107",
+      "kind": "button",
+      "label": "SOLO"
+    },
+    {
+      "name": "button.rec",
+      "source": "midi:note:9:108",
+      "kind": "button",
+      "label": "RECORD ARM"
+    },
+    {
+      "name": "nav.up",
+      "source": "midi:cc:9:104",
+      "kind": "button",
+      "label": "SEND SELECT UP"
+    },
+    {
+      "name": "nav.down",
+      "source": "midi:cc:9:105",
+      "kind": "button",
+      "label": "SEND SELECT DOWN"
+    },
+    {
+      "name": "nav.left",
+      "source": "midi:cc:9:106",
+      "kind": "button",
+      "label": "TRACK SELECT LEFT"
+    },
+    {
+      "name": "nav.right",
+      "source": "midi:cc:9:107",
+      "kind": "button",
+      "label": "TRACK SELECT RIGHT"
+    }
+  ],
+  "bindings": []
+}

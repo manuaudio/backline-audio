@@ -1,0 +1,356 @@
+{
+  "schema": "backline.midi-profile/1",
+  "id": "akai-midimix",
+  "name": "Akai Professional MIDImix",
+  "vendor": "Akai Professional",
+  "model": "MIDImix",
+  "mode": "factory preset, MIDI channel 1 (buttons as notes)",
+  "match": "MIDI ?Mix",
+  "verified": false,
+  "note": "built from the published chart, not tried on hardware. Knob rows a, b, c are top to bottom. A strip's solo is its MUTE button pressed while SOLO is held (button.solo.N). The MUTE and REC ARM LEDs light from a note-on on their own note, so bindings to them get feedback by default. SEND ALL is not mapped.",
+  "sources": [
+    "Akai Professional MIDImix User Guide (akaipro.com)",
+    "Ardour share/midi_maps/AKAI_MIDIMix_Normal_Mode.map and AKAI_MIDIMix_EQ_Mode.map (the factory preset, channel 1)"
+  ],
+  "controls": [
+    {
+      "name": "knob.a.1",
+      "source": "midi:cc:1:16",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.2",
+      "source": "midi:cc:1:20",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.3",
+      "source": "midi:cc:1:24",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.4",
+      "source": "midi:cc:1:28",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.5",
+      "source": "midi:cc:1:46",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.6",
+      "source": "midi:cc:1:50",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.7",
+      "source": "midi:cc:1:54",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.8",
+      "source": "midi:cc:1:58",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.b.1",
+      "source": "midi:cc:1:17",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.b.2",
+      "source": "midi:cc:1:21",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.b.3",
+      "source": "midi:cc:1:25",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.b.4",
+      "source": "midi:cc:1:29",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.b.5",
+      "source": "midi:cc:1:47",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.b.6",
+      "source": "midi:cc:1:51",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.b.7",
+      "source": "midi:cc:1:55",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.b.8",
+      "source": "midi:cc:1:59",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.c.1",
+      "source": "midi:cc:1:18",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.c.2",
+      "source": "midi:cc:1:22",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.c.3",
+      "source": "midi:cc:1:26",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.c.4",
+      "source": "midi:cc:1:30",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.c.5",
+      "source": "midi:cc:1:48",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.c.6",
+      "source": "midi:cc:1:52",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.c.7",
+      "source": "midi:cc:1:56",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.c.8",
+      "source": "midi:cc:1:60",
+      "kind": "knob"
+    },
+    {
+      "name": "fader.1",
+      "source": "midi:cc:1:19",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.2",
+      "source": "midi:cc:1:23",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.3",
+      "source": "midi:cc:1:27",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.4",
+      "source": "midi:cc:1:31",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.5",
+      "source": "midi:cc:1:49",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.6",
+      "source": "midi:cc:1:53",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.7",
+      "source": "midi:cc:1:57",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.8",
+      "source": "midi:cc:1:61",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.master",
+      "source": "midi:cc:1:62",
+      "kind": "fader",
+      "label": "MASTER"
+    },
+    {
+      "name": "button.mute.1",
+      "source": "midi:note:1:1",
+      "kind": "button",
+      "label": "MUTE",
+      "feedback": true
+    },
+    {
+      "name": "button.mute.2",
+      "source": "midi:note:1:4",
+      "kind": "button",
+      "label": "MUTE",
+      "feedback": true
+    },
+    {
+      "name": "button.mute.3",
+      "source": "midi:note:1:7",
+      "kind": "button",
+      "label": "MUTE",
+      "feedback": true
+    },
+    {
+      "name": "button.mute.4",
+      "source": "midi:note:1:10",
+      "kind": "button",
+      "label": "MUTE",
+      "feedback": true
+    },
+    {
+      "name": "button.mute.5",
+      "source": "midi:note:1:13",
+      "kind": "button",
+      "label": "MUTE",
+      "feedback": true
+    },
+    {
+      "name": "button.mute.6",
+      "source": "midi:note:1:16",
+      "kind": "button",
+      "label": "MUTE",
+      "feedback": true
+    },
+    {
+      "name": "button.mute.7",
+      "source": "midi:note:1:19",
+      "kind": "button",
+      "label": "MUTE",
+      "feedback": true
+    },
+    {
+      "name": "button.mute.8",
+      "source": "midi:note:1:22",
+      "kind": "button",
+      "label": "MUTE",
+      "feedback": true
+    },
+    {
+      "name": "button.solo.1",
+      "source": "midi:note:1:2",
+      "kind": "button",
+      "label": "SOLO + MUTE"
+    },
+    {
+      "name": "button.solo.2",
+      "source": "midi:note:1:5",
+      "kind": "button",
+      "label": "SOLO + MUTE"
+    },
+    {
+      "name": "button.solo.3",
+      "source": "midi:note:1:8",
+      "kind": "button",
+      "label": "SOLO + MUTE"
+    },
+    {
+      "name": "button.solo.4",
+      "source": "midi:note:1:11",
+      "kind": "button",
+      "label": "SOLO + MUTE"
+    },
+    {
+      "name": "button.solo.5",
+      "source": "midi:note:1:14",
+      "kind": "button",
+      "label": "SOLO + MUTE"
+    },
+    {
+      "name": "button.solo.6",
+      "source": "midi:note:1:17",
+      "kind": "button",
+      "label": "SOLO + MUTE"
+    },
+    {
+      "name": "button.solo.7",
+      "source": "midi:note:1:20",
+      "kind": "button",
+      "label": "SOLO + MUTE"
+    },
+    {
+      "name": "button.solo.8",
+      "source": "midi:note:1:23",
+      "kind": "button",
+      "label": "SOLO + MUTE"
+    },
+    {
+      "name": "button.rec.1",
+      "source": "midi:note:1:3",
+      "kind": "button",
+      "label": "REC ARM",
+      "feedback": true
+    },
+    {
+      "name": "button.rec.2",
+      "source": "midi:note:1:6",
+      "kind": "button",
+      "label": "REC ARM",
+      "feedback": true
+    },
+    {
+      "name": "button.rec.3",
+      "source": "midi:note:1:9",
+      "kind": "button",
+      "label": "REC ARM",
+      "feedback": true
+    },
+    {
+      "name": "button.rec.4",
+      "source": "midi:note:1:12",
+      "kind": "button",
+      "label": "REC ARM",
+      "feedback": true
+    },
+    {
+      "name": "button.rec.5",
+      "source": "midi:note:1:15",
+      "kind": "button",
+      "label": "REC ARM",
+      "feedback": true
+    },
+    {
+      "name": "button.rec.6",
+      "source": "midi:note:1:18",
+      "kind": "button",
+      "label": "REC ARM",
+      "feedback": true
+    },
+    {
+      "name": "button.rec.7",
+      "source": "midi:note:1:21",
+      "kind": "button",
+      "label": "REC ARM",
+      "feedback": true
+    },
+    {
+      "name": "button.rec.8",
+      "source": "midi:note:1:24",
+      "kind": "button",
+      "label": "REC ARM",
+      "feedback": true
+    },
+    {
+      "name": "nav.bank.prev",
+      "source": "midi:note:1:25",
+      "kind": "button",
+      "label": "BANK LEFT"
+    },
+    {
+      "name": "nav.bank.next",
+      "source": "midi:note:1:26",
+      "kind": "button",
+      "label": "BANK RIGHT"
+    }
+  ],
+  "bindings": []
+}

@@ -558,6 +558,23 @@ effect-insert component.
   scale); `param:` targets with automatic gestures; and a MIDI **output**
   port (`SetMidiOut`) for feedback to motor faders and LED rings. The pure
   parts (decoders, takeover, feedback bytes) are in `mapping.c`, unit-tested.
+- **MIDI learn profiles** (built; [Control1.md](docs/api/Control1.md#midi-profiles)).
+  A profile (`backline.midi-profile/1`) names a controller's physical
+  controls (`fader.1`, `knob.a.1`, `button.mute.1`) with the message each
+  sends in one factory mode, plus the user's learned bindings of those
+  controls to targets. The user's profiles (`$XDG_CONFIG_HOME/backline/midi-profiles`)
+  hide shipped ones of the same id (`$datadir/backline/midi-profiles`). When
+  a matching MIDI port appears, the profile becomes active: the device is
+  linked to controld and its bindings become mappings; when the device goes,
+  they go. `SaveProfile` turns the learned mappings of a device into its
+  profile. Shipped, all marked unverified until a bench pass: Korg
+  nanoKONTROL2 (CC mode), Akai MIDImix, Novation Launch Control XL (factory
+  template 1), from the published charts. The model (parse, validation,
+  binding, the directory set) is `control/midiprof.c`, pure and unit-tested
+  (`tests/unit/test_midiprof.c`); controld does the glue. The live check
+  (device appears, profile loads, the control works, device goes) is
+  section 8 of `tests/controld-proof`, **not run yet: verify when the audio
+  hold lifts**.
 - **Omarchy.** Nothing directly.
 
 ### 2.7 Client surface: `libbackline`, `backline`, QML module
@@ -1041,6 +1058,12 @@ non-Backline node. Full report in `docs/proofs/controld-proof.txt`.
   an address is refused even with the right one, while another allowed
   address still gets in. `Save` writes mode 0600; a restart restores the same
   mappings and listeners; no socket is left after exit.
+- **MIDI profiles** (section 8, added 2026-11-12, **not run yet: it needs
+  PipeWire, so it waits for the audio hold to lift**). A learned CC is saved
+  as a profile for the test keyboard; after a restart with no mappings, the
+  keyboard appearing loads the profile by itself and the control works, and
+  the keyboard leaving unloads it. Offline, `test_midiprof` checks every
+  shipped profile against its chart and the save/load/bind round trip.
 
 ### 4.12 Surfaces and Params1 (`tests/surfaced-proof`)
 

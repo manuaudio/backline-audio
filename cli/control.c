@@ -45,6 +45,8 @@ static int usage_map(void)
 	      "       backline map listen udp|tcp ADDRESS PORT [--allow CIDR]... [--secret S | --secret-file F]\n"
 	      "                                        [--insecure-udp] [--max-rate N] [--max-clients N] [--params ROLE]\n"
 	      "       backline map unlisten ID\n"
+	      "       backline map profile list | show ID | load ID | unload ID | delete ID\n"
+	      "       backline map profile save ID [--name N] [--match REGEX] [--no-auto] [--mapping MAPPING-ID]...\n"
 	      "  SOURCE: midi:cc:CH:NUM  midi:cc14:CH:MSB  midi:nrpn:CH:PARAM  midi:rpn:CH:PARAM  midi:note:CH:KEY\n"
 	      "          midi:pitchbend:CH  midi:program:CH  osc:/ADDRESS  (CH 1-16 or *)\n"
 	      "  TARGET: instance:NODE/PARAM  transport:play|stop|toggle|tempo|locate:POS  recorder:arm|record|stop|marker\n"
@@ -154,12 +156,124 @@ static void print_status_json(const bl_control_status *s)
 	json_object_put(o);
 }
 
+static const char *jget(json_object *o, const char *k)
+{
+	json_object *v;
+	return json_object_object_get_ex(o, k, &v) ? json_object_get_string(v) : "";
+}
+
+static bool jbool(json_object *o, const char *k)
+{
+	json_object *v;
+	return json_object_object_get_ex(o, k, &v) && json_object_get_boolean(v);
+}
+
+/* backline map profile ... (MIDI learn profiles) */
+static int cli_profile(bl_client *c, bool json, int argc, char **argv)
+{
+	if (argc < 1)
+		return usage_map();
+	const char *sub = argv[0];
+	if (!strcmp(sub, "list") || (!strcmp(sub, "show") && argc == 2)) {
+		char *js = NULL;
+		bool list = !strcmp(sub, "list");
+		if ((list ? bl_control_profiles(c, &js) : bl_control_profile(c, argv[1], &js)) < 0)
+			return fail(c, list ? "map profile list" : "map profile show");
+		json_object *o = json_tokener_parse(js);
+		if (json || !o) {
+			puts(o ? json_object_to_json_string_ext(o, JSON_C_TO_STRING_PRETTY | JSON_C_TO_STRING_NOSLASHESCAPE) : js);
+		} else if (list) {
+			json_object *ps;
+			if (json_object_object_get_ex(o, "profiles", &ps))
+				for (size_t i = 0; i < json_object_array_length(ps); i++) {
+					json_object *p = json_object_array_get_idx(ps, i), *v;
+					int nc = json_object_object_get_ex(p, "controls", &v) ? json_object_get_int(v) : 0;
+					int nb = json_object_object_get_ex(p, "bindings", &v) ? json_object_get_int(v) : 0;
+					printf("%-28s %-44s %3d controls, %2d bindings  %s%s%s%s\n", jget(p, "id"), jget(p, "name"), nc, nb,
+					       jbool(p, "system") ? "system" : "user", jbool(p, "verified") ? ", verified" : ", unverified",
+					       jbool(p, "active") ? ", active" : "", jbool(p, "present") ? ", device present" : "");
+				}
+		} else {
+			printf("%s: %s\n", jget(o, "id"), jget(o, "name"));
+			printf("  %s, %s; match /%s/\n", jget(o, "model"), jget(o, "mode"), jget(o, "match"));
+			printf("  %s%s; %s\n", jbool(o, "verified") ? "verified on hardware" : "not verified on hardware",
+			       jbool(o, "system") ? ", shipped" : ", yours", jget(o, "path"));
+			if (*jget(o, "note"))
+				printf("  %s\n", jget(o, "note"));
+			json_object *cs, *bs;
+			if (json_object_object_get_ex(o, "controls", &cs))
+				for (size_t i = 0; i < json_object_array_length(cs); i++) {
+					json_object *x = json_object_array_get_idx(cs, i);
+					printf("  %-22s %-18s %s\n", jget(x, "name"), jget(x, "source"), jget(x, "label"));
+				}
+			if (json_object_object_get_ex(o, "bindings", &bs))
+				for (size_t i = 0; i < json_object_array_length(bs); i++) {
+					json_object *x = json_object_array_get_idx(bs, i);
+					printf("  bound %-16s -> %s\n", jget(x, "control"), jget(x, "target"));
+				}
+		}
+		json_object_put(o);
+		bl_free(js);
+		return 0;
+	}
+	if (!strcmp(sub, "save") && argc >= 2) {
+		bl_profile_options o = BL_PROFILE_OPTIONS_INIT;
+		const char *ids[256];
+		size_t n_ids = 0;
+		for (int i = 2; i < argc; i++) {
+			const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
+			if (!strcmp(a, "--name") && v) { o.name = v; i++; }
+			else if (!strcmp(a, "--match") && v) { o.match = v; i++; }
+			else if (!strcmp(a, "--no-auto")) o.autoload = 0;
+			else if (!strcmp(a, "--auto")) o.autoload = 1;
+			else if (!strcmp(a, "--mapping") && v) { if (n_ids < 256) ids[n_ids++] = v; i++; }
+			else {
+				fprintf(stderr, "backline map profile save: unknown option '%s'\n", a);
+				return 2;
+			}
+		}
+		if (n_ids) {
+			o.mappings = ids;
+			o.n_mappings = n_ids;
+		}
+		char path[800];
+		if (bl_control_save_profile(c, argv[1], &o, path, sizeof(path)) < 0)
+			return fail(c, "map profile save");
+		out_kv(json, "path", path, "saved %s");
+		return 0;
+	}
+	if (!strcmp(sub, "load") && argc == 2) {
+		int k = bl_control_load_profile(c, argv[1]);
+		if (k < 0)
+			return fail(c, "map profile load");
+		if (json)
+			printf("{\"profile\": \"%s\", \"mappings\": %d}\n", argv[1], k);
+		else
+			printf("loaded %s: %d mappings\n", argv[1], k);
+		return 0;
+	}
+	if (!strcmp(sub, "unload") && argc == 2) {
+		if (bl_control_unload_profile(c, argv[1]) < 0)
+			return fail(c, "map profile unload");
+		return 0;
+	}
+	if (!strcmp(sub, "delete") && argc == 2) {
+		if (bl_control_delete_profile(c, argv[1]) < 0)
+			return fail(c, "map profile delete");
+		out_kv(json, "deleted", argv[1], "deleted %s");
+		return 0;
+	}
+	return usage_map();
+}
+
 int cli_map(bl_client *c, bool json, int argc, char **argv)
 {
 	if (argc < 1)
 		return usage_map();
 	const char *sub = argv[0];
 	char id[160];
+	if (!strcmp(sub, "profile"))
+		return cli_profile(c, json, argc - 1, argv + 1);
 	if (!strcmp(sub, "add")) {
 		if (argc < 3)
 			return usage_map();
@@ -231,7 +345,11 @@ int cli_map(bl_client *c, bool json, int argc, char **argv)
 					const char *mid = json_object_object_get_ex(m, "id", &v) ? json_object_get_string(v) : "";
 					const char *s = json_object_object_get_ex(m, "source", &v) ? json_object_get_string(v) : "";
 					const char *t = json_object_object_get_ex(m, "target", &v) ? json_object_get_string(v) : "";
-					printf("%-8s %-24s -> %s\n", mid, s, t);
+					const char *ctl = json_object_object_get_ex(m, "control", &v) ? json_object_get_string(v) : NULL;
+					if (ctl)
+						printf("%-8s %-24s -> %s  (%s)\n", mid, s, t, ctl);
+					else
+						printf("%-8s %-24s -> %s\n", mid, s, t);
 				}
 			if (json_object_object_get_ex(o, "listeners", &ls))
 				for (size_t i = 0; i < json_object_array_length(ls); i++) {

@@ -1,0 +1,308 @@
+{
+  "schema": "backline.midi-profile/1",
+  "id": "korg-nanokontrol2",
+  "name": "Korg nanoKONTROL2 (CC mode)",
+  "vendor": "Korg",
+  "model": "nanoKONTROL2",
+  "mode": "factory scene, Control Mode CC, global MIDI channel 1, LED mode internal",
+  "match": "nanoKONTROL2",
+  "verified": false,
+  "note": "built from the published chart, not tried on hardware. Buttons send 127 on press and 0 on release (momentary, the factory setting). Button LEDs follow the host only with LED Mode External, set in the KORG KONTROL Editor; then add feedback to a binding.",
+  "sources": [
+    "KORG nanoKONTROL2 Parameter Guide and MIDI Implementation (korg.com, nanoKONTROL2 support downloads)",
+    "Ardour share/midi_maps/Korg_nanoKONTROL2.map (the same factory scene, channel 1)"
+  ],
+  "controls": [
+    {
+      "name": "fader.1",
+      "source": "midi:cc:1:0",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.2",
+      "source": "midi:cc:1:1",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.3",
+      "source": "midi:cc:1:2",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.4",
+      "source": "midi:cc:1:3",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.5",
+      "source": "midi:cc:1:4",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.6",
+      "source": "midi:cc:1:5",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.7",
+      "source": "midi:cc:1:6",
+      "kind": "fader"
+    },
+    {
+      "name": "fader.8",
+      "source": "midi:cc:1:7",
+      "kind": "fader"
+    },
+    {
+      "name": "knob.a.1",
+      "source": "midi:cc:1:16",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.2",
+      "source": "midi:cc:1:17",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.3",
+      "source": "midi:cc:1:18",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.4",
+      "source": "midi:cc:1:19",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.5",
+      "source": "midi:cc:1:20",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.6",
+      "source": "midi:cc:1:21",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.7",
+      "source": "midi:cc:1:22",
+      "kind": "knob"
+    },
+    {
+      "name": "knob.a.8",
+      "source": "midi:cc:1:23",
+      "kind": "knob"
+    },
+    {
+      "name": "button.solo.1",
+      "source": "midi:cc:1:32",
+      "kind": "button",
+      "label": "S"
+    },
+    {
+      "name": "button.solo.2",
+      "source": "midi:cc:1:33",
+      "kind": "button",
+      "label": "S"
+    },
+    {
+      "name": "button.solo.3",
+      "source": "midi:cc:1:34",
+      "kind": "button",
+      "label": "S"
+    },
+    {
+      "name": "button.solo.4",
+      "source": "midi:cc:1:35",
+      "kind": "button",
+      "label": "S"
+    },
+    {
+      "name": "button.solo.5",
+      "source": "midi:cc:1:36",
+      "kind": "button",
+      "label": "S"
+    },
+    {
+      "name": "button.solo.6",
+      "source": "midi:cc:1:37",
+      "kind": "button",
+      "label": "S"
+    },
+    {
+      "name": "button.solo.7",
+      "source": "midi:cc:1:38",
+      "kind": "button",
+      "label": "S"
+    },
+    {
+      "name": "button.solo.8",
+      "source": "midi:cc:1:39",
+      "kind": "button",
+      "label": "S"
+    },
+    {
+      "name": "button.mute.1",
+      "source": "midi:cc:1:48",
+      "kind": "button",
+      "label": "M"
+    },
+    {
+      "name": "button.mute.2",
+      "source": "midi:cc:1:49",
+      "kind": "button",
+      "label": "M"
+    },
+    {
+      "name": "button.mute.3",
+      "source": "midi:cc:1:50",
+      "kind": "button",
+      "label": "M"
+    },
+    {
+      "name": "button.mute.4",
+      "source": "midi:cc:1:51",
+      "kind": "button",
+      "label": "M"
+    },
+    {
+      "name": "button.mute.5",
+      "source": "midi:cc:1:52",
+      "kind": "button",
+      "label": "M"
+    },
+    {
+      "name": "button.mute.6",
+      "source": "midi:cc:1:53",
+      "kind": "button",
+      "label": "M"
+    },
+    {
+      "name": "button.mute.7",
+      "source": "midi:cc:1:54",
+      "kind": "button",
+      "label": "M"
+    },
+    {
+      "name": "button.mute.8",
+      "source": "midi:cc:1:55",
+      "kind": "button",
+      "label": "M"
+    },
+    {
+      "name": "button.rec.1",
+      "source": "midi:cc:1:64",
+      "kind": "button",
+      "label": "R"
+    },
+    {
+      "name": "button.rec.2",
+      "source": "midi:cc:1:65",
+      "kind": "button",
+      "label": "R"
+    },
+    {
+      "name": "button.rec.3",
+      "source": "midi:cc:1:66",
+      "kind": "button",
+      "label": "R"
+    },
+    {
+      "name": "button.rec.4",
+      "source": "midi:cc:1:67",
+      "kind": "button",
+      "label": "R"
+    },
+    {
+      "name": "button.rec.5",
+      "source": "midi:cc:1:68",
+      "kind": "button",
+      "label": "R"
+    },
+    {
+      "name": "button.rec.6",
+      "source": "midi:cc:1:69",
+      "kind": "button",
+      "label": "R"
+    },
+    {
+      "name": "button.rec.7",
+      "source": "midi:cc:1:70",
+      "kind": "button",
+      "label": "R"
+    },
+    {
+      "name": "button.rec.8",
+      "source": "midi:cc:1:71",
+      "kind": "button",
+      "label": "R"
+    },
+    {
+      "name": "transport.play",
+      "source": "midi:cc:1:41",
+      "kind": "button",
+      "label": "PLAY"
+    },
+    {
+      "name": "transport.stop",
+      "source": "midi:cc:1:42",
+      "kind": "button",
+      "label": "STOP"
+    },
+    {
+      "name": "transport.rewind",
+      "source": "midi:cc:1:43",
+      "kind": "button",
+      "label": "REW"
+    },
+    {
+      "name": "transport.forward",
+      "source": "midi:cc:1:44",
+      "kind": "button",
+      "label": "FF"
+    },
+    {
+      "name": "transport.record",
+      "source": "midi:cc:1:45",
+      "kind": "button",
+      "label": "REC"
+    },
+    {
+      "name": "transport.cycle",
+      "source": "midi:cc:1:46",
+      "kind": "button",
+      "label": "CYCLE"
+    },
+    {
+      "name": "nav.track.prev",
+      "source": "midi:cc:1:58",
+      "kind": "button",
+      "label": "TRACK <"
+    },
+    {
+      "name": "nav.track.next",
+      "source": "midi:cc:1:59",
+      "kind": "button",
+      "label": "TRACK >"
+    },
+    {
+      "name": "marker.set",
+      "source": "midi:cc:1:60",
+      "kind": "button",
+      "label": "MARKER SET"
+    },
+    {
+      "name": "marker.prev",
+      "source": "midi:cc:1:61",
+      "kind": "button",
+      "label": "MARKER <"
+    },
+    {
+      "name": "marker.next",
+      "source": "midi:cc:1:62",
+      "kind": "button",
+      "label": "MARKER >"
+    }
+  ],
+  "bindings": []
+}
