@@ -40,7 +40,7 @@ jobs:
             build-essential git cmake ninja-build pkg-config ca-certificates \
             libpipewire-0.3-dev libsystemd-dev libsndfile1-dev libasound2-dev \
             libjson-c-dev liblilv-dev libssl-dev \
-            libjack-jackd2-dev libltc-dev libasio-dev libavahi-client-dev
+            libjack-jackd2-dev libltc-dev libasio-dev libavahi-client-dev dbus-daemon
       - uses: actions/checkout@v4
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ matrix.distro == 'archlinux' && '-DBACKLINE_LINK=ON' || '' }}

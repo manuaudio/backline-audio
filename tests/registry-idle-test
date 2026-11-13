@@ -23,7 +23,12 @@ echo "ok - serve --idle 1 exits after a second idle"
 pid0=$!
 sleep 3
 if ! kill -0 $pid0 2>/dev/null; then echo "not ok - serve --idle 0 stays up"; cat "$cache/zero.log"; exit 1; fi
-busctl --user status io.github.manuaudio.Backline.Registry >/dev/null 2>&1 ||
-  { echo "not ok - it owns its bus name"; exit 1; }
+# busctl ships with systemd itself, which a build container may not have
+if command -v busctl >/dev/null; then
+  busctl --user status io.github.manuaudio.Backline.Registry >/dev/null 2>&1 ||
+    { echo "not ok - it owns its bus name"; exit 1; }
+else
+  echo "# no busctl: bus-name check skipped"
+fi
 grep -q 'no idle exit' "$cache/zero.log" || { echo "not ok - it says it won't exit when idle"; cat "$cache/zero.log"; exit 1; }
 echo "ok - serve --idle 0 stays up and serves (3 s idle and still on the bus)"

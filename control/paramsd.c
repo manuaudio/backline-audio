@@ -36,7 +36,7 @@
 #define PD_MAX_ROOTS 16
 #define PD_MAX_PARAMS 20000
 #define PD_MAX_METERS 1024
-#define PD_MAX_SUBS 64
+#define PD_MAX_SUBS (PRM_SUB_WORDS * 64)
 #define PD_SUBS_PER_PEER 32
 #define PD_PEERS_PER_LISTENER 32
 #define PD_MAX_GEST 1024
@@ -58,6 +58,21 @@ struct root {
 	size_t meters_len;
 	char (*meter_ids)[PRM_SEG_MAX + 1];
 	uint32_t n_meters;
+	bool set_many;        /* features: set-many (one SetMany signal per batch) */
+};
+
+/* Set requests for an owner that takes SetMany, gathered until the loop is
+ * idle: one signal per (root, client, role) run. */
+struct set_ent {
+	uint32_t slot;
+	double num;
+	char *str;            /* string values, malloc'd */
+};
+struct set_batch {
+	char client[128];
+	char role[32];
+	struct set_ent *e;
+	size_t n, cap;
 };
 
 struct sub {
@@ -96,6 +111,17 @@ static struct {
 	struct ctl_bucket err_bucket[PD_MAX_LISTENERS];
 	uint64_t set_requests, refused;
 	sd_bus_slot *vtable_slot, *match_slot;
+	/* batching: Changed and SetMany are sent once the loop has handled what
+	 * is queued (an idle-time event), so a burst becomes one signal */
+	struct spa_source *flush_ev;
+	bool flush_armed;
+	uint32_t *pend;           /* slots with a Changed pending, in order */
+	size_t n_pend, cap_pend;
+	uint8_t *pend_flag;       /* by slot */
+	size_t cap_flag;
+	struct set_batch batch[PD_MAX_ROOTS];
+	int n_gest_osc;           /* open OSC gestures (skip the per-message scan when 0) */
+	uint64_t changed_signals, set_signals;
 } P;
 
 static uint64_t now_ns(void)
@@ -156,8 +182,11 @@ static void emit_structure(const char *root)
 
 static void gest_drop_root(const char *root);
 
+static void pd_flush(void);
+
 static void root_remove(int i, const char *why)
 {
+	pd_flush();
 	struct root *r = &P.roots[i];
 	char name[sizeof(r->root)];
 	snprintf(name, sizeof(name), "%s", r->root);
@@ -299,6 +328,163 @@ static void signal_owner(struct root *r, const char *member, const struct prm *p
 	sd_bus_message_unref(m);
 }
 
+/* ============================================================ batching */
+static void flush_arm(void)
+{
+	if (!P.flush_armed && P.flush_ev) {
+		P.flush_armed = true;
+		pw_loop_signal_event(P.loop, P.flush_ev);
+	}
+}
+
+static bool grow(void **v, size_t *cap, size_t need, size_t elem)
+{
+	if (need <= *cap)
+		return true;
+	size_t nc = *cap ? *cap : 256;
+	while (nc < need)
+		nc *= 2;
+	void *nv = realloc(*v, nc * elem);
+	if (!nv)
+		return false;
+	*v = nv;
+	*cap = nc;
+	return true;
+}
+
+/* A confirmed value to announce in the next Changed of its root. */
+static void pend_changed(struct prm *p)
+{
+	size_t old = P.cap_flag;
+	if (!grow((void **)&P.pend_flag, &P.cap_flag, (size_t)p->slot + 1, 1))
+		return;
+	if (P.cap_flag > old)
+		memset(P.pend_flag + old, 0, P.cap_flag - old);
+	if (P.pend_flag[p->slot])
+		return; /* already pending: the signal carries its latest value */
+	if (!grow((void **)&P.pend, &P.cap_pend, P.n_pend + 1, sizeof(*P.pend)))
+		return;
+	P.pend_flag[p->slot] = 1;
+	P.pend[P.n_pend++] = p->slot;
+	flush_arm();
+}
+
+static void append_changed(sd_bus_message *s, struct prm *p);
+
+static void flush_changed(void)
+{
+	if (!P.n_pend)
+		return;
+	for (int ri = 0; ri < PD_MAX_ROOTS; ri++) {
+		struct root *rt = &P.roots[ri];
+		if (!rt->used)
+			continue;
+		sd_bus_message *m = NULL;
+		int n = 0;
+		for (size_t k = 0; k < P.n_pend; k++) {
+			struct prm *p = prm_store_slot(P.store, P.pend[k]);
+			if (!p || p->root != ri)
+				continue;
+			if (!m) {
+				if (sd_bus_message_new_signal(P.bus, &m, PD_OBJ_PATH, PD_IFACE, "Changed") < 0)
+					break;
+				sd_bus_message_append(m, "s", rt->root);
+				sd_bus_message_open_container(m, 'a', "(svds)");
+			}
+			append_changed(m, p);
+			n++;
+		}
+		if (m) {
+			sd_bus_message_close_container(m);
+			if (n && sd_bus_send(P.bus, m, NULL) >= 0)
+				P.changed_signals++;
+			sd_bus_message_unref(m);
+		}
+	}
+	for (size_t k = 0; k < P.n_pend; k++)
+		if (P.pend[k] < P.cap_flag)
+			P.pend_flag[P.pend[k]] = 0;
+	P.n_pend = 0;
+}
+
+static int append_value(sd_bus_message *m, const struct prm *p, double num, const char *str);
+
+static void batch_flush(int ri)
+{
+	struct set_batch *b = &P.batch[ri];
+	if (!b->n)
+		return;
+	struct root *r = &P.roots[ri];
+	sd_bus_message *m = NULL;
+	if (r->used && sd_bus_message_new_signal(P.bus, &m, PD_OBJ_PATH, PD_IFACE, "SetMany") >= 0) {
+		sd_bus_message_set_destination(m, r->owner);
+		int rr = sd_bus_message_open_container(m, 'a', "(sv)");
+		for (size_t k = 0; rr >= 0 && k < b->n; k++) {
+			struct prm *p = prm_store_slot(P.store, b->e[k].slot);
+			if (!p || p->root != ri)
+				continue;
+			rr = sd_bus_message_open_container(m, 'r', "sv");
+			if (rr >= 0)
+				rr = sd_bus_message_append(m, "s", p->path);
+			if (rr >= 0)
+				rr = append_value(m, p, b->e[k].num, b->e[k].str ? b->e[k].str : "");
+			if (rr >= 0)
+				rr = sd_bus_message_close_container(m);
+		}
+		if (rr >= 0)
+			rr = sd_bus_message_close_container(m);
+		if (rr >= 0)
+			rr = sd_bus_message_append(m, "ss", b->client, b->role);
+		if (rr >= 0 && sd_bus_send(P.bus, m, NULL) >= 0)
+			P.set_signals++;
+		sd_bus_message_unref(m);
+	}
+	for (size_t k = 0; k < b->n; k++)
+		free(b->e[k].str);
+	b->n = 0;
+}
+
+/* A set request for an owner with set-many: gathered into one SetMany per
+ * run of requests from the same client in the same role. */
+static void batch_add(struct prm *p, double num, const char *str, const char *client, const char *role)
+{
+	struct set_batch *b = &P.batch[p->root];
+	if (!client)
+		client = "";
+	if (!role || !*role)
+		role = "all";
+	if (b->n && (strcmp(b->client, client) || strcmp(b->role, role) || b->n >= PD_MAX_PARAMS))
+		batch_flush(p->root);
+	if (!b->n) {
+		snprintf(b->client, sizeof(b->client), "%s", client);
+		snprintf(b->role, sizeof(b->role), "%s", role);
+	}
+	if (!grow((void **)&b->e, &b->cap, b->n + 1, sizeof(*b->e)))
+		return;
+	b->e[b->n].slot = p->slot;
+	b->e[b->n].num = num;
+	b->e[b->n].str = p->type == PRM_STRING ? strdup(str) : NULL;
+	b->n++;
+	flush_arm();
+}
+
+/* Sends what is batched: SetMany to owners, then Changed. Before any change
+ * to the tree (so a batch never names a parameter that was replaced) and
+ * when the loop has handled what was queued. */
+static void pd_flush(void)
+{
+	for (int ri = 0; ri < PD_MAX_ROOTS; ri++)
+		batch_flush(ri);
+	flush_changed();
+}
+
+static void on_flush(void *data, uint64_t count)
+{
+	P.flush_armed = false;
+	pd_flush();
+	sd_bus_flush(P.bus);
+}
+
 static int check_write(const struct prm *p, struct root *r, const char *role, char *why, size_t n)
 {
 	if (!prm_role_may_write(r->roles, r->n_roles, role, p, why, n)) {
@@ -306,6 +492,17 @@ static int check_write(const struct prm *p, struct root *r, const char *role, ch
 		return -1;
 	}
 	return 0;
+}
+
+static void deliver_set(struct prm *p, double num, const char *str, const char *client, const char *role)
+{
+	struct root *r = &P.roots[p->root];
+	if (r->set_many)
+		batch_add(p, num, str, client, role);
+	else
+		signal_owner(r, "Set", p, num, str, -1, client, role);
+	P.set_requests++;
+	VLOG("set %s = %g%s%s by %s (%s)\n", p->path, num, str[0] ? " " : "", str, client, role && *role ? role : "all");
 }
 
 static int request_set(struct prm *p, const struct pval *v, bool norm, const char *client, const char *role, char *why,
@@ -318,9 +515,7 @@ static int request_set(struct prm *p, const struct pval *v, bool norm, const cha
 	char str[PRM_STRING_MAX];
 	if (convert(p, v, norm, &num, str, sizeof(str), why, wn) < 0)
 		return -EINVAL;
-	signal_owner(r, "Set", p, num, str, -1, client, role);
-	P.set_requests++;
-	VLOG("set %s = %g%s%s by %s (%s)\n", p->path, num, str[0] ? " " : "", str, client, role && *role ? role : "all");
+	deliver_set(p, num, str, client, role);
 	return 0;
 }
 
@@ -334,13 +529,20 @@ static struct gest *gest_find(enum gest_kind k, const char *path, const char *cl
 	return NULL;
 }
 
+static void gest_release(struct gest *g)
+{
+	if (g->used && g->kind == G_OSC)
+		P.n_gest_osc--;
+	g->used = false;
+}
+
 static void gest_end(struct gest *g, const char *why)
 {
 	struct prm *p = prm_store_get(P.store, g->path);
 	if (p && P.roots[p->root].used)
 		signal_owner(&P.roots[p->root], "Gesture", p, 0, NULL, 0, g->client, g->role);
 	VLOG("gesture end %s by %s (%s)\n", g->path, g->client, why);
-	g->used = false;
+	gest_release(g);
 }
 
 static void gest_drop_root(const char *root)
@@ -348,7 +550,7 @@ static void gest_drop_root(const char *root)
 	size_t rl = strlen(root);
 	for (int i = 0; i < PD_MAX_GEST; i++)
 		if (P.gests[i].used && !strncmp(P.gests[i].path, root, rl) && P.gests[i].path[rl] == '/')
-			P.gests[i].used = false; /* its owner is gone: nobody to tell */
+			gest_release(&P.gests[i]); /* its owner is gone: nobody to tell */
 }
 
 static int request_gesture(struct prm *p, bool begin, enum gest_kind kind, const char *client, const char *role,
@@ -377,6 +579,8 @@ static int request_gesture(struct prm *p, bool begin, enum gest_kind kind, const
 		memset(g, 0, sizeof(*g));
 		g->used = true;
 		g->kind = kind;
+		if (kind == G_OSC)
+			P.n_gest_osc++;
 		snprintf(g->path, sizeof(g->path), "%s", p->path);
 		snprintf(g->client, sizeof(g->client), "%s", client);
 		snprintf(g->role, sizeof(g->role), "%s", role && *role ? role : "all");
@@ -472,8 +676,41 @@ static bool same_peer(const struct pd_peer *a, const struct pd_peer *b)
 	return a->alen == b->alen && !memcmp(&a->addr, &b->addr, a->alen);
 }
 
+/* The subscription index: bit i of p->match says sub i's pattern matches p,
+ * so a change costs one bit scan, not a pattern match per subscription. */
+#define BIT_W(i) ((i) >> 6)
+#define BIT_M(i) (1ull << ((i) & 63))
+
+static int index_sub_set(void *data, struct prm *p)
+{
+	int i = (int)((struct sub *)data - P.subs);
+	if (prm_match(((struct sub *)data)->pattern, p->path))
+		p->match[BIT_W(i)] |= BIT_M(i);
+	else
+		p->match[BIT_W(i)] &= ~BIT_M(i);
+	return 0;
+}
+
+static int index_sub_clear(void *data, struct prm *p)
+{
+	int i = (int)((struct sub *)data - P.subs);
+	p->match[BIT_W(i)] &= ~BIT_M(i);
+	p->dirty[BIT_W(i)] &= ~BIT_M(i);
+	return 0;
+}
+
+static void index_param(struct prm *p)
+{
+	memset(p->match, 0, sizeof(p->match));
+	for (int i = 0; i < PD_MAX_SUBS; i++)
+		if (P.subs[i].used && !P.subs[i].meters && prm_match(P.subs[i].pattern, p->path))
+			p->match[BIT_W(i)] |= BIT_M(i);
+}
+
 static void sub_free(struct sub *s)
 {
+	if (!s->meters)
+		prm_store_each(P.store, index_sub_clear, s);
 	free(s->dirty);
 	memset(s, 0, sizeof(*s));
 	sd_bus_emit_properties_changed(P.bus, PD_OBJ_PATH, PD_IFACE, "Subscriptions", NULL);
@@ -481,9 +718,13 @@ static void sub_free(struct sub *s)
 
 static void mark_dirty(struct prm *p)
 {
-	for (int i = 0; i < PD_MAX_SUBS; i++) {
+	for (int w = 0; w < PRM_SUB_WORDS; w++) {
+	uint64_t want = p->match[w] & ~p->dirty[w];
+	while (want) {
+		int i = w * 64 + __builtin_ctzll(want);
+		want &= want - 1;
 		struct sub *s = &P.subs[i];
-		if (!s->used || s->meters || (p->dirty & (1ull << i)) || !prm_match(s->pattern, p->path))
+		if (!s->used || s->meters)
 			continue;
 		if (s->n_dirty == s->cap_dirty) {
 			size_t nc = s->cap_dirty ? s->cap_dirty * 2 : 64;
@@ -494,7 +735,8 @@ static void mark_dirty(struct prm *p)
 			s->cap_dirty = nc;
 		}
 		s->dirty[s->n_dirty++] = p->slot;
-		p->dirty |= 1ull << i;
+		p->dirty[w] |= BIT_M(i);
+	}
 	}
 	tick_update();
 }
@@ -565,10 +807,12 @@ static void flush_sub(int i, uint64_t now)
 	} else {
 		for (size_t k = 0; k < s->n_dirty; k++) {
 			struct prm *p = prm_store_slot(P.store, s->dirty[k]);
-			if (!p)
+			/* a slot can be queued twice if its parameter was removed and the
+			 * slot reused: only a parameter still marked is sent, once */
+			if (!p || !(p->dirty[BIT_W(i)] & BIT_M(i)))
 				continue;
-			p->dirty &= ~(1ull << i);
-			if (!prm_match(s->pattern, p->path))
+			p->dirty[BIT_W(i)] &= ~BIT_M(i);
+			if (!(p->match[BIT_W(i)] & BIT_M(i)))
 				continue;
 			uint8_t msg[700];
 			bundler_add(b, msg, value_msg(p, s->norm, msg, sizeof(msg)));
@@ -650,6 +894,9 @@ static void subscribe(const struct pd_peer *peer, const char *pattern, double ra
 		s->used = true;
 		s->peer = *peer;
 		snprintf(s->pattern, sizeof(s->pattern), "%s", pattern);
+		s->meters = meters;
+		if (!meters)
+			prm_store_each(P.store, index_sub_set, s);
 		sd_bus_emit_properties_changed(P.bus, PD_OBJ_PATH, PD_IFACE, "Subscriptions", NULL);
 	}
 	double maxr = meters ? 30 : 60, defr = meters ? 15 : 30;
@@ -724,6 +971,8 @@ static bool osc_value(const struct osc_arg *a, struct pval *v)
 
 static void touch_peer_gestures(const struct pd_peer *peer)
 {
+	if (!P.n_gest_osc)
+		return;
 	uint64_t now = now_ns();
 	for (int i = 0; i < PD_MAX_GEST; i++)
 		if (P.gests[i].used && P.gests[i].kind == G_OSC && same_peer(&P.gests[i].peer, peer))
@@ -943,11 +1192,26 @@ static int m_register(sd_bus_message *m, void *ud, sd_bus_error *err)
 	}
 	json_object_object_foreach(o, key, val) {
 		(void)val;
-		if (strcmp(key, "schema") && strcmp(key, "params") && strcmp(key, "meters")) {
+		if (strcmp(key, "schema") && strcmp(key, "params") && strcmp(key, "meters") && strcmp(key, "features")) {
 			json_object_put(o);
 			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "unknown key '%s'", key);
 		}
 	}
+	bool set_many = false;
+	json_object *jf = NULL;
+	if (json_object_object_get_ex(o, "features", &jf)) {
+		if (!json_object_is_type(jf, json_type_array)) {
+			json_object_put(o);
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "features is an array of strings");
+		}
+		for (size_t i = 0; i < json_object_array_length(jf); i++) {
+			const char *f = json_object_get_string(json_object_array_get_idx(jf, i));
+			if (f && !strcmp(f, "set-many"))
+				set_many = true;
+			/* unknown features are ignored: a newer program on an older controld */
+		}
+	}
+	pd_flush();
 	bool fresh = ri < 0;
 	if (fresh) {
 		for (int i = 0; i < PD_MAX_ROOTS && ri < 0; i++)
@@ -982,6 +1246,7 @@ static int m_register(sd_bus_message *m, void *ud, sd_bus_error *err)
 	json_object_put(o);
 	struct root *rt = &P.roots[ri];
 	rt->used = true;
+	rt->set_many = set_many;
 	snprintf(rt->owner, sizeof(rt->owner), "%s", sender ? sender : "");
 	if (!rt->token[0]) {
 		uint8_t rnd[16];
@@ -991,8 +1256,11 @@ static int m_register(sd_bus_message *m, void *ud, sd_bus_error *err)
 		for (int i = 0; i < 16; i++)
 			snprintf(rt->token + 2 * i, 3, "%02x", rnd[i]);
 	}
-	for (int i = 0; i < np; i++)
-		mark_dirty(prm_store_put(P.store, ps[i]));
+	for (int i = 0; i < np; i++) {
+		struct prm *p = prm_store_put(P.store, ps[i]);
+		index_param(p);
+		mark_dirty(p);
+	}
 	free(ps);
 	plog("%s registered by %s: %d parameters, %u meters\n", root, rt->owner, np, rt->n_meters);
 	emit_structure(root);
@@ -1016,13 +1284,17 @@ static int m_add(sd_bus_message *m, void *ud, sd_bus_error *err)
 	char e[400];
 	struct prm **ps;
 	int np;
+	pd_flush();
 	if (parse_params_into(jp, (int)(rt - P.roots), &ps, &np, e, sizeof(e)) < 0) {
 		json_object_put(o);
 		return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s", e);
 	}
 	json_object_put(o);
-	for (int i = 0; i < np; i++)
-		mark_dirty(prm_store_put(P.store, ps[i]));
+	for (int i = 0; i < np; i++) {
+		struct prm *p = prm_store_put(P.store, ps[i]);
+		index_param(p);
+		mark_dirty(p);
+	}
 	free(ps);
 	emit_structure(rt->root);
 	return sd_bus_reply_method_return(m, "");
@@ -1042,6 +1314,7 @@ static int m_remove(sd_bus_message *m, void *ud, sd_bus_error *err)
 		return r;
 	const char *path;
 	int n = 0;
+	pd_flush();
 	while ((r = sd_bus_message_read(m, "s", &path)) > 0) {
 		size_t l = strlen(path);
 		if (l > 3 && !strcmp(path + l - 3, "/**"))
@@ -1067,23 +1340,14 @@ static void append_changed(sd_bus_message *s, struct prm *p)
 	sd_bus_message_close_container(s);
 }
 
-static void emit_changed(struct root *rt, struct prm **ps, int n)
-{
-	if (!n)
-		return;
-	sd_bus_message *s = NULL;
-	if (sd_bus_message_new_signal(P.bus, &s, PD_OBJ_PATH, PD_IFACE, "Changed") < 0)
-		return;
-	sd_bus_message_append(s, "s", rt->root);
-	sd_bus_message_open_container(s, 'a', "(svds)");
-	for (int i = 0; i < n; i++)
-		append_changed(s, ps[i]);
-	sd_bus_message_close_container(s);
-	sd_bus_send(P.bus, s, NULL);
-	sd_bus_message_unref(s);
-}
-
-#define MAX_UPDATE 4096
+/* Update and UpdateText take any number of values (up to the tree's size),
+ * check them all first (nothing applies if one is bad), and announce them in
+ * the next Changed: the updates the loop handles together become one signal. */
+struct upd {
+	struct prm *p;
+	double num;
+	const char *str;      /* string values: valid while the message is */
+};
 
 static int m_update(sd_bus_message *m, void *ud, sd_bus_error *err)
 {
@@ -1095,18 +1359,10 @@ static int m_update(sd_bus_message *m, void *ud, sd_bus_error *err)
 	if (!rt)
 		return -EACCES;
 	int ri = (int)(rt - P.roots);
-	struct upd {
-		struct prm *p;
-		double num;
-		char str[PRM_STRING_MAX];
-	} *u = malloc(MAX_UPDATE * sizeof(*u));
-	if (!u)
-		return -ENOMEM;
-	int n = 0;
-	if ((r = sd_bus_message_enter_container(m, 'a', "(sv)")) < 0) {
-		free(u);
+	struct upd *u = NULL;
+	size_t n = 0, cap = 0;
+	if ((r = sd_bus_message_enter_container(m, 'a', "(sv)")) < 0)
 		return r;
-	}
 	while ((r = sd_bus_message_enter_container(m, 'r', "sv")) > 0) {
 		const char *path;
 		struct pval v;
@@ -1120,21 +1376,26 @@ static int m_update(sd_bus_message *m, void *ud, sd_bus_error *err)
 			free(u);
 			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s is not a parameter of %s", path, rt->root);
 		}
-		if (n >= MAX_UPDATE) {
+		if (n >= PD_MAX_PARAMS) {
 			free(u);
-			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "at most %d values per Update", MAX_UPDATE);
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "at most %d values per Update", PD_MAX_PARAMS);
 		}
-		char why[256];
+		if (!grow((void **)&u, &cap, n + 1, sizeof(*u))) {
+			free(u);
+			return -ENOMEM;
+		}
+		char why[256], str[PRM_STRING_MAX];
 		u[n].p = p;
-		if (p->type != PRM_TRIGGER && convert(p, &v, false, &u[n].num, u[n].str, sizeof(u[n].str), why, sizeof(why)) < 0) {
+		u[n].num = 0;
+		u[n].str = v.str;
+		if (p->type != PRM_TRIGGER && convert(p, &v, false, &u[n].num, str, sizeof(str), why, sizeof(why)) < 0) {
 			free(u);
 			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s", why);
 		}
 		n++;
 	}
 	sd_bus_message_exit_container(m);
-	struct prm **ch = malloc((n ? n : 1) * sizeof(*ch));
-	for (int i = 0; i < n; i++) {
+	for (size_t i = 0; i < n; i++) {
 		struct prm *p = u[i].p;
 		if (p->type == PRM_STRING)
 			snprintf(p->str, sizeof(p->str), "%s", u[i].str);
@@ -1142,13 +1403,11 @@ static int m_update(sd_bus_message *m, void *ud, sd_bus_error *err)
 			p->value = u[i].num;
 		p->text_override = false;
 		prm_refresh_text(p);
-		ch[i] = p;
 		mark_dirty(p);
+		pend_changed(p);
 		if (P.hooks.changed)
 			P.hooks.changed(P.hooks.data, p);
 	}
-	emit_changed(rt, ch, n);
-	free(ch);
 	free(u);
 	return sd_bus_reply_method_return(m, "");
 }
@@ -1167,31 +1426,30 @@ static int m_update_text(sd_bus_message *m, void *ud, sd_bus_error *err)
 	if ((r = sd_bus_message_enter_container(m, 'a', "(ss)")) < 0)
 		return r;
 	const char *path, *text;
+	size_t n = 0;
 	while ((r = sd_bus_message_read(m, "(ss)", &path, &text)) > 0) {
 		struct prm *p = prm_store_get(P.store, path);
 		if (!p || p->root != ri)
 			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s is not a parameter of %s", path, rt->root);
 		if (strlen(text) >= PRM_TEXT_MAX)
 			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "text is at most %d bytes", PRM_TEXT_MAX - 1);
+		if (++n > PD_MAX_PARAMS)
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "at most %d texts per UpdateText", PD_MAX_PARAMS);
 	}
 	sd_bus_message_exit_container(m);
 	sd_bus_message_rewind(m, true);
 	sd_bus_message_skip(m, "s");
 	sd_bus_message_enter_container(m, 'a', "(ss)");
-	struct prm **ch = malloc(MAX_UPDATE * sizeof(*ch));
-	int n = 0;
-	while ((r = sd_bus_message_read(m, "(ss)", &path, &text)) > 0 && n < MAX_UPDATE) {
+	while ((r = sd_bus_message_read(m, "(ss)", &path, &text)) > 0) {
 		struct prm *p = prm_store_get(P.store, path);
 		snprintf(p->text, sizeof(p->text), "%s", text);
 		p->text_override = true;
-		ch[n++] = p;
 		mark_dirty(p);
+		pend_changed(p);
 		if (P.hooks.changed)
 			P.hooks.changed(P.hooks.data, p);
 	}
 	sd_bus_message_exit_container(m);
-	emit_changed(rt, ch, n);
-	free(ch);
 	return sd_bus_reply_method_return(m, "");
 }
 
@@ -1364,6 +1622,13 @@ static int m_get(sd_bus_message *m, void *ud, sd_bus_error *err)
 	return r;
 }
 
+static void strv_free_(char **v)
+{
+	for (size_t i = 0; v && v[i]; i++)
+		free(v[i]);
+	free(v);
+}
+
 struct opts {
 	bool norm;
 	char role[32];
@@ -1431,6 +1696,135 @@ static int m_set(sd_bus_message *m, void *ud, sd_bus_error *err)
 		return sd_bus_error_setf(err, ERR_NOTFOUND, "no parameter %s", path);
 	char why[256] = "";
 	return reply_status(m, err, request_set(p, &v, o.norm, o.client, o.role, why, sizeof(why)), why);
+}
+
+/* SetMany(a(sv) values, a{sv} options): every value is checked first (path,
+ * role, kind); one bad value refuses the call and nothing is passed on. */
+static int m_set_many(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	int r = sd_bus_message_enter_container(m, 'a', "(sv)");
+	if (r < 0)
+		return r;
+	struct sm {
+		struct prm *p;
+		double num;
+		const char *str;
+	} *v = NULL;
+	size_t n = 0, cap = 0;
+	char why[256] = "";
+	int bad = 0;
+	const char *bad_path = ""; /* valid while the message is */
+	while ((r = sd_bus_message_enter_container(m, 'r', "sv")) > 0) {
+		const char *path;
+		struct pval pv;
+		if (sd_bus_message_read(m, "s", &path) < 0 || read_variant(m, &pv) < 0) {
+			free(v);
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "each value is (s path, v value) of d, i, u, b or s");
+		}
+		sd_bus_message_exit_container(m);
+		if (bad)
+			continue;
+		if (n >= PD_MAX_PARAMS) {
+			free(v);
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "at most %d values per SetMany", PD_MAX_PARAMS);
+		}
+		if (!grow((void **)&v, &cap, n + 1, sizeof(*v))) {
+			free(v);
+			return -ENOMEM;
+		}
+		v[n].p = prm_store_get(P.store, path);
+		v[n].str = pv.type == 's' ? pv.str : NULL;
+		v[n].num = pv.num;
+		if (!v[n].p) {
+			bad = -ENOENT;
+			bad_path = path;
+			continue;
+		}
+		n++; /* role, kind and range are checked once the options are read */
+	}
+	sd_bus_message_exit_container(m);
+	struct opts o;
+	if ((r = read_opts(m, &o, true, err)) < 0) {
+		free(v);
+		return r;
+	}
+	if (bad == -ENOENT) {
+		free(v);
+		return sd_bus_error_setf(err, ERR_NOTFOUND, "no parameter %s", bad_path);
+	}
+	/* every value: role, kind and range, with the norm option known */
+	for (size_t i = 0; i < n; i++) {
+		struct pval pv = { v[i].str ? 's' : 'd', v[i].num, v[i].str };
+		char str[PRM_STRING_MAX];
+		if (check_write(v[i].p, &P.roots[v[i].p->root], o.role, why, sizeof(why)) < 0) {
+			free(v);
+			return sd_bus_error_setf(err, ERR_ACCESS, "%s", why);
+		}
+		if (convert(v[i].p, &pv, o.norm, &v[i].num, str, sizeof(str), why, sizeof(why)) < 0) {
+			free(v);
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "%s", why);
+		}
+	}
+	for (size_t i = 0; i < n; i++)
+		deliver_set(v[i].p, v[i].num, v[i].str ? v[i].str : "", o.client, o.role);
+	free(v);
+	return sd_bus_reply_method_return(m, "u", (uint32_t)n);
+}
+
+struct gm_ctx {
+	const char *pattern;
+	sd_bus_message *reply;
+	uint32_t n;
+};
+
+static int gm_one(void *data, struct prm *p)
+{
+	struct gm_ctx *c = data;
+	if (prm_match(c->pattern, p->path)) {
+		append_changed(c->reply, p);
+		c->n++;
+	}
+	return 0;
+}
+
+/* GetMatching(as patterns) -> a(svds): the values of every parameter that
+ * matches any pattern, each once, in tree order. */
+static int m_get_matching(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	char **pats = NULL;
+	int r = sd_bus_message_read_strv(m, &pats);
+	if (r < 0)
+		return r;
+	sd_bus_message *reply = NULL;
+	if ((r = sd_bus_message_new_method_return(m, &reply)) < 0) {
+		strv_free_(pats);
+		return r;
+	}
+	sd_bus_message_open_container(reply, 'a', "(svds)");
+	size_t np = 0;
+	while (pats && pats[np])
+		np++;
+	if (np == 1) {
+		struct gm_ctx c = { pats[0], reply, 0 };
+		prm_store_each(P.store, gm_one, &c);
+	} else {
+		uint32_t cap = prm_store_capacity(P.store);
+		for (uint32_t i = 0; i < cap; i++) {
+			struct prm *p = prm_store_slot(P.store, i);
+			if (!p)
+				continue;
+			for (size_t k = 0; k < np; k++)
+				if (prm_match(pats[k], p->path)) {
+					append_changed(reply, p);
+					break;
+				}
+		}
+	}
+	strv_free_(pats);
+	sd_bus_message_close_container(reply);
+	r = sd_bus_send(NULL, reply, NULL);
+	sd_bus_message_unref(reply);
+	return r;
 }
 
 static int m_gesture(sd_bus_message *m, void *ud, sd_bus_error *err)
@@ -1507,6 +1901,10 @@ static int p_props(sd_bus *bus, const char *path, const char *iface, const char 
 		return sd_bus_message_append(reply, "u", pd_subscriptions());
 	if (!strcmp(prop, "SetRequests"))
 		return sd_bus_message_append(reply, "t", P.set_requests);
+	if (!strcmp(prop, "ChangedSignals"))
+		return sd_bus_message_append(reply, "t", P.changed_signals);
+	if (!strcmp(prop, "SetSignals"))
+		return sd_bus_message_append(reply, "t", P.set_signals);
 	return sd_bus_message_append(reply, "t", P.refused);
 }
 
@@ -1524,14 +1922,19 @@ static const sd_bus_vtable vtable[] = {
 	SD_BUS_METHOD_WITH_ARGS("Get", SD_BUS_ARGS("as", paths), SD_BUS_RESULT("a(svds)", values), m_get, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Set", SD_BUS_ARGS("s", path, "v", value, "a{sv}", options), SD_BUS_NO_RESULT, m_set, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Gesture", SD_BUS_ARGS("s", path, "b", begin, "a{sv}", options), SD_BUS_NO_RESULT, m_gesture, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("SetMany", SD_BUS_ARGS("a(sv)", values, "a{sv}", options), SD_BUS_RESULT("u", passed), m_set_many, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("GetMatching", SD_BUS_ARGS("as", patterns), SD_BUS_RESULT("a(svds)", values), m_get_matching, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("MeterTable", SD_BUS_ARGS("s", root), SD_BUS_RESULT("h", memfd, "as", ids), m_meter_table, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_PROPERTY("Roots", "as", p_props, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("ParamCount", "u", p_props, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("Subscriptions", "u", p_props, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("SetRequests", "t", p_props, 0, 0),
 	SD_BUS_PROPERTY("Refused", "t", p_props, 0, 0),
+	SD_BUS_PROPERTY("ChangedSignals", "t", p_props, 0, 0),
+	SD_BUS_PROPERTY("SetSignals", "t", p_props, 0, 0),
 	SD_BUS_SIGNAL_WITH_ARGS("Set", SD_BUS_ARGS("s", path, "v", value, "s", client, "s", role), 0),
 	SD_BUS_SIGNAL_WITH_ARGS("Gesture", SD_BUS_ARGS("s", path, "b", begin, "s", client, "s", role), 0),
+	SD_BUS_SIGNAL_WITH_ARGS("SetMany", SD_BUS_ARGS("a(sv)", values, "s", client, "s", role), 0),
 	SD_BUS_SIGNAL_WITH_ARGS("Changed", SD_BUS_ARGS("s", root, "a(svds)", values), 0),
 	SD_BUS_SIGNAL_WITH_ARGS("Structure", SD_BUS_ARGS("s", root), 0),
 	SD_BUS_VTABLE_END
@@ -1572,6 +1975,7 @@ int pd_init(sd_bus *bus, struct pw_loop *loop, const struct pd_hooks *hooks, boo
 	if (r < 0)
 		return r;
 	P.tick = pw_loop_add_timer(loop, on_tick, NULL);
+	P.flush_ev = pw_loop_add_event(loop, on_flush, NULL);
 	return 0;
 }
 
@@ -1584,6 +1988,13 @@ void pd_fini(void)
 		meters_drop(&P.roots[i]);
 		free(P.roots[i].meter_ids);
 	}
+	pd_flush();
+	for (int i = 0; i < PD_MAX_ROOTS; i++)
+		free(P.batch[i].e);
+	free(P.pend);
+	free(P.pend_flag);
+	if (P.flush_ev)
+		pw_loop_destroy_source(P.loop, P.flush_ev);
 	if (P.tick)
 		pw_loop_destroy_source(P.loop, P.tick);
 	sd_bus_slot_unref(P.match_slot);

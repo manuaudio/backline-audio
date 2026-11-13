@@ -23,4 +23,11 @@ if(BUILD_TESTING)
   add_executable(test_params ${PROJECT_SOURCE_DIR}/tests/unit/test_params.c)
   target_link_libraries(test_params PRIVATE bl_params)
   add_test(NAME params_tree COMMAND test_params)
+  # Params1 under load, offline: a private dbus-daemon (no activation),
+  # controld --no-graph (never PipeWire), 5000 parameters, 8 OSC clients x 2000.
+  add_executable(backline-test-params-load ${PROJECT_SOURCE_DIR}/tests/tools/params-load.c)
+  target_link_libraries(backline-test-params-load PRIVATE bl_control_core PkgConfig::SYSTEMD Threads::Threads m)
+  add_test(NAME params_load COMMAND backline-test-params-load $<TARGET_FILE:backline-controld>
+           --json ${CMAKE_BINARY_DIR}/params-load.json)
+  set_tests_properties(params_load PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 endif()
