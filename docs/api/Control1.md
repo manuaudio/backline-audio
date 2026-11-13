@@ -97,6 +97,113 @@ that mapping replace each other and only the latest is sent when the call
 returns, so a fast fader never queues up a backlog. Volume, mute and control
 targets go straight to PipeWire.
 
+## MIDI profiles
+
+A **profile** describes one MIDI controller: its physical controls under
+abstract names (`fader.1`, `knob.a.1`, `button.mute.1`, `transport.play`),
+each with the message it sends in a named factory mode, and the **bindings**
+the user learned for them (a control to a target, with the options of a
+mapping). Learning stays what it is (`Learn`); a profile is how what was
+learned for one device is kept, comes back when the device is plugged in, and
+can be shared.
+
+- **Where they live.** The user's profiles are in
+  `$XDG_CONFIG_HOME/backline/midi-profiles/` (`ProfileDirs[0]`; beside
+  `ConfigDir`, or `--profile-dir`); the shipped ones in
+  `$datadir/backline/midi-profiles/` (`ProfileDirs[1]`). A user profile hides
+  a system profile of the same id, so saving bindings for a shipped device
+  writes the user's copy and leaves the shipped file alone. One file per
+  profile, `<id>.json`.
+- **Active.** A profile is active while its device is in the graph: when a
+  MIDI port whose `node:port | alias` matches its `match` appears, the first
+  matching profile (the user's before the system's, then by id) with `auto`
+  on becomes active. That links the device to controld's MIDI input and
+  output (as `SetMidiFollow`/`SetMidiOut` would, without changing them) and
+  makes each binding a mapping, id `<profile>.<control>` (`.2`, `.3` for a
+  control's further bindings), origin `profile:<id>`. When the device's last
+  port goes, the profile and its mappings go too (`ProfileUnloaded`,
+  `device-gone`). `LoadProfile` activates one by hand, device or not; it
+  stays until `UnloadProfile`.
+- **Mappings() and controls.** A mapping whose source is a control of an
+  active profile lists `"profile"` and `"control"` with it, so a UI can say
+  "fader 1" rather than `midi:cc:1:0`. Both are output-only and ignored on
+  input.
+- **Saving.** `SaveProfile(id)` binds the current MIDI mappings that are
+  this device's controls (made at run time, from `control.json`, or the
+  profile's own) and writes the user's file. Those mappings then belong to
+  the profile: they are no longer written to `control.json` by `Save`, and go
+  when the profile is unloaded. For a device no profile describes, give
+  `match` (and `name`): the controls are made from the mappings' sources
+  (`cc.1.7`, `note.10.36`).
+
+### The file (`backline.midi-profile/1`)
+
+```json
+{"schema": "backline.midi-profile/1",
+ "id": "korg-nanokontrol2",
+ "name": "Korg nanoKONTROL2 (CC mode)",
+ "vendor": "Korg", "model": "nanoKONTROL2",
+ "mode": "factory scene, Control Mode CC, global MIDI channel 1, LED mode internal",
+ "match": "nanoKONTROL2",
+ "verified": false,
+ "note": "built from the published chart, not tried on hardware. ...",
+ "sources": ["KORG nanoKONTROL2 Parameter Guide and MIDI Implementation (korg.com)", "..."],
+ "controls": [{"name": "fader.1", "source": "midi:cc:1:0", "kind": "fader"},
+              {"name": "button.mute.1", "source": "midi:cc:1:48", "kind": "button", "label": "M"}],
+ "bindings": [{"control": "fader.1", "target": "param:/console/in.1/fader", "gesture": "auto"}]}
+```
+
+| Key | Meaning |
+|---|---|
+| `id` | `[a-z0-9][a-z0-9._-]*`, at most 63; the file's name without `.json` |
+| `name`, `vendor`, `model`, `mode` | for people; `mode` names the device setting the controls are for (a template, a scene, a preset) |
+| `match` | POSIX extended regex, case-insensitive, on the device's MIDI ports (`node:port \| alias`) |
+| `verified` | required: `true` only once the profile has been tried on the hardware |
+| `note`, `sources` | how it was built, what the device needs (an editor setting for LEDs), the documents it comes from |
+| `auto` | load by itself when the device appears (default `true`) |
+| `controls[]` | `name` (as `id`), `source` (a Control1 MIDI source), `kind` (`fader`, `knob`, `encoder`, `button`, `pad`, `key`, `wheel`, `other`), `label` (what is printed on it), and what every binding to it gets unless it says otherwise: `encoding` (a relative encoder), `bits` (NRPN/RPN), `feedback` (the control lights or moves) |
+| `bindings[]` | `control`, `target` and any option of a mapping (`min`, `max`, `invert`, `args`, `encoding`, `takeover`, `step`, `accel`, `bits`, `feedback`, `gesture`, `role`); never a `source` |
+
+A profile is refused (and skipped, with the reason in the log) when it
+doesn't validate: an unknown key, a missing `verified`, a bad regex, two
+controls with one name, two controls a device can't tell apart (the same
+message, a channel `*` over a channel, a `cc14` pair over a plain CC, a CC
+that NRPN data entry uses), a binding to a control that isn't there, or a
+target or option that doesn't parse.
+
+### Shipped profiles
+
+All three are built from the vendors' published MIDI charts (and the same
+factory layouts in Ardour's MIDI maps), and **none is verified on hardware
+yet**; each says so (`"verified": false`). A bench pass flips it.
+
+| id | Device, mode | Controls |
+|---|---|---|
+| `korg-nanokontrol2` | Korg nanoKONTROL2, factory scene in CC mode, channel 1 | 8 faders (CC 0-7), 8 knobs (16-23), S/M/R ×8 (32-39, 48-55, 64-71), transport, track and marker buttons (41-46, 58-62) |
+| `akai-midimix` | Akai Professional MIDImix, factory preset, channel 1 | 3 × 8 knobs, 8 faders and master (CC), mute, solo (SOLO + MUTE) and rec arm ×8 and bank left/right (notes 1-26); mute and rec arm LEDs as feedback |
+| `novation-launch-control-xl` | Novation Launch Control XL (mk1, mk2), factory template 1, channel 9 | 3 × 8 knobs (CC 13-20, 29-36, 49-56), 8 faders (77-84), track focus and control ×8 (notes 41-44, 57-60, 73-76, 89-92), device/mute/solo/record arm (105-108), the four arrows (CC 104-107) |
+
+### Methods
+
+- `Profiles() → (s json)`: `{"schema": "backline.midi-profile/1", "profiles": [{id, name, vendor, model, mode,
+  match, verified, auto, system, path, controls, bindings, active, present, device}], "dirs": [user, system]}`.
+  The directories are read again on every call, so a hand-edited file shows at once. `present`: a matching port
+  is in the graph now; `device`: that port.
+- `Profile(s profile) → (s json)`: the file, plus `system`, `path`, `active`, `present`, `device`. Error `NotFound`.
+- `SaveProfile(s profile, a{sv} options) → (s path)`: options `name` (`s`), `match` (`s`, required for a new
+  profile, refused for an existing one), `auto` (`b`), `mappings` (`as`: exactly these mapping ids, with controls
+  made for sources the profile doesn't have; default: every MIDI mapping that is one of its controls). The
+  profile becomes active. Errors `InvalidArgs`, `NotFound` (a mapping id), `State` (`--no-config`).
+- `LoadProfile(s profile) → (as ids)`: activates it (again, if it was: an edited file takes effect); returns the
+  mappings made. All or none: a binding that fails leaves nothing. Errors `NotFound`, `InvalidArgs`.
+- `UnloadProfile(s profile) → ()`: removes its mappings and its links. Error `NotFound` (not active).
+- `DeleteProfile(s profile) → ()`: deletes the user's file (and unloads it). A system profile can't be deleted
+  (`State`); the user's copy of one can, and the shipped one is used again.
+
+Properties `ActiveProfiles` (`as`) and `ProfileDirs` (`as`, the user's then the system's). Signals
+`ProfileLoaded(s profile, s device, u mappings)` and `ProfileUnloaded(s profile, s reason)` (`unloaded`,
+`device-gone`, `reloaded`, `deleted`).
+
 ## MIDI input and output
 
 `backline-controld --no-graph` never connects to PipeWire: it serves Control1
@@ -196,7 +303,7 @@ input port whose `node:port | alias` matches. `""` links to nothing.
 ### `Save() → (s path)`
 
 Writes the mappings, listeners and MIDI follow made at run time (and those
-loaded from it) to `control.json` in `ConfigDir`, atomically, mode 0600 (it
+loaded from it; not the mappings of a [MIDI profile](#midi-profiles)) to `control.json` in `ConfigDir`, atomically, mode 0600 (it
 may hold a listener's secret). Error `State` when started with `--no-config`.
 
 ## Properties
@@ -206,6 +313,8 @@ may hold a listener's secret). Error `State` when started with `--no-config`.
 | `MappingCount` | `u` | Mappings |
 | `Listeners` | `as` | Open listener ids |
 | `Learning` | `s` | The target being learned, `""` when not learning |
+| `ActiveProfiles` | `as` | The [MIDI profiles](#midi-profiles) active now |
+| `ProfileDirs` | `as` | The user's profile directory, then the system's |
 | `MidiFollow` | `s` | The follow regex |
 | `MidiOut` | `s` | The MIDI output's regex |
 | `Node` | `s` | controld's PipeWire node name |
@@ -226,6 +335,8 @@ may hold a listener's secret). Error `State` when started with `--no-config`.
 |---|---|
 | `Learned(s id, s source, s target)` | A learn made its mapping |
 | `LearnCancelled(s id, s reason)` | A learn timed out (`timeout`), was cancelled, or its input could not be mapped |
+| `ProfileLoaded(s profile, s device, u mappings)` | A [MIDI profile](#midi-profiles) became active (`device` is `""` for a load by hand with no device) |
+| `ProfileUnloaded(s profile, s reason)` | It stopped being active: `unloaded`, `device-gone`, `reloaded`, `deleted` |
 
 ## Configuration
 
@@ -302,6 +413,8 @@ backline map follow REGEX
 backline map out REGEX
 backline map listen udp|tcp ADDRESS PORT [--allow CIDR]... [--secret S | --secret-file F] [--insecure-udp] [--params ROLE]
 backline map unlisten ID
+backline map profile list | show ID | load ID | unload ID | delete ID
+backline map profile save ID [--name N] [--match REGEX] [--no-auto] [--mapping MAPPING-ID]...
 ```
 
 Examples:
@@ -321,4 +434,12 @@ backline map add midi:cc:1:81 param:/console/in.1/fader --feedback --gesture aut
 backline map add midi:cc:1:1 param:/console/in.1/pan --encoding rel-2c --feedback
 backline map add midi:nrpn:1:291 param:/console/in.1/eq.lf --feedback
 backline map add midi:cc:1:7 param:/console/main/fader --takeover pickup
+# a nanoKONTROL2: learn two controls, keep them as the device's profile
+backline map profile show korg-nanokontrol2
+backline map learn param:/console/in.1/fader      # move fader 1
+backline map learn param:/console/in.1/mute       # press M 1
+backline map profile save korg-nanokontrol2       # ~/.config/backline/midi-profiles/korg-nanokontrol2.json
+# from now on, plugging it in brings both back (ActiveProfiles, ProfileLoaded)
+# a device nobody ships a profile for
+backline map profile save my-box --name "My box" --match '^Midi-Bridge:My Box'
 ```
