@@ -390,10 +390,24 @@ effect-insert component.
   `live` puts them back. Moves are written to
   `$XDG_RUNTIME_DIR/backline/soundcheck.json` first, so a crash doesn't
   strand a consumer: the next start puts the links back (§4.6).
+- **Per-channel soundcheck.** `SetInput` switches a whole device for every
+  consumer, which is too coarse for a console: one channel strip wants
+  channel 3 of a 16-channel interface on playback while the DAW recording
+  the same interface keeps hearing it live. `SetChannelInput(node, channel,
+  mode, consumer)` and the batch `SetChannelInputs` keep a mode per input
+  channel, with a default for every consumer and overrides per consumer
+  (a `node.name`). Only the links that state names move. The decisions are
+  `recorder/sc_plan.c`: pure, no PipeWire, unit-tested
+  (`tests/unit/test_sc_plan.c`); recorderd snapshots the graph, asks for a
+  plan and carries it out in one main-loop pass. A batch is checked whole
+  before anything changes. A program that switches inside its own process
+  (the console's `pb_` ports) is sample-exact; link moves are not (verify
+  when the hold lifts how many cycles a batch spreads over).
 - **Interfaces** (built). D-Bus `Recorder1` ([docs/api/Recorder1.md](docs/api/Recorder1.md)):
   `Arm`, `Record`, `Stop`, `AddMarker`, `Takes`, `GetTake`, `Soundcheck`,
-  `SetInput`, `StopSoundcheck`; signals `Level`, `Overrun`, `Marker`,
-  `TakeFinished`, `SoundcheckInput`. `backline rec arm|record|stop|...`
+  `SetInput`, `SetChannelInput`, `SetChannelInputs`, `StopSoundcheck`;
+  signals `Level`, `Overrun`, `Marker`, `TakeFinished`, `SoundcheckInput`,
+  `SoundcheckChannels`. `backline rec arm|record|stop|...`
   speaks it; `backline rec -s ...` still runs the one-shot recorder.
 - **Reuse.**
   - `pw-record` (one stream, no timestamps, so not alignable: −384 to −512

@@ -203,6 +203,20 @@ int bl_recorder_take(bl_client *c, const char *take, char **json);
 int bl_recorder_soundcheck(bl_client *c, const char *take, int loop, uint64_t start);
 /* mode: "live" or "playback" */
 int bl_recorder_set_input(bl_client *c, const char *node, const char *mode);
+/* Per channel (docs/api/Recorder1.md, SetChannelInput): channel is the input's
+ * 1-based source channel (0 = every channel); consumer a node.name, or NULL /
+ * "" for every consumer. Only that channel's links into that consumer move. */
+int bl_recorder_set_channel_input(bl_client *c, const char *node, uint32_t channel, const char *mode,
+				  const char *consumer);
+typedef struct bl_channel_input {
+	const char *node;
+	uint32_t channel;
+	const char *mode;       /* "live" or "playback" */
+	const char *consumer;   /* NULL or "" = every consumer */
+} bl_channel_input;
+/* Many switches at once: all are checked first, and either all apply, in one
+ * pass, or none does. */
+int bl_recorder_set_channel_inputs(bl_client *c, const bl_channel_input *v, size_t n);
 int bl_recorder_stop_soundcheck(bl_client *c);
 int bl_recorder_status(bl_client *c, bl_rec_status *st);
 

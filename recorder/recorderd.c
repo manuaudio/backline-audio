@@ -36,6 +36,7 @@
 
 #include "bl_graph.h"
 #include "rec_engine.h"
+#include "sc_plan.h"
 #include "soundcheck.h"
 
 #define BUS_NAME "io.github.manuaudio.Backline.Recorder"
@@ -46,15 +47,6 @@
 #define ERR_STATE "io.github.manuaudio.Backline.Error.State"
 #define ERR_TIMEOUT "io.github.manuaudio.Backline.Error.Timeout"
 #define MAX_MOVES 512
-
-struct move {
-	char input[256];        /* the take's input node */
-	char out_port[128];     /* its port name */
-	char in_node[256];      /* consumer node and port */
-	char in_port[128];
-	int track, channel;     /* soundcheck port t<track>_<channel> (1-based) */
-	bool active;
-};
 
 static struct {
 	struct pw_main_loop *loop;
@@ -77,8 +69,8 @@ static struct {
 
 	struct sc_player *sc;
 	struct sc_take sc_take;
-	char sc_mode[SC_MAX_TRACKS][16];   /* per track: live / playback */
-	struct move moves[MAX_MOVES];
+	struct scp_state scs;              /* per input channel and consumer: live / playback */
+	struct scp_move moves[MAX_MOVES];
 	int n_moves;
 	char moves_file[600];
 
@@ -551,12 +543,8 @@ static int m_get_take(sd_bus_message *m, void *ud, sd_bus_error *err)
 }
 
 /* -------------------------------------------------------------- soundcheck */
-static bool is_ours(uint32_t node_id)
-{
-	const struct bl_node *n = bl_graph_node(D.graph, node_id);
-	return n && !strncmp(n->name, "backline.", 9);
-}
-
+/* The decisions are recorder/sc_plan.c (pure, unit-tested); this part reads
+ * the graph into a snapshot and carries the plan out. */
 static int track_of_input(const char *node)
 {
 	for (int k = 0; k < D.sc_take.n_tracks; k++)
@@ -566,21 +554,21 @@ static int track_of_input(const char *node)
 }
 
 /* The input's source ports in graph order: the order the recorder used. */
-struct srcports { uint32_t node; bool monitor; int n; uint32_t ids[64]; uint32_t idx[64]; char names[64][128]; };
+struct srcports { uint32_t node; bool monitor; int n; uint32_t ids[SCP_MAX_PORTS]; uint32_t idx[SCP_MAX_PORTS]; char names[SCP_MAX_PORTS][SCP_PORT]; };
 static int collect_src(void *data, const struct bl_port *p)
 {
 	struct srcports *s = data;
-	if (p->node_id == s->node && p->output && !p->midi && p->monitor == s->monitor && s->n < 64) {
+	if (p->node_id == s->node && p->output && !p->midi && p->monitor == s->monitor && s->n < SCP_MAX_PORTS) {
 		int k = s->n++;   /* in port order, as the recorder takes them */
 		while (k > 0 && s->idx[k - 1] > p->index) {
 			s->ids[k] = s->ids[k - 1];
 			s->idx[k] = s->idx[k - 1];
-			memcpy(s->names[k], s->names[k - 1], 128);
+			memcpy(s->names[k], s->names[k - 1], SCP_PORT);
 			k--;
 		}
 		s->ids[k] = p->id;
 		s->idx[k] = p->index;
-		snprintf(s->names[k], 128, "%s", p->name);
+		snprintf(s->names[k], SCP_PORT, "%s", p->name);
 	}
 	return 0;
 }
@@ -625,8 +613,8 @@ static uint32_t port_by_name(const char *node, const char *port, bool output)
 static uint32_t sc_port(int track, int channel)
 {
 	char name[32];
-	snprintf(name, sizeof(name), "t%d_%d", track, channel);
-	return port_by_name("backline.soundcheck", name, true);
+	scp_port_name(track, channel, name, sizeof(name));
+	return port_by_name(SC_NODE_NAME, name, true);
 }
 
 static void save_moves(void)
@@ -635,12 +623,13 @@ static void save_moves(void)
 		return;
 	json_object *arr = json_object_new_array();
 	for (int i = 0; i < D.n_moves; i++) {
-		struct move *mv = &D.moves[i];
+		struct scp_move *mv = &D.moves[i];
 		json_object *o = json_object_new_object();
 		json_object_object_add(o, "input", json_object_new_string(mv->input));
 		json_object_object_add(o, "out_port", json_object_new_string(mv->out_port));
 		json_object_object_add(o, "in_node", json_object_new_string(mv->in_node));
 		json_object_object_add(o, "in_port", json_object_new_string(mv->in_port));
+		json_object_object_add(o, "channel", json_object_new_int(mv->channel));
 		json_object_array_add(arr, o);
 	}
 	json_object *root = json_object_new_object();
@@ -656,103 +645,139 @@ static void save_moves(void)
 	json_object_put(root);
 }
 
-struct move_ctx { struct srcports *sp; int track; const char *input; int moved; };
-
-/* Move every foreign consumer link of one input onto the soundcheck ports. */
-static int move_link_cb(void *data, const struct bl_link *l)
+/* Undo one move (persistent: the link was someone else's) and drop its record. */
+static void restore_move(int i)
 {
-	struct move_ctx *c = data;
-	int ch = -1;
-	for (int i = 0; i < c->sp->n; i++)
-		if (c->sp->ids[i] == l->out_port)
-			ch = i;
-	if (ch < 0 || is_ours(l->in_node))
-		return 0;
-	const struct bl_port *in = bl_graph_port(D.graph, l->in_port);
-	const struct bl_node *in_node = bl_graph_node(D.graph, l->in_node);
-	if (!in || !in_node)
-		return 0;
-	int channels = D.sc_take.tracks[c->track].channels;
-	int sc_ch = SPA_MIN(ch, channels - 1) + 1;
-	uint32_t scp = sc_port(c->track + 1, sc_ch);
-	if (scp == SPA_ID_INVALID)
-		return 0;
-	/* remember it before touching anything */
-	struct move *mv = NULL;
-	for (int i = 0; i < D.n_moves; i++)
-		if (spa_streq(D.moves[i].input, c->input) && spa_streq(D.moves[i].out_port, c->sp->names[ch]) &&
-		    spa_streq(D.moves[i].in_node, in_node->name) && spa_streq(D.moves[i].in_port, in->name))
-			mv = &D.moves[i];
-	if (!mv) {
-		if (D.n_moves == MAX_MOVES)
-			return 0;
-		mv = &D.moves[D.n_moves++];
-		snprintf(mv->input, sizeof(mv->input), "%s", c->input);
-		snprintf(mv->out_port, sizeof(mv->out_port), "%s", c->sp->names[ch]);
-		snprintf(mv->in_node, sizeof(mv->in_node), "%s", in_node->name);
-		snprintf(mv->in_port, sizeof(mv->in_port), "%s", in->name);
-		mv->track = c->track + 1;
-		mv->channel = sc_ch;
-		save_moves();
-	}
-	mv->active = true;
-	bl_graph_link(D.graph, scp, l->in_port);
-	bl_graph_destroy_global(D.graph, l->id);
-	c->moved++;
-	return 0;
+	struct scp_move *mv = &D.moves[i];
+	uint32_t out = port_by_name(mv->input, mv->out_port, true);
+	uint32_t in = port_by_name(mv->in_node, mv->in_port, false);
+	uint32_t scp = mv->track > 0 ? sc_port(mv->track, mv->sc_channel) : SPA_ID_INVALID;
+	if (scp != SPA_ID_INVALID && in != SPA_ID_INVALID)
+		bl_graph_unlink(D.graph, scp, in);
+	if (out != SPA_ID_INVALID && in != SPA_ID_INVALID && !bl_graph_is_linked(D.graph, out, in))
+		bl_graph_link_persistent(D.graph, out, in);
+	D.moves[i] = D.moves[--D.n_moves];
 }
 
-static int enforce_input(int track)
+static void restore_all(void)
 {
-	struct srcports sp;
-	const char *input = D.sc_take.tracks[track].node;
-	if (!input_ports(input, &sp))
-		return 0;
-	struct move_ctx c = { &sp, track, input, 0 };
-	bl_graph_for_each_link(D.graph, move_link_cb, &c);
-	/* our soundcheck links for moves whose consumer is (back) in the graph */
-	for (int i = 0; i < D.n_moves; i++) {
-		struct move *mv = &D.moves[i];
-		if (!spa_streq(mv->input, input))
-			continue;
-		uint32_t in = port_by_name(mv->in_node, mv->in_port, false), scp = sc_port(mv->track, mv->channel);
-		if (in != SPA_ID_INVALID && scp != SPA_ID_INVALID)
-			bl_graph_link(D.graph, scp, in);
-	}
-	return c.moved;
-}
-
-/* Put an input's moved links back (persistent: they were someone else's). */
-static void restore_input(const char *input)
-{
-	for (int i = 0; i < D.n_moves;) {
-		struct move *mv = &D.moves[i];
-		if (input && !spa_streq(mv->input, input)) {
-			i++;
-			continue;
-		}
-		uint32_t out = port_by_name(mv->input, mv->out_port, true);
-		uint32_t in = port_by_name(mv->in_node, mv->in_port, false);
-		uint32_t scp = mv->track ? sc_port(mv->track, mv->channel) : SPA_ID_INVALID;
-		if (scp != SPA_ID_INVALID && in != SPA_ID_INVALID)
-			bl_graph_unlink(D.graph, scp, in);
-		if (out != SPA_ID_INVALID && in != SPA_ID_INVALID && !bl_graph_is_linked(D.graph, out, in))
-			bl_graph_link_persistent(D.graph, out, in);
-		D.moves[i] = D.moves[--D.n_moves];
-	}
+	while (D.n_moves > 0)
+		restore_move(D.n_moves - 1);
 	save_moves();
 }
 
-static void reconcile(void)
+/* The graph as the plan sees it: every link out of an input's source ports. */
+struct snap_ctx {
+	struct srcports sp[SCP_MAX_TRACKS];
+	bool present[SCP_MAX_TRACKS];
+	struct scp_link *links;
+	int n, cap;
+};
+
+static int snap_link_cb(void *data, const struct bl_link *l)
 {
-	if (!D.sc)
-		return;
-	for (int k = 0; k < D.sc_take.n_tracks; k++)
-		if (spa_streq(D.sc_mode[k], "playback"))
-			enforce_input(k);
+	struct snap_ctx *c = data;
+	for (int i = 0; i < D.scs.n_inputs; i++) {
+		if (!c->present[i] || l->out_node != c->sp[i].node)
+			continue;
+		for (int ch = 0; ch < c->sp[i].n; ch++) {
+			if (c->sp[i].ids[ch] != l->out_port)
+				continue;
+			const struct bl_port *in = bl_graph_port(D.graph, l->in_port);
+			const struct bl_node *in_node = bl_graph_node(D.graph, l->in_node);
+			if (!in || !in_node)
+				return 0;
+			if (c->n == c->cap) {
+				int cap = c->cap ? c->cap * 2 : 64;
+				struct scp_link *g = realloc(c->links, (size_t)cap * sizeof(*g));
+				if (!g)
+					return 0;
+				c->links = g;
+				c->cap = cap;
+			}
+			c->links[c->n++] = (struct scp_link){ l->id, i, ch + 1, c->sp[i].names[ch], in_node->name, in->name };
+			return 0;
+		}
+	}
+	return 0;
 }
 
-static void on_reconcile(void *data, uint64_t count) { reconcile(); }
+/* Every input's source ports as the graph has them now (port counts for the
+ * channel checks, and the ids for the snapshot). */
+static void read_inputs(struct snap_ctx *c)
+{
+	for (int i = 0; i < D.scs.n_inputs; i++) {
+		c->present[i] = input_ports(D.scs.inputs[i].node, &c->sp[i]);
+		if (c->present[i] && c->sp[i].n > 0)
+			D.scs.inputs[i].ports = c->sp[i].n;
+	}
+}
+
+/* Make the graph match the state: every link the state says carries the
+ * take is moved to the soundcheck ports, every move it no longer wants goes
+ * back. All of it in this one main-loop pass. */
+static int sync_graph(void)
+{
+	if (!D.sc)
+		return 0;
+	struct snap_ctx *c = calloc(1, sizeof(*c));
+	if (!c)
+		return -ENOMEM;
+	read_inputs(c);
+	bl_graph_for_each_link(D.graph, snap_link_cb, c);
+	int max = c->n + D.n_moves + 1;
+	struct scp_action *acts = calloc((size_t)max, sizeof(*acts));
+	int na = acts ? scp_plan(&D.scs, c->links, c->n, D.moves, D.n_moves, acts, max) : -ENOMEM;
+	if (na < 0) {
+		free(acts);
+		free(c->links);
+		free(c);
+		return na;
+	}
+	/* records first, on disk before the graph changes */
+	bool added = false;
+	for (int a = 0; a < na; a++)
+		if (acts[a].kind == SCP_MOVE && acts[a].add_record && D.n_moves < MAX_MOVES) {
+			D.moves[D.n_moves++] = acts[a].rec;
+			added = true;
+		} else if (acts[a].kind == SCP_MOVE && acts[a].add_record) {
+			acts[a].link_id = SPA_ID_INVALID;   /* no room to remember it: leave it live */
+		}
+	if (added)
+		save_moves();
+	int moved = 0, restored = 0;
+	for (int a = 0; a < na; a++) {
+		const struct scp_action *x = &acts[a];
+		if (x->kind == SCP_MOVE && x->link_id != SPA_ID_INVALID) {
+			uint32_t scp = sc_port(x->rec.track, x->rec.sc_channel);
+			uint32_t in = port_by_name(x->rec.in_node, x->rec.in_port, false);
+			if (scp == SPA_ID_INVALID || in == SPA_ID_INVALID)
+				continue;
+			bl_graph_link(D.graph, scp, in);
+			bl_graph_destroy_global(D.graph, x->link_id);
+			moved++;
+		} else if (x->kind == SCP_KEEP) {
+			const struct scp_move *mv = &D.moves[x->move];
+			uint32_t scp = sc_port(mv->track, mv->sc_channel), in = port_by_name(mv->in_node, mv->in_port, false);
+			if (scp != SPA_ID_INVALID && in != SPA_ID_INVALID)
+				bl_graph_link(D.graph, scp, in);
+		}
+	}
+	/* restores last, highest record first, so the indexes stay valid */
+	for (int a = na - 1; a >= 0; a--)
+		if (acts[a].kind == SCP_RESTORE) {
+			restore_move(acts[a].move);
+			restored++;
+		}
+	if (restored)
+		save_moves();
+	free(acts);
+	free(c->links);
+	free(c);
+	return moved + restored;
+}
+
+static void on_reconcile(void *data, uint64_t count) { sync_graph(); }
 
 static void on_link_added(void *data, const struct bl_link *l)
 {
@@ -775,14 +800,14 @@ static void stop_soundcheck(void)
 {
 	if (!D.sc && !D.n_moves)
 		return;
-	restore_input(NULL);
+	restore_all();
 	if (D.sc) {
 		sc_player_destroy(D.sc);
 		D.sc = NULL;
 	}
 	memset(&D.sc_take, 0, sizeof(D.sc_take));
-	memset(D.sc_mode, 0, sizeof(D.sc_mode));
-	props_changed("Soundcheck", "SoundcheckInputs", NULL);
+	memset(&D.scs, 0, sizeof(D.scs));
+	props_changed("Soundcheck", "SoundcheckInputs", "SoundcheckChannels", NULL);
 	arm_idle();
 }
 
@@ -822,11 +847,79 @@ static int m_soundcheck(sd_bus_message *m, void *ud, sd_bus_error *err)
 	if (!D.sc)
 		return sd_bus_error_set(err, SD_BUS_ERROR_FAILED, e);
 	D.sc_take = t;
-	for (int k = 0; k < t.n_tracks; k++)
-		snprintf(D.sc_mode[k], sizeof(D.sc_mode[k]), "live");
+	const char *nodes[SC_MAX_TRACKS];
+	int chans[SC_MAX_TRACKS];
+	for (int k = 0; k < t.n_tracks; k++) {
+		nodes[k] = D.sc_take.tracks[k].node;
+		chans[k] = D.sc_take.tracks[k].channels;
+	}
+	scp_init(&D.scs, t.n_tracks, nodes, chans);
 	arm_idle();
-	props_changed("Soundcheck", "SoundcheckInputs", NULL);
+	props_changed("Soundcheck", "SoundcheckInputs", "SoundcheckChannels", NULL);
 	return sd_bus_reply_method_return(m, "");
+}
+
+#define MAX_SWITCHES 1024
+
+/* Validate and apply a set of switches at once (all or none), carry them
+ * out in one pass, then tell everyone. */
+static int switch_inputs(sd_bus_message *m, sd_bus_error *err, struct scp_request *reqs, int n)
+{
+	if (!D.sc)
+		return sd_bus_error_set(err, ERR_STATE, "no soundcheck loaded");
+	for (int i = 0; i < n; i++)
+		if (track_of_input(reqs[i].node) < 0)
+			return sd_bus_error_setf(err, ERR_NOTFOUND, "\"%s\" is not an input of take %s%s", reqs[i].node,
+						 D.sc_take.take, n > 1 ? " (nothing was switched)" : "");
+	/* the channel checks use the port counts the graph has now */
+	struct snap_ctx *c = calloc(1, sizeof(*c));
+	if (!c)
+		return -ENOMEM;
+	read_inputs(c);
+	free(c);
+	const char *before[SCP_MAX_TRACKS];
+	for (int i = 0; i < D.scs.n_inputs; i++)
+		before[i] = scp_input_mode(&D.scs, i);
+	char e[300];
+	int r = scp_apply(&D.scs, reqs, n, e, sizeof(e));
+	if (r < 0) {
+		if (n > 1)
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "switch %d: %s (nothing was switched)", -r - 1, e);
+		return sd_bus_error_set(err, SD_BUS_ERROR_INVALID_ARGS, e);
+	}
+	sync_graph();
+	for (int i = 0; i < D.scs.n_inputs; i++) {
+		const char *now = scp_input_mode(&D.scs, i);
+		bool named = false;   /* as before: every switched input is announced, changed or not */
+		for (int q = 0; q < n && !named; q++)
+			named = spa_streq(reqs[q].node, D.scs.inputs[i].node);
+		if (named || strcmp(now, before[i]))
+			sd_bus_emit_signal(D.bus, OBJ_PATH, IFACE, "SoundcheckInput", "ss", D.scs.inputs[i].node, now);
+	}
+	sd_bus_message *sig = NULL;
+	if (sd_bus_message_new_signal(D.bus, &sig, OBJ_PATH, IFACE, "SoundcheckChannels") >= 0) {
+		int q = sd_bus_message_open_container(sig, 'a', "(suss)");
+		for (int i = 0; q >= 0 && i < n; i++)
+			q = sd_bus_message_append(sig, "(suss)", reqs[i].node, reqs[i].channel,
+						  reqs[i].playback ? "playback" : "live", reqs[i].consumer ? reqs[i].consumer : "");
+		if (q >= 0 && sd_bus_message_close_container(sig) >= 0)
+			sd_bus_send(D.bus, sig, NULL);
+		sd_bus_message_unref(sig);
+	}
+	props_changed("SoundcheckInputs", "SoundcheckChannels", NULL);
+	arm_idle();
+	return sd_bus_reply_method_return(m, "");
+}
+
+static int parse_mode(const char *mode, bool *playback)
+{
+	if (spa_streq(mode, "live"))
+		*playback = false;
+	else if (spa_streq(mode, "playback"))
+		*playback = true;
+	else
+		return -EINVAL;
+	return 0;
 }
 
 static int m_set_input(sd_bus_message *m, void *ud, sd_bus_error *err)
@@ -835,27 +928,48 @@ static int m_set_input(sd_bus_message *m, void *ud, sd_bus_error *err)
 	int r = sd_bus_message_read(m, "ss", &node, &mode);
 	if (r < 0)
 		return r;
-	if (!D.sc)
-		return sd_bus_error_set(err, ERR_STATE, "no soundcheck loaded");
-	int k = track_of_input(node);
-	if (k < 0)
-		return sd_bus_error_setf(err, ERR_NOTFOUND, "\"%s\" is not an input of take %s", node, D.sc_take.take);
-	if (!spa_streq(mode, "live") && !spa_streq(mode, "playback"))
+	struct scp_request q = { node, 0, "", false };
+	if (D.sc && track_of_input(node) >= 0 && parse_mode(mode, &q.playback) < 0)
 		return sd_bus_error_set(err, SD_BUS_ERROR_INVALID_ARGS, "mode is live or playback");
-	/* several tracks may come from the same input node: switch them all */
-	for (int i = 0; i < D.sc_take.n_tracks; i++) {
-		if (!spa_streq(D.sc_take.tracks[i].node, node))
-			continue;
-		snprintf(D.sc_mode[i], sizeof(D.sc_mode[i]), "%s", mode);
-		if (spa_streq(mode, "playback"))
-			enforce_input(i);
+	return switch_inputs(m, err, &q, 1);
+}
+
+static int m_set_channel_input(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	const char *node, *mode, *consumer;
+	uint32_t channel;
+	int r = sd_bus_message_read(m, "suss", &node, &channel, &mode, &consumer);
+	if (r < 0)
+		return r;
+	struct scp_request q = { node, channel, consumer, false };
+	if (parse_mode(mode, &q.playback) < 0)
+		return sd_bus_error_set(err, SD_BUS_ERROR_INVALID_ARGS, "mode is live or playback");
+	return switch_inputs(m, err, &q, 1);
+}
+
+static int m_set_channel_inputs(sd_bus_message *m, void *ud, sd_bus_error *err)
+{
+	static struct scp_request reqs[MAX_SWITCHES];
+	int n = 0, r;
+	if ((r = sd_bus_message_enter_container(m, 'a', "(suss)")) < 0)
+		return r;
+	const char *node, *mode, *consumer;
+	uint32_t channel;
+	while ((r = sd_bus_message_read(m, "(suss)", &node, &channel, &mode, &consumer)) > 0) {
+		if (n == MAX_SWITCHES)
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS, "at most %d switches at once", MAX_SWITCHES);
+		reqs[n] = (struct scp_request){ node, channel, consumer, false };
+		if (parse_mode(mode, &reqs[n].playback) < 0)
+			return sd_bus_error_setf(err, SD_BUS_ERROR_INVALID_ARGS,
+						 "switch %d: mode is live or playback (nothing was switched)", n);
+		n++;
 	}
-	if (spa_streq(mode, "live"))
-		restore_input(node);
-	sd_bus_emit_signal(D.bus, OBJ_PATH, IFACE, "SoundcheckInput", "ss", node, mode);
-	props_changed("SoundcheckInputs", NULL);
-	arm_idle();
-	return sd_bus_reply_method_return(m, "");
+	if (r < 0)
+		return r;
+	sd_bus_message_exit_container(m);
+	if (n == 0)
+		return sd_bus_reply_method_return(m, "");
+	return switch_inputs(m, err, reqs, n);
 }
 
 static int m_stop_soundcheck(sd_bus_message *m, void *ud, sd_bus_error *err)
@@ -873,7 +987,7 @@ static void restore_from_file(void)
 	if (json_object_object_get_ex(j, "moves", &arr))
 		for (size_t i = 0; i < json_object_array_length(arr) && D.n_moves < MAX_MOVES; i++) {
 			json_object *o = json_object_array_get_idx(arr, i), *v;
-			struct move *mv = &D.moves[D.n_moves++];
+			struct scp_move *mv = &D.moves[D.n_moves++];
 			memset(mv, 0, sizeof(*mv));
 			if (json_object_object_get_ex(o, "input", &v)) snprintf(mv->input, sizeof(mv->input), "%s", json_object_get_string(v));
 			if (json_object_object_get_ex(o, "out_port", &v)) snprintf(mv->out_port, sizeof(mv->out_port), "%s", json_object_get_string(v));
@@ -882,7 +996,7 @@ static void restore_from_file(void)
 		}
 	json_object_put(j);
 	fprintf(stderr, "backline-recorderd: putting back %d soundcheck link(s) left by a previous run\n", D.n_moves);
-	restore_input(NULL);
+	restore_all();
 }
 
 /* -------------------------------------------------------------- properties */
@@ -925,14 +1039,25 @@ static int p_latency(sd_bus *bus, const char *path, const char *iface, const cha
 static int p_inputs(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply, void *ud, sd_bus_error *err)
 {
 	int r = sd_bus_message_open_container(reply, 'a', "{ss}");
-	for (int k = 0; r >= 0 && D.sc && k < D.sc_take.n_tracks; k++) {
-		bool dup = false;
-		for (int j = 0; j < k; j++)
-			dup |= spa_streq(D.sc_take.tracks[j].node, D.sc_take.tracks[k].node);
-		if (!dup)
-			r = sd_bus_message_append(reply, "{ss}", D.sc_take.tracks[k].node, D.sc_mode[k]);
-	}
+	for (int i = 0; r >= 0 && D.sc && i < D.scs.n_inputs; i++)
+		r = sd_bus_message_append(reply, "{ss}", D.scs.inputs[i].node, scp_input_mode(&D.scs, i));
 	return r < 0 ? r : sd_bus_message_close_container(reply);
+}
+
+struct rows_ctx { sd_bus_message *reply; int r; };
+static void add_row(void *data, const char *node, int channel, const char *consumer, bool playback)
+{
+	struct rows_ctx *c = data;
+	if (c->r >= 0)
+		c->r = sd_bus_message_append(c->reply, "(suss)", node, (uint32_t)channel, playback ? "playback" : "live", consumer);
+}
+
+static int p_channels(sd_bus *bus, const char *path, const char *iface, const char *prop, sd_bus_message *reply, void *ud, sd_bus_error *err)
+{
+	struct rows_ctx c = { reply, sd_bus_message_open_container(reply, 'a', "(suss)") };
+	if (c.r >= 0 && D.sc)
+		scp_for_each_row(&D.scs, add_row, &c);
+	return c.r < 0 ? c.r : sd_bus_message_close_container(reply);
 }
 
 static const sd_bus_vtable vtable[] = {
@@ -945,6 +1070,8 @@ static const sd_bus_vtable vtable[] = {
 	SD_BUS_METHOD_WITH_ARGS("GetTake", SD_BUS_ARGS("s", take), SD_BUS_RESULT("s", json), m_get_take, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("Soundcheck", SD_BUS_ARGS("s", take, "a{sv}", options), SD_BUS_NO_RESULT, m_soundcheck, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("SetInput", SD_BUS_ARGS("s", node, "s", mode), SD_BUS_NO_RESULT, m_set_input, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("SetChannelInput", SD_BUS_ARGS("s", node, "u", channel, "s", mode, "s", consumer), SD_BUS_NO_RESULT, m_set_channel_input, SD_BUS_VTABLE_UNPRIVILEGED),
+	SD_BUS_METHOD_WITH_ARGS("SetChannelInputs", SD_BUS_ARGS("a(suss)", switches), SD_BUS_NO_RESULT, m_set_channel_inputs, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_METHOD_WITH_ARGS("StopSoundcheck", SD_BUS_NO_ARGS, SD_BUS_NO_RESULT, m_stop_soundcheck, SD_BUS_VTABLE_UNPRIVILEGED),
 	SD_BUS_PROPERTY("State", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("Take", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
@@ -957,12 +1084,14 @@ static const sd_bus_vtable vtable[] = {
 	SD_BUS_PROPERTY("LastTake", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("Soundcheck", "s", p_str, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("SoundcheckInputs", "a{ss}", p_inputs, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+	SD_BUS_PROPERTY("SoundcheckChannels", "a(suss)", p_channels, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
 	SD_BUS_PROPERTY("SoundcheckPosition", "t", p_num, 0, 0),
 	SD_BUS_SIGNAL_WITH_ARGS("Level", SD_BUS_ARGS("t", frames, "ad", peaks), 0),
 	SD_BUS_SIGNAL_WITH_ARGS("Overrun", SD_BUS_ARGS("t", frames), 0),
 	SD_BUS_SIGNAL_WITH_ARGS("Marker", SD_BUS_ARGS("s", take, "s", name, "t", frame), 0),
 	SD_BUS_SIGNAL_WITH_ARGS("TakeFinished", SD_BUS_ARGS("s", take, "s", sidecar, "t", frames, "t", overruns), 0),
 	SD_BUS_SIGNAL_WITH_ARGS("SoundcheckInput", SD_BUS_ARGS("s", node, "s", mode), 0),
+	SD_BUS_SIGNAL_WITH_ARGS("SoundcheckChannels", SD_BUS_ARGS("a(suss)", switches), 0),
 	SD_BUS_VTABLE_END
 };
 

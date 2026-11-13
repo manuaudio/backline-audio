@@ -163,6 +163,34 @@ int bl_recorder_set_input(bl_client *c, const char *node, const char *mode)
 	return call(c, true, "SetInput", 0, NULL, "ss", node, mode);
 }
 
+int bl_recorder_set_channel_input(bl_client *c, const char *node, uint32_t channel, const char *mode,
+				  const char *consumer)
+{
+	return call(c, true, "SetChannelInput", 0, NULL, "suss", node, channel, mode, consumer ? consumer : "");
+}
+
+int bl_recorder_set_channel_inputs(bl_client *c, const bl_channel_input *v, size_t n)
+{
+	sd_bus_message *m = NULL, *rp = NULL;
+	sd_bus_error e = SD_BUS_ERROR_NULL;
+	int r = sd_bus_message_new_method_call(bl__bus(c), &m, REC_NAME, REC_PATH, REC_IFACE, "SetChannelInputs");
+	if (r >= 0)
+		r = sd_bus_message_open_container(m, 'a', "(suss)");
+	for (size_t i = 0; r >= 0 && i < n; i++)
+		r = sd_bus_message_append(m, "(suss)", v[i].node, v[i].channel, v[i].mode, v[i].consumer ? v[i].consumer : "");
+	if (r >= 0)
+		r = sd_bus_message_close_container(m);
+	if (r >= 0)
+		r = sd_bus_call(bl__bus(c), m, 0, &e, &rp);
+	sd_bus_message_unref(m);
+	sd_bus_message_unref(rp);
+	if (r < 0) {
+		r = bl__fail_bus(c, r, &e, "Recorder SetChannelInputs");
+		sd_bus_error_free(&e);
+	}
+	return r;
+}
+
 int bl_recorder_stop_soundcheck(bl_client *c)
 {
 	return call(c, true, "StopSoundcheck", 0, NULL, "");

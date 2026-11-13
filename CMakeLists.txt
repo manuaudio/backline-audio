@@ -135,8 +135,11 @@ target_link_libraries(bl_rec_engine PUBLIC bl_graph bl_rec_align PkgConfig::PIPE
 add_executable(backline-recorder recorder/recorder.c)
 target_link_libraries(backline-recorder PRIVATE bl_rec_engine)
 # The recorder as a D-Bus service (Recorder1), with virtual soundcheck.
+# Which links virtual soundcheck moves, per channel and consumer: pure, no PipeWire.
+add_library(bl_sc_plan STATIC recorder/sc_plan.c)
+target_include_directories(bl_sc_plan PUBLIC recorder)
 add_executable(backline-recorderd recorder/recorderd.c recorder/soundcheck.c)
-target_link_libraries(backline-recorderd PRIVATE bl_rec_engine PkgConfig::SYSTEMD PkgConfig::JSONC)
+target_link_libraries(backline-recorderd PRIVATE bl_rec_engine bl_sc_plan PkgConfig::SYSTEMD PkgConfig::JSONC)
 
 # Test tool: a virtual MIDI keyboard on the ALSA sequencer (what a USB
 # keyboard looks like to PipeWire's MIDI bridge).
@@ -182,6 +185,9 @@ if(BUILD_TESTING)
   add_executable(test_rec_cues tests/unit/test_rec_cues.c)
   target_link_libraries(test_rec_cues PRIVATE bl_rec_engine)
   add_test(NAME rec_cues COMMAND test_rec_cues)
+  add_executable(test_sc_plan tests/unit/test_sc_plan.c)
+  target_link_libraries(test_sc_plan PRIVATE bl_sc_plan)
+  add_test(NAME soundcheck_channel_plan COMMAND test_sc_plan)
   add_executable(test_midi_follow tests/unit/test_midi_follow.c)
   add_test(NAME midi_follow COMMAND test_midi_follow)
   # LD_PRELOAD shim for the slow-disk proof (tests/recorderd-proof).

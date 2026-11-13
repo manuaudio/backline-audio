@@ -55,7 +55,7 @@ static void usage(FILE *f)
 	      "\n"
 	      "  rec arm NODE[:CH]... [opts]  arm the recorder daemon; rec record|stop|marker [NAME]|status\n"
 	      "  rec takes|take TAKE    list takes, show one take's sidecar\n"
-	      "  rec soundcheck TAKE [--once]|stop; rec input NODE live|playback   virtual soundcheck\n"
+	      "  rec soundcheck TAKE [--once]|stop; rec input NODE live|playback [--channel N,..] [--for NODE]   virtual soundcheck\n"
 	      "  rec -s NODE ... ARGS   run the one-shot recorder (see backline rec -h)\n"
 	      "  transport play|stop|locate POS|tempo BPM|meter N D|link on|off|status\n"
 	      "  transport ltc|mtc off|generate|chase [--fps F] [--target NODE] [--source NODE]\n"
