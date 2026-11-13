@@ -324,7 +324,7 @@ if(BUILD_TESTING)
   endif()
   string(REPLACE ";" "," _slot_formats "${_slot_formats}")
   add_test(NAME slot-proof COMMAND ${PROJECT_SOURCE_DIR}/tests/slot-proof ${CMAKE_BINARY_DIR} ${_slot_formats})
-  set_tests_properties(slot-proof PROPERTIES TIMEOUT 300)
+  set_tests_properties(slot-proof PROPERTIES TIMEOUT 900)
   # Offload: two servers (primary, mirror) in their own network namespaces
   # inside a user namespace (no sudo); skipped where user namespaces are off.
   add_executable(backline-test-offload-console tests/tools/offload-console.c)

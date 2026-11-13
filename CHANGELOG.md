@@ -7,9 +7,60 @@ evidence for every item is in [docs/proofs/](docs/proofs/).
 ## Unreleased
 
 Fixes from the first real install (Omarchy 4.0.4, PipeWire 1.6.8,
-WirePlumber 0.5.17).
+WirePlumber 0.5.17), and the engine-facing pieces a console needs. Every
+item below was proved offline. The ones that need live audio say so.
 
 ### Added
+
+- **Slot mode** ([Slot1](docs/api/Slot1.md)): a mixing engine's insert chain
+  runs in one `backline-slot-host` process per strip, inside the engine's own
+  cycle, over a sealed memfd and a pair of futexes. It adds nothing beyond
+  what the plugins report.
+  - A chain that misses the deadline plays the dry signal, delayed by its
+    reported latency, until it catches up or a restarted sandbox takes over.
+  - It hosts CLAP, VST3 and LV2 in any mix, with same-cycle parameter
+    events, bypass, latency reports and state.
+  - `Host1.LoadSlot` supervises chains like workers.
+  - The contract is a header-only C file, `backline/slot1.h`.
+  - Proved offline (`tests/slot-proof`): +0-frame alignment; sample-exact
+    delayed dry on a miss; a crash stays in its own chain; no allocations on
+    either audio thread; round trip p99 155–180 µs at 64 frames.
+  - The run inside a real PipeWire cycle waits for the hold to lift.
+- **Network DSP offload server**, `backline-offloadd` ([Offload1](docs/api/Offload1.md)):
+  - It hosts slots through Slot1 and processes each block in lockstep with
+    the console: it has no clock and adds no buffer.
+  - It restarts a crashed chain with its state.
+  - The console's data plane is `backline/offload1.h`, with a mirror server
+    that takes over with no gap.
+  - Proved on one box, with no sudo, in its own network stacks
+    (`offload/tests/failover-proof`).
+- **Params1 for big trees**: `SetMany` (all or nothing), `GetMatching`, and
+  a whole-tree `Update`.
+  - A `set-many` feature batches the requests to the program, `Changed` is
+    merged per burst, and subscriptions are indexed (up to 256).
+  - `backline-controld --no-graph` serves Params1 and OSC without PipeWire.
+  - Offline load test (`params_load`): 5,000 parameters and 8 OSC clients ×
+    2,000. Registering takes 16 ms, the echo p99 is 21 ms, and a 5,000-value
+    `SetMany` reaches every subscriber within about 70 ms.
+- **MIDI learn profiles** (`backline.midi-profile/1`):
+  - A profile holds a device's controls under abstract names, plus what you
+    learned for them. It loads automatically when the device appears.
+  - New Control1 calls `Profiles`, `SaveProfile`, `LoadProfile`,
+    `UnloadProfile` and `DeleteProfile`, and the CLI command
+    `backline map profile`.
+  - Ships profiles for the Korg nanoKONTROL2 (CC mode), Akai MIDImix and
+    Novation Launch Control XL (factory template 1). They are built from the
+    published charts, are marked `"verified": false`, and are not yet tried
+    on hardware.
+  - The live device run waits for the hold to lift.
+- **Per-channel virtual soundcheck** in the recorder:
+  - `SetChannelInput` and `SetChannelInputs` switch one channel of a device,
+    for one consumer or for all, without touching its other channels or
+    other consumers. A batch is all or nothing.
+  - New `SoundcheckChannels` property and signal, and the CLI option
+    `backline rec input --channel N,.. --for NODE`.
+  - The link decisions are a pure, unit-tested plan (`recorder/sc_plan.c`).
+  - The live link moves wait for the hold to lift.
 
 - **Audio Setup**, a fifth Omarchy panel, and three commands moved in from
   the `manuaudio/omarchy-audio` Omarchy branches, so Omarchy itself only gets
@@ -26,6 +77,14 @@ WirePlumber 0.5.17).
     runs a Backline command.
 
 ### Fixed
+
+- **Every `omarchy/lib` helper is installed**, so `omarchy-backline-src`
+  works from a package; the install-layout test checks it.
+- **controld over TCP**: replies are queued and never cut mid-frame. A
+  client that leaves 4 MiB unread is closed.
+- **Packaging**: the AUR draft (not submitted) follows main. avahi is now a
+  dependency and python is optional. `container-check` verifies the version
+  against `project()`, and `--local` works.
 
 - **One version everywhere**: `bl_version()`, `backline version` and Host1's
   `Version` reported 0.3.0, 0.3.0 and 0.2.0 for the 0.4.0 release. All of
