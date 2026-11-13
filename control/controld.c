@@ -80,6 +80,7 @@
 #define MAX_VNODES 64
 #define MIDI_RING 1024           /* power of two */
 #define AUTH_TIMEOUT_NS (5ull * 1000000000ull)
+#define TCP_OUT_MAX (4u << 20)   /* bytes queued for one TCP peer before it counts as stuck */
 #define BLOCK_AFTER_FAILS 3
 #define BLOCK_NS (30ull * 1000000000ull)
 
@@ -140,6 +141,11 @@ struct conn {
 	bool authed;
 	uint64_t opened_ns;
 	struct listener *l;
+	/* what the socket did not take yet: frames are never cut, so a slow
+	 * reader gets everything in order or is disconnected (TCP_OUT_MAX) */
+	uint8_t *out;
+	size_t out_off, out_len, out_cap;
+	bool out_watch, slow;
 };
 
 struct listener {
@@ -227,6 +233,7 @@ static struct {
 
 	char config_dir[600];
 	bool no_config;
+	bool no_graph;           /* --no-graph: Params1 and OSC only, no PipeWire */
 	int idle_exit;
 	uint64_t idle_since;
 	bool verbose;
@@ -477,6 +484,8 @@ static const struct pw_proxy_events vnode_proxy_events = {
 /* The bound node for a name, (re)bound if it is new or came back. */
 static struct vnode *vnode_get(const char *name)
 {
+	if (!D.graph)
+		return NULL; /* --no-graph */
 	const struct bl_node *n = bl_graph_find_node(D.graph, name);
 	if (!n)
 		return NULL;
@@ -1569,6 +1578,7 @@ static void conn_close(struct conn *c)
 	pw_loop_destroy_source(D.l, c->src);
 	close(c->fd);
 	free(c->buf);
+	free(c->out);
 	for (int i = 0; i < l->n_conns; i++)
 		if (l->conns[i] == c) {
 			l->conns[i] = l->conns[--l->n_conns];
@@ -1577,14 +1587,74 @@ static void conn_close(struct conn *c)
 	free(c);
 }
 
+static void conn_watch_out(struct conn *c, bool on)
+{
+	if (c->out_watch == on)
+		return;
+	c->out_watch = on;
+	pw_loop_update_io(D.l, c->src, SPA_IO_IN | SPA_IO_ERR | SPA_IO_HUP | (on ? SPA_IO_OUT : 0));
+}
+
+/* Writes what is queued; never closes (the caller may be iterating). */
+static void conn_drain(struct conn *c)
+{
+	while (c->out_len) {
+		ssize_t w = send(c->fd, c->out + c->out_off, c->out_len, MSG_NOSIGNAL | MSG_DONTWAIT);
+		if (w <= 0) {
+			if (w < 0 && errno != EAGAIN && errno != EINTR)
+				c->out_len = 0; /* the socket is broken; HUP/ERR closes it */
+			break;
+		}
+		c->out_off += (size_t)w;
+		c->out_len -= (size_t)w;
+	}
+	if (!c->out_len)
+		c->out_off = 0;
+	conn_watch_out(c, c->out_len > 0 || c->slow);
+}
+
 static void tcp_send(struct conn *c, const uint8_t *pkt, size_t n)
 {
 	uint8_t frame[4 + 8192];
-	if (n > 8192)
+	if (n > 8192 || c->slow)
 		return;
 	frame[0] = (uint8_t)(n >> 24); frame[1] = (uint8_t)(n >> 16); frame[2] = (uint8_t)(n >> 8); frame[3] = (uint8_t)n;
 	memcpy(frame + 4, pkt, n);
-	(void)!send(c->fd, frame, n + 4, MSG_NOSIGNAL | MSG_DONTWAIT);
+	size_t done = 0;
+	if (!c->out_len) {
+		ssize_t w = send(c->fd, frame, n + 4, MSG_NOSIGNAL | MSG_DONTWAIT);
+		if (w == (ssize_t)(n + 4))
+			return;
+		if (w < 0 && errno != EAGAIN && errno != EINTR)
+			return; /* broken: HUP/ERR closes it */
+		done = w > 0 ? (size_t)w : 0;
+	}
+	size_t rest = n + 4 - done;
+	if (c->out_len + rest > TCP_OUT_MAX) {
+		c->slow = true; /* closed from its own I/O callback, never mid-iteration */
+		conn_watch_out(c, true);
+		return;
+	}
+	if (c->out_off && c->out_off + c->out_len + rest > c->out_cap) {
+		memmove(c->out, c->out + c->out_off, c->out_len);
+		c->out_off = 0;
+	}
+	if (c->out_off + c->out_len + rest > c->out_cap) {
+		size_t nc = c->out_cap ? c->out_cap : 65536;
+		while (nc < c->out_len + rest)
+			nc *= 2;
+		uint8_t *no = realloc(c->out, nc);
+		if (!no) {
+			c->slow = true;
+			conn_watch_out(c, true);
+			return;
+		}
+		c->out = no;
+		c->out_cap = nc;
+	}
+	memcpy(c->out + c->out_off + c->out_len, frame + done, rest);
+	c->out_len += rest;
+	conn_watch_out(c, true);
 }
 
 struct auth_ctx {
@@ -1655,6 +1725,15 @@ static void on_tcp_conn(void *data, int fd, uint32_t mask)
 		conn_close(c);
 		return;
 	}
+	if (c->slow) {
+		reject("a TCP peer that reads too slowly (4 MiB queued), closing", &c->peer);
+		conn_close(c);
+		return;
+	}
+	if (mask & SPA_IO_OUT)
+		conn_drain(c);
+	if (!(mask & SPA_IO_IN))
+		return;
 	size_t cap = l->spec.max_size + 4;
 	ssize_t n = recv(fd, c->buf + c->have, cap - c->have, MSG_DONTWAIT);
 	if (n <= 0) {
@@ -1984,6 +2063,10 @@ static const struct bl_graph_events graph_events = {
 
 static int set_follow(const char *re, char *err, size_t n)
 {
+	if (!D.graph && re && *re) {
+		snprintf(err, n, "started with --no-graph: no MIDI input");
+		return -1;
+	}
 	regex_t nr;
 	if (re && *re) {
 		int r = regcomp(&nr, re, REG_EXTENDED | REG_ICASE | REG_NOSUB);
@@ -2011,6 +2094,10 @@ static int set_follow(const char *re, char *err, size_t n)
 
 static int set_out_follow(const char *re, char *err, size_t n)
 {
+	if (!D.graph && re && *re) {
+		snprintf(err, n, "started with --no-graph: no MIDI output");
+		return -1;
+	}
 	regex_t nr;
 	if (re && *re) {
 		int r = regcomp(&nr, re, REG_EXTENDED | REG_ICASE | REG_NOSUB);
@@ -2657,7 +2744,9 @@ static void usage(FILE *f)
 	      "  It opens no network socket unless a listener is configured or asked for (docs/api/Control1.md).\n"
 	      "  --config-dir DIR  mappings and listeners (default $XDG_CONFIG_HOME/backline/control)\n"
 	      "  --no-config       start empty and never write a file\n"
-	      "  --idle-exit N     exit after N s with nothing mapped (default 60; 0 = never)\n", f);
+	      "  --idle-exit N     exit after N s with nothing mapped (default 60; 0 = never)\n"
+	      "  --no-graph        Params1 and OSC only: never connect to PipeWire (no MIDI, no volume or\n"
+	      "                    instance targets); for tests and hosts without an audio server\n", f);
 }
 
 int main(int argc, char **argv)
@@ -2669,6 +2758,7 @@ int main(int argc, char **argv)
 		{ "midi-follow", required_argument, NULL, 'm' },
 		{ "idle-exit", required_argument, NULL, 'i' },
 		{ "replace", no_argument, NULL, 'r' },
+		{ "no-graph", no_argument, NULL, 'G' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
@@ -2677,7 +2767,7 @@ int main(int argc, char **argv)
 	const char *follow = NULL;
 	D.idle_exit = 60;
 	snprintf(D.node_name, sizeof(D.node_name), "backline.control");
-	while ((c = getopt_long(argc, argv, "n:c:Nm:i:rvh", opts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "n:c:Nm:i:rGvh", opts, NULL)) != -1) {
 		switch (c) {
 		case 'n': snprintf(D.node_name, sizeof(D.node_name), "%s", optarg); break;
 		case 'c': snprintf(D.config_dir, sizeof(D.config_dir), "%s", optarg); break;
@@ -2685,6 +2775,7 @@ int main(int argc, char **argv)
 		case 'm': follow = optarg; break;
 		case 'i': D.idle_exit = atoi(optarg); break;
 		case 'r': replace = 1; break;
+		case 'G': D.no_graph = true; break;
 		case 'v': D.verbose = true; break;
 		case 'h': usage(stdout); return 0;
 		default: usage(stderr); return 2;
@@ -2698,41 +2789,43 @@ int main(int argc, char **argv)
 	D.l = pw_main_loop_get_loop(D.loop);
 	pw_loop_add_signal(D.l, SIGINT, on_signal, NULL);
 	pw_loop_add_signal(D.l, SIGTERM, on_signal, NULL);
-	D.context = pw_context_new(D.l, NULL, 0);
-	D.core = pw_context_connect(D.context, NULL, 0);
-	if (!D.core) {
-		fprintf(stderr, "backline-controld: cannot connect to PipeWire\n");
-		return 1;
-	}
-	D.registry = pw_core_get_registry(D.core, PW_VERSION_REGISTRY, 0);
-	D.graph = bl_graph_new(D.core, &graph_events, NULL);
-	D.midi_ev = pw_loop_add_event(D.l, on_midi_event, NULL);
-
-	/* The MIDI input: a node with one MIDI port and no audio. It is never
-	 * autoconnected; sources reach it by midi-follow or by a link someone
-	 * makes. */
-	struct pw_properties *props = pw_properties_new(
-		PW_KEY_MEDIA_TYPE, "Midi", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_CLASS, "Midi/Sink",
-		PW_KEY_NODE_DESCRIPTION, "Backline control (MIDI learn and mapping)", PW_KEY_NODE_AUTOCONNECT, "false",
-		"node.passive", "true", "backline.dbus.name", BUS_NAME, NULL);
-	D.filter = pw_filter_new(D.core, D.node_name, props);
-	pw_filter_add_listener(D.filter, &D.filter_listener, &filter_events, NULL);
-	D.midi_port = pw_filter_add_port(D.filter, PW_DIRECTION_INPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, 0,
-					 pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi", PW_KEY_PORT_NAME, "midi_in", NULL),
-					 NULL, 0);
-	/* MIDI out: feedback to controllers (motor faders, LED rings), linked by
-	 * SetMidiOut. The process callback drains a ring the main loop fills. */
 	if (bl_midi_ring_init(&D.out_ring, 1 << 16) < 0) {
 		fprintf(stderr, "backline-controld: out of memory\n");
 		return 1;
 	}
-	D.midi_out_port = pw_filter_add_port(D.filter, PW_DIRECTION_OUTPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, 0,
-					     pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi", PW_KEY_PORT_NAME, "midi_out", NULL),
-					     NULL, 0);
 	ctl_nrpn_init(&D.nrpn);
-	if (pw_filter_connect(D.filter, PW_FILTER_FLAG_RT_PROCESS, NULL, 0) < 0) {
-		fprintf(stderr, "backline-controld: pw_filter_connect failed\n");
-		return 1;
+	if (!D.no_graph) {
+		D.context = pw_context_new(D.l, NULL, 0);
+		D.core = pw_context_connect(D.context, NULL, 0);
+		if (!D.core) {
+			fprintf(stderr, "backline-controld: cannot connect to PipeWire\n");
+			return 1;
+		}
+		D.registry = pw_core_get_registry(D.core, PW_VERSION_REGISTRY, 0);
+		D.graph = bl_graph_new(D.core, &graph_events, NULL);
+		D.midi_ev = pw_loop_add_event(D.l, on_midi_event, NULL);
+
+		/* The MIDI input: a node with one MIDI port and no audio. It is never
+		 * autoconnected; sources reach it by midi-follow or by a link someone
+		 * makes. */
+		struct pw_properties *props = pw_properties_new(
+			PW_KEY_MEDIA_TYPE, "Midi", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_CLASS, "Midi/Sink",
+			PW_KEY_NODE_DESCRIPTION, "Backline control (MIDI learn and mapping)", PW_KEY_NODE_AUTOCONNECT, "false",
+			"node.passive", "true", "backline.dbus.name", BUS_NAME, NULL);
+		D.filter = pw_filter_new(D.core, D.node_name, props);
+		pw_filter_add_listener(D.filter, &D.filter_listener, &filter_events, NULL);
+		D.midi_port = pw_filter_add_port(D.filter, PW_DIRECTION_INPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, 0,
+						 pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi", PW_KEY_PORT_NAME, "midi_in", NULL),
+						 NULL, 0);
+		/* MIDI out: feedback to controllers (motor faders, LED rings), linked by
+		 * SetMidiOut. The process callback drains a ring the main loop fills. */
+		D.midi_out_port = pw_filter_add_port(D.filter, PW_DIRECTION_OUTPUT, PW_FILTER_PORT_FLAG_MAP_BUFFERS, 0,
+						     pw_properties_new(PW_KEY_FORMAT_DSP, "8 bit raw midi", PW_KEY_PORT_NAME, "midi_out", NULL),
+						     NULL, 0);
+		if (pw_filter_connect(D.filter, PW_FILTER_FLAG_RT_PROCESS, NULL, 0) < 0) {
+			fprintf(stderr, "backline-controld: pw_filter_connect failed\n");
+			return 1;
+		}
 	}
 
 	int r = sd_bus_open_user(&D.bus);
@@ -2758,9 +2851,11 @@ int main(int argc, char **argv)
 	struct timespec hk = { 0, 250 * 1000000L };
 	pw_loop_update_timer(D.l, D.house_timer, &hk, &hk, false);
 
-	pw_core_sync(D.core, PW_ID_CORE, 0);
-	for (int i = 0; i < 20; i++)
-		pw_loop_iterate(D.l, 10);
+	if (D.core) {
+		pw_core_sync(D.core, PW_ID_CORE, 0);
+		for (int i = 0; i < 20; i++)
+			pw_loop_iterate(D.l, 10);
+	}
 	if (!D.no_config)
 		load_config();
 	if (follow) {
@@ -2794,13 +2889,18 @@ int main(int argc, char **argv)
 	if (D.out_on)
 		regfree(&D.out_re);
 	pd_fini();
-	pw_filter_destroy(D.filter);
+	if (D.filter)
+		pw_filter_destroy(D.filter);
 	bl_midi_ring_free(&D.out_ring);
-	bl_graph_destroy(D.graph);
-	pw_proxy_destroy((struct pw_proxy *)D.registry);
+	if (D.graph)
+		bl_graph_destroy(D.graph);
+	if (D.registry)
+		pw_proxy_destroy((struct pw_proxy *)D.registry);
 	sd_bus_flush_close_unref(D.bus);
-	pw_core_disconnect(D.core);
-	pw_context_destroy(D.context);
+	if (D.core)
+		pw_core_disconnect(D.core);
+	if (D.context)
+		pw_context_destroy(D.context);
 	pw_main_loop_destroy(D.loop);
 	pw_deinit();
 	return 0;

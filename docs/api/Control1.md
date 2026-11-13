@@ -99,6 +99,11 @@ targets go straight to PipeWire.
 
 ## MIDI input and output
 
+`backline-controld --no-graph` never connects to PipeWire: it serves Control1
+listeners and Params1 only (no MIDI, no `volume:` or `instance:` targets;
+`SetMidiFollow` and `SetMidiOut` are refused). It is for tests and for hosts
+without an audio server; the Params1 load test runs it that way.
+
 controld is one PipeWire node, `backline.control` (`Midi/Sink`), with one
 MIDI input port `midi_in`. It is never autoconnected. MIDI reaches it through
 links: `SetMidiFollow(regex)` links every MIDI output port whose

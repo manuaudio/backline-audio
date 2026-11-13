@@ -25,6 +25,7 @@ extern "C" {
 #define PRM_STRING_MAX 257
 #define PRM_MAX_ENUM 64
 #define PRM_DB_INF -120.0     /* a db-fader min at or below this is -inf */
+#define PRM_SUB_WORDS 4       /* 256 subscriptions in controld */
 
 enum prm_type { PRM_FLOAT, PRM_INT, PRM_BOOL, PRM_ENUM, PRM_STRING, PRM_TRIGGER };
 enum prm_taper { PRM_LINEAR, PRM_LOG, PRM_DB_FADER };
@@ -49,7 +50,11 @@ struct prm {
 	bool text_override;
 	/* owner bookkeeping (opaque to this module) */
 	int root;
-	uint64_t dirty;        /* per-subscriber bits (controld) */
+	/* per-subscription bits (controld; PRM_SUB_WORDS x 64 subscriptions):
+	 * dirty: queued for that subscription; match: its pattern matches this
+	 * path (the index that makes a change cost a bit scan, not N matches) */
+	uint64_t dirty[PRM_SUB_WORDS];
+	uint64_t match[PRM_SUB_WORDS];
 	uint32_t slot;         /* index in the store */
 };
 

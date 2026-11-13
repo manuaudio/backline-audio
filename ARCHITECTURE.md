@@ -552,6 +552,16 @@ effect-insert component.
   answers. UDP subscriptions expire without a renewal; TCP ones live with the
   connection. Without that option a listener is exactly what it was
   (security rule 7 holds).
+- **Big trees** (built, measured offline): a console's thousands of
+  parameters. `Update` takes the whole tree in one call; `SetMany` (all or
+  nothing) and `GetMatching` for clients; an owner that registers the
+  `set-many` feature gets requests batched into one `SetMany` signal per
+  run; `Changed` is coalesced until the loop is idle (one signal per root,
+  each path once). Subscriptions are indexed per parameter (256 in all), and
+  TCP replies are queued, never cut, for a slow reader. 5 000 parameters,
+  8 OSC clients x 2 000: register 16 ms, a 5 000-value `SetMany` fanned out
+  to all 16 000 subscriber values in 16-60 ms, 40 000 OSC sets a second at
+  10 % of a core ([Params1.md](docs/api/Params1.md#big-trees)).
 - **MIDI additions** (built): `midi:cc14`, `midi:nrpn`, `midi:rpn` sources;
   relative encodings (two's complement, sign-magnitude, binary offset,
   increment/decrement) with step and acceleration; soft takeover (pickup,

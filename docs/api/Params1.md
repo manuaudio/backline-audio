@@ -97,6 +97,18 @@ roots and 20 000 parameters in all, 1 024 meters a root. Errors: `Busy`
 (another client owns the root), `InvalidArgs` with the first bad parameter
 and why.
 
+`features` (optional) lists what the program can take beyond the base
+contract. Names controld doesn't know are ignored, so a newer program works
+with an older controld:
+
+- `"set-many"`: the program takes the **`SetMany` signal** (below). Requests
+  are then batched: every set that controld handles before its loop is idle
+  (one OSC bundle, one `SetMany` call, a burst of `Set` calls) reaches the
+  program as one signal per run of requests from the same client in the same
+  role. Without it the program gets one `Set` signal per value, as before.
+
+A 5 000-parameter `Register` takes about 16 ms (see [Big trees](#big-trees)).
+
 ### `Add(s token, s params_json) → ()`, `Remove(s token, as paths) → ()`
 
 Sessions are built live: `Add` takes `{"params": [...]}` (an existing path is
@@ -109,7 +121,8 @@ The program's confirmed values: a path and its value (`d` for `float`, `i` or
 `d` for `int` and `enum`, `b` for `bool`, `s` for `string`). This is what
 everyone sees: subscribers, surfaces, MIDI feedback. An `Update` clears any
 text the program set for that path. Unknown paths are an `InvalidArgs` error
-and nothing in the call is applied.
+and nothing in the call is applied. One call takes up to 20 000 values (the
+whole tree); send a big change as one `Update`, not one call per value.
 
 ### `UpdateText(s token, a(ss) texts) → ()`
 
@@ -188,6 +201,23 @@ Same options and errors as `Set`, and the parameter must be `automatable`.
 controld keeps each client's open gestures and ends them itself when the
 client leaves the bus, so a crashed surface can't leave automation writing.
 
+### `SetMany(a(sv) values, a{sv} options) → (u passed)`
+
+Many `Set`s in one call: each `(path, value)` as in `Set`, with one set of
+options (`norm`, `role`, `client`) for all of them. **All or nothing**: every
+value is checked first (path, role, kind, range), and one bad value refuses
+the whole call (`NotFound`, `AccessDenied` or `InvalidArgs`, naming it)
+with nothing passed on. Returns the number of values passed on. At most
+20 000 values a call. An owner with the `set-many` feature gets them as one
+`SetMany` signal; any other owner gets one `Set` signal per value, in order.
+
+### `GetMatching(as patterns) → (a(svds) values)`
+
+Path, value, normalised value and text of every parameter matching any of the
+patterns, each once, in tree order. The values-only answer to a big read:
+`List` carries every field as JSON, `GetMatching` only what changes (5 000
+values in about 2.5 ms against about 15 ms for `List`).
+
 ### `MeterTable(s root) → (h memfd, as ids)`
 
 A read-only copy of the root's meter table fd. Error `NotFound` when the
@@ -198,8 +228,9 @@ root has no meters.
 | Signal | To | When |
 |---|---|---|
 | `Set(s path, v value, s client, s role)` | the owner only | A client asks for a value, already converted and clamped: `d` for `float`, `i` for `int` and `enum`, `b` for `bool` and `trigger`, `s` for `string` |
+| `SetMany(a(sv) values, s client, s role)` | the owner only, if it registered `set-many` | The same as `Set` for many values: one run of requests from one client in one role, in the order asked (a path can appear more than once; apply them in order) |
 | `Gesture(s path, b begin, s client, s role)` | the owner only | A touch begins or ends |
-| `Changed(s root, a(svds) values)` | everyone | An `Update` or `UpdateText`: path, value, normalised value, text |
+| `Changed(s root, a(svds) values)` | everyone | Values confirmed by `Update` or `UpdateText`: path, value, normalised value, text. **Batched**: the updates controld handles together (until its loop is idle) become one signal per root, each path once with its latest value. 5 000 single-value `Update` calls in a burst arrive as a few hundred signals, one 5 000-value `Update` as one |
 | `Structure(s root)` | everyone | A root was registered, removed, or had parameters added or removed |
 
 ## Properties
@@ -211,6 +242,8 @@ root has no meters.
 | `Subscriptions` | `u` | OSC subscriptions open (*polled*) |
 | `SetRequests` | `t` | Set requests passed to owners (*polled*) |
 | `Refused` | `t` | Sets and gestures refused for a role or `read-only` (*polled*) |
+| `ChangedSignals` | `t` | `Changed` signals sent (*polled*; with `SetRequests`, shows the batching) |
+| `SetSignals` | `t` | `SetMany` signals sent to owners (*polled*) |
 
 ## OSC
 
@@ -247,9 +280,45 @@ address, allow-list, TCP secret, rate and size limits).
   controld flood someone else. Use TCP, or a narrower pattern, for more.
 - **UDP subscriptions expire** 30 s after their last `sub` or `renew`; TCP
   subscriptions live with the connection. A peer has at most 32
-  subscriptions, a listener at most 32 subscribed peers.
+  subscriptions, a listener at most 32 subscribed peers, controld at most
+  256 in all.
+- **Subscriptions are indexed.** Which subscriptions match a parameter is
+  worked out once, when the subscription or the parameter is made, so a
+  change costs a bit scan, not a pattern match per subscription. Use as
+  many patterns as the client needs.
+- **A TCP peer gets every reply, in order, or is disconnected.** What its
+  socket can't take yet is queued (frames are never cut); a peer that
+  leaves 4 MiB unread is closed (`Rejected` counts it).
 - **Gestures** opened over OSC end when a TCP connection closes, or 60 s after
   the peer's last message on UDP.
+
+## Big trees
+
+A console publishes thousands of parameters. What to use for them:
+
+| To | Use |
+|---|---|
+| publish the tree | one `Register` (or `Add`) with every parameter |
+| confirm many values | one `Update` with all of them (up to 20 000) |
+| take many requests at once | `"features": ["set-many"]` in `Register`, then the `SetMany` signal |
+| set many values from a client | `SetMany` (all or nothing) |
+| read many values | `Get` with all the paths, or `GetMatching` with patterns |
+| follow many values over OSC | TCP, and one `/backline/sub` per group of paths |
+
+**Measured** (`tests/tools/params-load.c`, the `params_load` test, on a
+private bus with controld `--no-graph`, no PipeWire; i7-12650H, 2026-11-12):
+a 5 000-parameter tree, 8 OSC clients (4 TCP, 4 UDP) each subscribed to
+2 000 of them in 16 patterns at 60/s.
+
+| | |
+|---|---|
+| `Register` of 5 000 parameters | 16 ms (10 ms of controld CPU) |
+| `Get` of 5 000 paths / `GetMatching` / `List` | 2.9 ms / 2.5 ms / 15 ms |
+| 8 clients subscribe, all 16 000 initial values delivered | 56 ms |
+| OSC sweep: 20 000 sets (40 000 a second, bundles of 25), each echoed by the program | every echo arrived; set → echo p50 7-10 ms, p99 21 ms (the 60/s subscription rate is most of it); 63 000 values fanned out; 800 `SetMany` signals, about 100 `Changed`; controld 10 % of one core |
+| one `SetMany` of 5 000 values to a `set-many` owner | call 2.7 ms; 1 signal, 1 `Update`, 1 `Changed`; all 16 000 subscriber values out in 16-60 ms |
+| the same to an owner without `set-many` | call 45 ms; 5 000 `Set` signals and `Update`s, about 270 `Changed`; all out in 70 ms |
+| controld peak memory | 32 MB |
 
 ## Control1 targets
 

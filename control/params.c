@@ -712,7 +712,8 @@ struct prm *prm_store_put(struct prm_store *s, struct prm *p)
 	if (h) {
 		uint32_t slot = *h - 1;
 		p->slot = slot;
-		p->dirty = s->slots[slot]->dirty;
+		memcpy(p->dirty, s->slots[slot]->dirty, sizeof(p->dirty));
+		memcpy(p->match, s->slots[slot]->match, sizeof(p->match));
 		prm_free(s->slots[slot]);
 		s->slots[slot] = p;
 		return p;
