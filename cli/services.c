@@ -140,11 +140,42 @@ int cli_rec(bl_client *c, bool json, int argc, char **argv)
 		return 0;
 	}
 	if (!strcmp(sub, "input")) {
-		if (argc < 3) {
-			fprintf(stderr, "usage: backline rec input NODE live|playback\n");
+		const char *channels = NULL, *consumer = NULL;
+		int pos = 0;
+		const char *node = NULL, *mode = NULL;
+		for (int i = 1; i < argc; i++) {
+			if (!strcmp(argv[i], "--channel") && i + 1 < argc) channels = argv[++i];
+			else if (!strcmp(argv[i], "--for") && i + 1 < argc) consumer = argv[++i];
+			else if (pos == 0) { node = argv[i]; pos++; }
+			else if (pos == 1) { mode = argv[i]; pos++; }
+			else pos++;
+		}
+		if (!node || !mode || pos != 2) {
+			fprintf(stderr, "usage: backline rec input NODE live|playback [--channel N[,N...]] [--for CONSUMER]\n");
 			return 2;
 		}
-		if (bl_recorder_set_input(c, argv[1], argv[2]) < 0)
+		if (!channels && !consumer) {
+			if (bl_recorder_set_input(c, node, mode) < 0)
+				return fail(c, "input");
+			return 0;
+		}
+		bl_channel_input v[64];
+		size_t n = 0;
+		if (!channels) {
+			v[n++] = (bl_channel_input){ node, 0, mode, consumer };
+		} else {
+			for (const char *p = channels; *p && n < 64;) {
+				char *end;
+				unsigned long ch = strtoul(p, &end, 10);
+				if (end == p || ch == 0 || ch > 64 || (*end && *end != ',')) {
+					fprintf(stderr, "backline: --channel takes 1-based channel numbers, e.g. 1,3\n");
+					return 2;
+				}
+				v[n++] = (bl_channel_input){ node, (uint32_t)ch, mode, consumer };
+				p = *end ? end + 1 : end;
+			}
+		}
+		if (bl_recorder_set_channel_inputs(c, v, n) < 0)
 			return fail(c, "input");
 		return 0;
 	}

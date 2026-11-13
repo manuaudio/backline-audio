@@ -3,6 +3,7 @@
  */
 #define _GNU_SOURCE
 #include "soundcheck.h"
+#include "sc_plan.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -280,7 +281,7 @@ struct sc_player *sc_player_new(struct pw_core *core, struct pw_loop *loop, cons
 			PW_KEY_MEDIA_TYPE, "Audio",
 			PW_KEY_MEDIA_CATEGORY, "Playback",
 			PW_KEY_MEDIA_ROLE, "Production",
-			PW_KEY_NODE_NAME, "backline.soundcheck",
+			PW_KEY_NODE_NAME, SC_NODE_NAME,
 			PW_KEY_NODE_DESCRIPTION, "Backline soundcheck",
 			PW_KEY_NODE_AUTOCONNECT, "false",
 			PW_KEY_NODE_ALWAYS_PROCESS, "true",
@@ -290,7 +291,7 @@ struct sc_player *sc_player_new(struct pw_core *core, struct pw_loop *loop, cons
 	for (int k = 0; k < take->n_tracks; k++) {
 		for (int c = 0; c < p->t[k].channels; c++) {
 			char name[64];
-			snprintf(name, sizeof(name), "t%d_%d", k + 1, c + 1);
+			scp_port_name(k + 1, c + 1, name, sizeof(name));
 			p->t[k].ports[c] = pw_filter_add_port(p->filter, PW_DIRECTION_OUTPUT,
 				PW_FILTER_PORT_FLAG_MAP_BUFFERS, 0,
 				pw_properties_new(PW_KEY_FORMAT_DSP, "32 bit float mono audio",

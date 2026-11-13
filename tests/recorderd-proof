@@ -335,6 +335,25 @@ call SetInput ss backline-test.mic-b live >/dev/null; sleep 0.3
 after_live=$(links)
 echo "  both live: $after_live"
 foh live2
+# Per channel (SetChannelInput/SetChannelInputs): one channel of a device, one
+# consumer, never the device's other channel. A second link from mic-a's right
+# channel shows that; it is removed again before the checks below.
+pw-link backline-test.mic-a:capture_FR backline-test.foh:playback_FR
+sleep 0.2
+ok() { if eval "$2"; then echo "  $1: yes"; else echo "  $1: NO ($(links))"; fi; }
+call SetChannelInput suss backline-test.mic-a 1 playback backline-test.foh >/dev/null; sleep 0.3
+l=$(links)
+ok "channel 1 of mic-a moved alone" '[[ $l == *"backline.soundcheck:t1_1 -> backline-test.foh:playback_FL"* && $l == *"backline-test.mic-a:capture_FR -> backline-test.foh:playback_FR"* && $l != *"mic-a:capture_FL"* ]]'
+echo "  SoundcheckInputs: $(prop SoundcheckInputs); SoundcheckChannels: $(prop SoundcheckChannels)"
+call SetChannelInputs 'a(suss)' 2 backline-test.mic-a 1 live "" backline-test.mic-b 2 playback "" >/dev/null; sleep 0.3
+l=$(links)
+ok "batch: mic-a back, mic-b right to playback" '[[ $l == *"backline-test.mic-a:capture_FL -> backline-test.foh:playback_FL"* && $l == *"backline.soundcheck:t2_2 -> backline-test.foh:playback_FR"* ]]'
+bad=$(call SetChannelInputs 'a(suss)' 2 backline-test.mic-a 1 playback "" backline-test.foh 1 playback "" 2>&1 || true)
+ok "a bad batch switches nothing" '[[ $(links) == "$l" && $bad == *"nothing was switched"* ]]'
+call SetChannelInputs 'a(suss)' 1 backline-test.mic-b 0 live "" >/dev/null; sleep 0.3
+pw-link -d backline-test.mic-a:capture_FR backline-test.foh:playback_FR
+sleep 0.2
+ok "per-channel round trip ends where it started" '[[ $(links) == "$before" ]]'
 python3 -I - "$out" "$take" "$here" <<'EOF'
 import json, sys
 out, take, here = sys.argv[1:4]; sys.path.insert(0, here); import analyze as A
