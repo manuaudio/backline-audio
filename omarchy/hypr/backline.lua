@@ -7,7 +7,8 @@
 -- at a panel that can't open. The tags are not copied.
 --
 -- Super + Ctrl + I is Omarchy's "Toggle locking on idle", so the Instruments
--- panel is on U.
+-- panel is on U. Super + Ctrl + A is Omarchy's audio panel, and
+-- Super + Ctrl + Alt + A is its quick action here: pro audio on or off.
 -- backline:begin
 o.bind("SUPER + CTRL + U", "Backline instruments", "omarchy-shell -q backline.instruments toggle") -- panels
 o.bind("SUPER + CTRL + M", "Backline record panel", "omarchy-shell -q backline.record toggle") -- panels
@@ -15,4 +16,5 @@ o.bind("SUPER + CTRL + G", "Backline transport", "omarchy-shell -q backline.tran
 o.bind("SUPER + CTRL + M", "Backline Mixer", "omarchy-backline-mixer") -- no-panels
 o.bind("SUPER + CTRL + ALT + M", "Backline: record or stop", "omarchy-backline-record toggle")
 o.bind("SUPER + CTRL + ALT + G", "Backline: play or stop", "omarchy-backline-transport toggle")
+o.bind("SUPER + CTRL + ALT + A", "Backline: pro audio on or off", "omarchy-backline-pro toggle")
 -- backline:end

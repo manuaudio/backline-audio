@@ -9,6 +9,22 @@ evidence for every item is in [docs/proofs/](docs/proofs/).
 Fixes from the first real install (Omarchy 4.0.4, PipeWire 1.6.8,
 WirePlumber 0.5.17).
 
+### Added
+
+- **Audio Setup**, a fifth Omarchy panel, and three commands moved in from
+  the `manuaudio/omarchy-audio` Omarchy branches, so Omarchy itself only gets
+  small invisible defaults and fixes:
+  - `omarchy-backline-pro`: pro audio, a small buffer and a locked sample
+    rate, live, restored when PipeWire restarts; Trigger › Toggle › Pro Audio
+    and `Super + Ctrl + Alt + A`.
+  - `omarchy-backline-aggregate`: aggregate and multi-output devices, each in
+    its own PipeWire client; Setup › Audio.
+  - `omarchy-backline-midi`: MIDI ports with protocol and connections, and a
+    picker to connect them; Setup › Audio › MIDI Connections.
+  - Their tests: `omarchy/test/audio-setup-test.sh` and the model tests.
+  - `omarchy-backline-setup --uninstall` turns pro audio off, since its unit
+    runs a Backline command.
+
 ### Fixed
 
 - **One version everywhere**: `bl_version()`, `backline version` and Host1's

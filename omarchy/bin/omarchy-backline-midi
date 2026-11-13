@@ -1,0 +1,195 @@
+#!/bin/bash
+
+# omarchy:summary=List MIDI ports and connect or disconnect them
+# omarchy:args=[list [--all] [--json]|connect [<source> [<destination>]]|disconnect <source> <destination>]
+# omarchy:examples=omarchy backline midi | omarchy backline midi connect 24:0 128:0 | omarchy backline midi disconnect 24:0 128:0
+
+# The MIDI side of macOS's Audio MIDI Setup, over the ALSA sequencer. Every
+# keyboard, controller, virtual bus and app port is a sequencer port, and
+# PipeWire's MIDI bridge mirrors them all, so JACK and PipeWire apps see the
+# same ones. A source sends MIDI (a keyboard), a destination receives it (a
+# synth), and a connection carries one to the other. Ports are named by their
+# client:port address or by client name, as aconnect takes them.
+#
+# Since kernel 6.5 the sequencer also carries MIDI 2.0 (UMP) clients, so each
+# port shows the protocol its client speaks.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+bl_help "$@"
+
+clients="${BACKLINE_SEQ_CLIENTS_PATH:-/proc/asound/seq/clients}"
+
+usage() {
+  echo "Usage: omarchy-backline-midi [list [--all] [--json]|connect [<source> [<destination>]]|disconnect <source> <destination>]" >&2
+  exit 2
+}
+
+# One row per port: address, client, port, kind, protocol, direction, the
+# addresses it sends to. The sequencer's own System client and PipeWire's
+# bridge are plumbing; they are left out unless all is 1.
+ports_tsv() {
+  awk -v all="$1" '
+    function flush() {
+      if (port != "" && (all || !hidden)) print addr "\t" client "\t" port "\t" kind "\t" proto "\t" dir "\t" links
+      port = ""; links = ""
+    }
+    /^Client +[0-9]+ :/ {
+      flush()
+      id = $2
+      match($0, /"[^"]*"/); client = substr($0, RSTART + 1, RLENGTH - 2)
+      match($0, /\[[^]]*\]$/); split(substr($0, RSTART + 1, RLENGTH - 2), type, " ")
+      if (type[1] == "Kernel") kind = (id >= 16 && id < 128) ? "hardware" : "virtual"; else kind = "app"
+      proto = (type[2] == "Legacy") ? "MIDI 1.0" : (type[3] == "MIDI2" ? "MIDI 2.0" : "MIDI 1.0 (UMP)")
+      hidden = (id == 0 || client ~ /^PipeWire-/)
+      next
+    }
+    /^  Port +[0-9]+ :/ {
+      flush()
+      match($0, /"[^"]*"/); port = substr($0, RSTART + 1, RLENGTH - 2)
+      match($0, /\([^)]*\)/); caps = substr($0, RSTART + 1, 4)
+      addr = id ":" $2
+      sub(/:$/, "", addr)
+      dir = ""
+      if (substr(caps, 1, 1) == "R") dir = "source"
+      if (substr(caps, 2, 1) == "W") dir = (dir == "") ? "destination" : "both"
+      if (dir == "") dir = "private"
+      next
+    }
+    /^    Connecting To:/ {
+      sub(/^    Connecting To: /, "")
+      gsub(/\[[^]]*\]/, "")
+      gsub(/ /, "")
+      links = $0
+    }
+    END { flush() }
+  ' "$clients"
+}
+
+require_sequencer() {
+  if [[ ! -r $clients ]]; then
+    echo "The ALSA sequencer is not loaded, so there are no MIDI ports." >&2
+    exit 1
+  fi
+}
+
+print_list() {
+  local rows
+  rows=$(ports_tsv "$1")
+  if [[ -z $rows ]]; then
+    echo "No MIDI ports."
+    return
+  fi
+  {
+    printf 'PORT\tCLIENT\tNAME\tKIND\tPROTOCOL\tDIRECTION\tSENDS TO\n'
+    printf '%s\n' "$rows"
+  } | column -t -s$'\t'
+}
+
+print_json() {
+  ports_tsv "$1" | jq -R -s -c '
+    split("\n") | map(select(length > 0) | split("\t")
+      | {address: .[0], client: .[1], port: .[2], kind: .[3], protocol: .[4], direction: .[5],
+         sendsTo: ((.[6] // "") | if . == "" then [] else split(",") end)})
+    # Connections to ports left out of the list are left out with them.
+    | map(.address) as $listed | map(.sendsTo |= map(select(. as $a | $listed | index($a))))'
+}
+
+# Tell an open Audio Setup panel its MIDI section changed.
+refresh_shell() {
+  bl_push backline.setup
+}
+
+# The menu's flow: every destination, this source's connections ticked; what
+# is ticked on Apply becomes its connections.
+pick_destinations() {
+  local source="$1" rows options=() selected=() address client port links picked
+  rows=$(ports_tsv 0)
+  links=$(awk -F'\t' -v s="$source" '$1 == s {print $7}' <<<"$rows")
+  while IFS=$'\t' read -r address client port _ _ dir _; do
+    [[ $address == "$source" || $dir == "source" || $dir == "private" ]] && continue
+    options+=("$client"$'\t'"$port · $address")
+    [[ ,$links, == *",$address,"* ]] && selected+=(--selected "$client"$'\t'"$port · $address")
+  done <<<"$rows"
+  if ((${#options[@]} == 0)); then
+    bl_notify -g 󰣱 "$(bl_t midi.noDestinations)"
+    exit 1
+  fi
+  picked=$(omarchy-menu-select "$(bl_t midi.sendTo)" "${options[@]}" -- --multiple "${selected[@]}") || exit 1
+  set_destinations "$source" "$(jq -r '.[] | split(" · ") | last' <<<"$picked")"
+}
+
+# Make a source's connections exactly these destination addresses.
+# Connections to the plumbing the menu doesn't offer (PipeWire's bridge) stay.
+set_destinations() {
+  local source="$1" wanted="$2" listed current address failed=0
+  listed=$(ports_tsv 0 | cut -f1)
+  current=$(ports_tsv 0 | awk -F'\t' -v s="$source" '$1 == s {gsub(",", "\n", $7); print $7}' | grep -Fxf <(printf '%s\n' "$listed"))
+  for address in $current; do
+    grep -qx "$address" <<<"$wanted" || aconnect -d "$source" "$address" || failed=1
+  done
+  for address in $wanted; do
+    grep -qx "$address" <<<"$current" || aconnect "$source" "$address" || failed=1
+  done
+  refresh_shell
+  if ((failed)); then
+    bl_notify -u critical -g 󰣱 "$(bl_t midi.connectFailed)"
+    exit 1
+  fi
+}
+
+pick_source() {
+  local options=() address client port
+  while IFS=$'\t' read -r address client port _ _ dir _; do
+    [[ $dir == "source" || $dir == "both" ]] && options+=("$client"$'\t'"$port · $address")
+  done < <(ports_tsv 0)
+  if ((${#options[@]} == 0)); then
+    bl_notify -g 󰣱 "$(bl_t midi.noSources)"
+    exit 1
+  fi
+  omarchy-menu-select "$(bl_t midi.sendFrom)" "${options[@]}" | awk -F' · ' '{print $NF}'
+}
+
+action="${1:-list}"
+(($# > 0)) && shift
+require_sequencer
+
+case "$action" in
+  list)
+    all=0
+    json=false
+    for flag in "$@"; do
+      case "$flag" in
+        --all) all=1 ;;
+        --json) json=true ;;
+        *) usage ;;
+      esac
+    done
+    if [[ $json == "true" ]]; then
+      print_json "$all"
+    else
+      print_list "$all"
+    fi
+    ;;
+  connect)
+    if (($# == 2)); then
+      aconnect "$1" "$2" || exit 1
+      refresh_shell
+      echo "Connected $1 to $2."
+    elif (($# == 1)); then
+      pick_destinations "$1"
+    elif (($# == 0)); then
+      source=$(pick_source) || exit 1
+      pick_destinations "$source"
+    else
+      usage
+    fi
+    ;;
+  disconnect)
+    (($# == 2)) || usage
+    aconnect -d "$1" "$2" || exit 1
+    refresh_shell
+    echo "Disconnected $1 from $2."
+    ;;
+  *) usage ;;
+esac

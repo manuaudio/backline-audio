@@ -1,5 +1,5 @@
-// Pure logic shared by Backline's four panels (Instruments, Record, Plugins,
-// Transport). Plain JavaScript with no QML, so Node can load it for tests;
+// Pure logic shared by Backline's panels (Instruments, Record, Plugins,
+// Transport, Audio Setup). Plain JavaScript with no QML, so Node can load it for tests;
 // each panel imports it as "Model.js" (the plugins carry a copy, since a
 // third-party plugin directory is installed on its own). Functions that make
 // visible text take an optional tr(key, english) and default to the English,
@@ -270,6 +270,155 @@ function chaseStatus(clockState, tr) {
 
 var FPS_CHOICES = [24, 25, 29.97, 30]
 
+// ------------------------------------------------------------- audio setup
+// Pro audio (omarchy-backline-pro), combined devices
+// (omarchy-backline-aggregate) and MIDI ports (omarchy-backline-midi): the
+// panel offers the buffer sizes and rates a session picks between; the
+// commands take others.
+
+var PRO_BUFFERS = [64, 128, 256, 512, 1024]
+var PRO_RATES = [44100, 48000, 88200, 96000]
+
+// Numbers go through the shell's I18n.formatNumber when QML passes it; Node
+// tests leave it out and get plain English digits.
+function formatter(fmt) {
+  return typeof fmt === "function" ? fmt : function(v, d) { return d === undefined ? String(v) : Number(v).toFixed(d) }
+}
+
+// `omarchy-backline-pro status --json`, or null when PipeWire isn't answering
+// (the command then prints nothing on stdout) or the output is not its own.
+function parseProStatus(text) {
+  var data = parseJson(text, null)
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null
+  var buffer = Number(data.buffer)
+  var rate = Number(data.rate)
+  if (!(buffer > 0) || !(rate > 0)) return null
+  return { enabled: data.enabled === true, buffer: buffer, rate: rate, realtime: data.realtime === true }
+}
+
+function proLatency(buffer, rate, fmt) {
+  return formatter(fmt)(buffer / rate * 1000, 1)
+}
+
+// "PRO AUDIO", and once it is on the time one buffer takes: "PRO AUDIO · 2.7 ms".
+function proTitle(status, tr, fmt) {
+  var t = pick(tr)
+  if (!status || !status.enabled) return t("setup.pro", "PRO AUDIO")
+  return fill(t("setup.proLatency", "PRO AUDIO · %1 ms"), [proLatency(status.buffer, status.rate, fmt)])
+}
+
+// 44100 -> "44.1", 48000 -> "48": the pill. The tooltip adds the unit.
+function rateLabel(rate, fmt) {
+  var khz = rate / 1000
+  return khz % 1 === 0 ? formatter(fmt)(khz) : formatter(fmt)(khz, 1)
+}
+
+function rateTooltip(rate, tr, fmt) {
+  return fill(pick(tr)("setup.kiloHertz", "%1 kHz"), [rateLabel(rate, fmt)])
+}
+
+function bufferTooltip(buffer, rate, tr, fmt) {
+  return fill(pick(tr)("setup.bufferTooltip", "%1 frames, %2 ms"), [formatter(fmt)(buffer), proLatency(buffer, rate, fmt)])
+}
+
+// Where the cursor lands in a row of pills: on the value in force, else the first.
+function pillIndex(values, value) {
+  var index = (values || []).indexOf(value)
+  return index >= 0 ? index : 0
+}
+
+// `omarchy-backline-aggregate list --json`: the devices combined here.
+function parseCombined(text) {
+  var data = parseJson(text, [])
+  if (!Array.isArray(data)) return []
+  var rows = []
+  for (var i = 0; i < data.length; i++) {
+    var d = data[i]
+    if (!d || typeof d !== "object" || !d.name) continue
+    rows.push({ name: String(d.name), active: d.active === true, mirror: d.mirror === true })
+  }
+  return rows
+}
+
+// "Multi-output · running", "Aggregate · stopped".
+function combinedCaption(device, tr) {
+  var t = pick(tr)
+  var kind = device.mirror ? t("setup.multiOutput", "Multi-output") : t("setup.aggregate", "Aggregate")
+  return kind + " · " + (device.active ? t("setup.running", "running") : t("setup.stopped", "stopped"))
+}
+
+// `omarchy-backline-midi list --json`: the sequencer's ports, or none when the
+// output is not its own.
+function parseMidiPorts(text) {
+  var data = parseJson(text, [])
+  if (!Array.isArray(data)) return []
+  var ports = []
+  for (var i = 0; i < data.length; i++) {
+    var p = data[i]
+    if (!p || typeof p !== "object" || !p.address) continue
+    ports.push({
+      address: String(p.address),
+      client: String(p.client || ""),
+      port: String(p.port || ""),
+      kind: String(p.kind || ""),
+      protocol: String(p.protocol || ""),
+      direction: String(p.direction || ""),
+      sendsTo: Array.isArray(p.sendsTo) ? p.sendsTo.map(String) : []
+    })
+  }
+  return ports
+}
+
+// The ports a person plays or patches from: devices and apps that send. Kernel
+// buses like Midi Through are always there and would only be noise.
+function midiSources(ports) {
+  var list = (ports || []).filter(function(p) {
+    return (p.kind === "hardware" || p.kind === "app") && (p.direction === "source" || p.direction === "both")
+  })
+  list.sort(function(a, b) {
+    if (a.kind !== b.kind) return a.kind === "hardware" ? -1 : 1
+    return String(a.address).localeCompare(String(b.address), undefined, { numeric: true })
+  })
+  return list
+}
+
+// Hardware names its ports after the device ("Launchkey MK3 MIDI 1"); apps
+// often do not ("output"), so the client leads where the port leaves it out.
+function portLabel(port) {
+  if (!port.port || port.port.indexOf(port.client) >= 0) return port.port || port.client
+  return port.client + " " + port.port
+}
+
+// "MIDI 2.0 · to Surge XT, Vital", naming each destination by its client.
+function portCaption(port, ports, tr) {
+  var t = pick(tr)
+  var names = []
+  for (var i = 0; i < port.sendsTo.length; i++) {
+    var name = port.sendsTo[i]
+    for (var j = 0; j < (ports || []).length; j++)
+      if (ports[j].address === port.sendsTo[i]) name = ports[j].client
+    if (names.indexOf(name) < 0) names.push(name)
+  }
+  var where = names.length > 0 ? fill(t("setup.sendsTo", "to %1"), [names.join(", ")]) : t("setup.unconnected", "not connected")
+  return port.protocol + " · " + where
+}
+
+// The panel's one cursor walks these rows, top to bottom: the pro audio
+// switch, its two pill rows while it is on, each combined device, the add
+// row, then each MIDI port that sends. A section PipeWire or the sequencer
+// isn't answering for has no rows.
+function setupRows(proStatus, combined, midiRows) {
+  var rows = []
+  if (proStatus) {
+    rows.push({ kind: "pro" })
+    if (proStatus.enabled) rows.push({ kind: "buffer" }, { kind: "rate" })
+  }
+  for (var i = 0; i < (combined || []).length; i++) rows.push({ kind: "device", index: i })
+  rows.push({ kind: "add" })
+  for (var j = 0; j < (midiRows || []).length; j++) rows.push({ kind: "midi", index: j })
+  return rows
+}
+
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     parseJson: parseJson, gradeRank: gradeRank, sortChoices: sortChoices, matches: matches,
@@ -279,6 +428,10 @@ if (typeof module !== "undefined" && module.exports) {
     findingLine: findingLine, gradeLabel: gradeLabel, sourceKind: sourceKind,
     recordSources: recordSources, clock: clock, shortLength: shortLength, recordHero: recordHero,
     timecode: timecode, projectedFrame: projectedFrame, SYNC_SOURCES: SYNC_SOURCES,
-    syncLabel: syncLabel, chaseStatus: chaseStatus, FPS_CHOICES: FPS_CHOICES
+    syncLabel: syncLabel, chaseStatus: chaseStatus, FPS_CHOICES: FPS_CHOICES,
+    PRO_BUFFERS: PRO_BUFFERS, PRO_RATES: PRO_RATES, parseProStatus: parseProStatus, proTitle: proTitle,
+    rateLabel: rateLabel, rateTooltip: rateTooltip, bufferTooltip: bufferTooltip, pillIndex: pillIndex,
+    parseCombined: parseCombined, combinedCaption: combinedCaption, parseMidiPorts: parseMidiPorts,
+    midiSources: midiSources, portLabel: portLabel, portCaption: portCaption, setupRows: setupRows
   }
 }

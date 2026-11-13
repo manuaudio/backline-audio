@@ -1,0 +1,392 @@
+#!/bin/bash
+
+# omarchy:summary=Combine audio devices into one, like an aggregate or multi-output device on a Mac
+# omarchy:args=[list [--json]|create [--mirror] [<name> <device>...]|remove [<name>]]
+# omarchy:examples=omarchy backline aggregate create Studio <input-1> <input-2> | omarchy backline aggregate create --mirror Everywhere <output-1> <output-2> | omarchy backline aggregate remove Studio
+
+# An aggregate device stacks the channels of several interfaces into one, in
+# member order (interface A on 1-2, interface B on 3-4), so a recording app sees
+# all of them as a single device. With --mirror it is a multi-output device
+# instead: the same stereo signal on several outputs, such as speakers and
+# headphones at once. Members must all be outputs or all be inputs.
+#
+# Each device is PipeWire's combine-stream, hosted by its own PipeWire client in
+# a user unit, as Omarchy's speaker tuning is, so making or removing one never
+# restarts audio and a broken one stops only itself. PipeWire clocks every
+# member from one driver and resamples the others to it, which is what macOS
+# calls drift correction, and combine-stream compensates the members' latency.
+# A member that is unplugged comes back into the device when it is plugged in.
+#
+# It never changes the default output or input.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+bl_help "$@"
+
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+unit="$config_home/systemd/user/backline-aggregate@.service"
+node_prefix=backline_aggregate_
+
+usage() {
+  echo "Usage: omarchy-backline-aggregate [list [--json]|create [--mirror] [<name> <device>...]|remove [<name>]]" >&2
+  exit 2
+}
+
+# "Studio Rig" -> "studio-rig", for file names and the unit instance.
+slug() {
+  local value="${1,,}"
+  value="${value//[^a-z0-9]/-}"
+  while [[ $value == *--* ]]; do value="${value//--/-}"; done
+  value="${value#-}"
+  printf '%s' "${value%-}"
+}
+
+host_config() {
+  printf '%s/pipewire/backline-aggregate-%s.conf' "$config_home" "$1"
+}
+
+# The minimum a PipeWire client hosting nodes needs, as in Omarchy's
+# filter-chain-host.conf for the speaker tuning: its own client, so nothing a
+# user keeps in PipeWire's stock config directories is loaded with it.
+host_config_text() {
+  cat <<'EOF'
+# Host config for one Backline combined device, written by
+# omarchy-backline-aggregate and run as: pipewire -c <this file>.
+# The device itself is in the .conf.d/ fragment next to it.
+
+context.properties = {
+    log.level = 0
+}
+
+context.spa-libs = {
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}
+
+context.modules = [
+    # Ask RTKit directly, as pipewire.conf does.
+    { name = libpipewire-module-rt
+        args = { rtportal.enabled = false }
+        flags = [ ifexists nofail ]
+    }
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
+]
+EOF
+}
+
+unit_text() {
+  cat <<'EOF'
+[Unit]
+Description=Backline combined audio device %i
+# WirePlumber links the members, so start once it is up.
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+Wants=wireplumber.service
+# The device loses its connection when PipeWire goes away, so restart with it.
+PartOf=pipewire.service
+
+[Service]
+Type=simple
+# Hosted as its own PipeWire client, so making or removing a device needs no
+# audio restart and a broken one stops only itself.
+ExecStart=/usr/bin/pipewire -c backline-aggregate-%i.conf
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+}
+
+# Every audio device: direction, channels, description, node name. Devices this
+# command made are left out, since one cannot be a member of another.
+devices_tsv() {
+  pw-dump 2>/dev/null | jq -r --arg prefix "$node_prefix" '
+    .[] | select(.type == "PipeWire:Interface:Node") | .info.props
+    | select((.["media.class"] // "") | test("^Audio/(Sink|Source)(/Virtual)?$"))
+    | select((.["node.name"] // "") | startswith($prefix) | not)
+    | [
+        (if (.["media.class"] | startswith("Audio/Sink")) then "out" else "in" end),
+        ((.["audio.channels"] // 2) | tostring),
+        (.["node.description"] // .["node.nick"] // .["node.name"]),
+        .["node.name"]
+      ] | @tsv'
+}
+
+# Devices made here: name, whether its unit is running, mirror or aggregate.
+made_devices() {
+  local file name slug_name kind
+  for file in "$config_home"/pipewire/backline-aggregate-*.conf; do
+    [[ -e $file ]] || continue
+    slug_name=${file##*/backline-aggregate-}
+    slug_name=${slug_name%.conf}
+    name=$(sed -n 's/^# Device: //p' "$file.d/50-combine.conf" 2>/dev/null)
+    kind=aggregate
+    grep -q '^# Mirror' "$file.d/50-combine.conf" 2>/dev/null && kind=mirror
+    printf '%s\t%s\t%s\n' "${name:-$slug_name}" \
+      "$(systemctl --user is-active "backline-aggregate@$slug_name.service" 2>/dev/null)" "$kind"
+  done
+}
+
+print_list() {
+  local rows made
+  rows=$(devices_tsv)
+  if [[ -z $rows ]]; then
+    echo "PipeWire lists no audio devices." >&2
+    exit 1
+  fi
+  {
+    printf 'DIRECTION\tCHANNELS\tDEVICE\tNAME\n'
+    sort -t$'\t' -k1,1r -k3,3 <<<"$rows"
+  } | column -t -s$'\t'
+
+  made=$(made_devices)
+  if [[ -n $made ]]; then
+    echo
+    echo "Combined here:"
+    while IFS=$'\t' read -r name state _; do
+      printf '  %s (%s)\n' "$name" "${state:-inactive}"
+    done <<<"$made"
+  fi
+}
+
+# The devices made here, for the Audio Setup panel. Reads only files and
+# systemd, so it answers with PipeWire down too.
+print_json() {
+  made_devices | jq -R -s -c '
+    split("\n") | map(select(length > 0) | split("\t")
+      | {name: .[0], active: (.[1] == "active"), mirror: (.[2] == "mirror")})'
+}
+
+# One device by node name: direction, channels, positions.
+member() {
+  pw-dump 2>/dev/null | jq -r --arg want "$1" '
+    .[] | select(.type == "PipeWire:Interface:Node") | .info.props
+    | select(.["node.name"] == $want)
+    | select((.["media.class"] // "") | test("^Audio/(Sink|Source)(/Virtual)?$"))
+    | [.["media.class"], ((.["audio.channels"] // 2) | tostring),
+       ((.["audio.position"] // "") | gsub("[\\[\\],]"; " ") | gsub("^ +| +$"; "") | gsub(" +"; " "))]
+    | @tsv' | head -n1
+}
+
+create_device() {
+  local mirror="$1" name="$2"
+  shift 2
+  local slug_name node_name config fragment class="" rules="" stacked=() next=0
+  local wanted member_class channels positions position_list combine_list i
+
+  slug_name=$(slug "$name")
+  node_name="$node_prefix${slug_name//-/_}"
+  config=$(host_config "$slug_name")
+  fragment="$config.d/50-combine.conf"
+
+  # The name goes into PipeWire's config as written, so it stays plain.
+  if [[ -z $slug_name || ! $name =~ ^[[:alnum:]\ ._-]+$ ]]; then
+    echo "Name the device with letters, digits, spaces, dots, dashes or underscores." >&2
+    return 2
+  fi
+  if (($# < 2)); then
+    echo "Combining takes at least two devices." >&2
+    return 2
+  fi
+  if [[ -e $config ]]; then
+    echo "There is already a device called $name." >&2
+    return 1
+  fi
+
+  for wanted in "$@"; do
+    IFS=$'\t' read -r member_class channels positions < <(member "$wanted")
+    if [[ -z ${member_class:-} ]]; then
+      echo "No audio device is called $wanted. See: omarchy backline aggregate list" >&2
+      return 1
+    fi
+    if [[ -z $class ]]; then
+      class=${member_class%/Virtual}
+    elif [[ $class != "${member_class%/Virtual}" ]]; then
+      echo "Combine outputs with outputs and inputs with inputs; $wanted is not like the others." >&2
+      return 1
+    fi
+
+    if [[ -z $positions ]]; then
+      for ((i = 0; i < channels; i++)); do positions+=" AUX$i"; done
+    fi
+    read -ra position_list <<<"$positions"
+
+    if [[ $mirror == "true" && ${#position_list[@]} == 1 ]]; then
+      # A mono member takes the stereo pair and mixes it down itself.
+      rules+="
+        { matches = [ { node.name = \"$wanted\" } ]
+          actions = { create-stream = { stream.dont-remix = false } }
+        }"
+      continue
+    elif [[ $mirror == "true" ]]; then
+      # The same stereo pair on every member's first two channels.
+      combine_list=(FL FR)
+      position_list=("${position_list[0]}" "${position_list[1]}")
+    else
+      # This member's channels follow the previous member's.
+      combine_list=()
+      for ((i = 0; i < ${#position_list[@]}; i++)); do
+        combine_list+=("AUX$next")
+        stacked+=("AUX$next")
+        next=$((next + 1))
+      done
+    fi
+
+    rules+="
+        { matches = [ { node.name = \"$wanted\" } ]
+          actions = { create-stream = {
+            combine.audio.position = [ ${combine_list[*]} ]
+            audio.position = [ ${position_list[*]} ]
+          } }
+        }"
+  done
+
+  if [[ $mirror == "true" && $class != "Audio/Sink" ]]; then
+    echo "Only outputs can be mirrored." >&2
+    return 1
+  fi
+
+  local mode=source positions_out="${stacked[*]}" dont_remix=true kind_line="# Aggregate"
+  [[ $class == "Audio/Sink" ]] && mode=sink
+  if [[ $mirror == "true" ]]; then
+    positions_out="FL FR"
+    dont_remix=false
+    kind_line="# Mirror"
+  fi
+
+  mkdir -p "${fragment%/*}" "${unit%/*}"
+  host_config_text >"$config"
+  unit_text >"$unit"
+  cat >"$fragment" <<EOF
+# Device: $name
+$kind_line
+# Written by omarchy-backline-aggregate. Remove with: omarchy backline aggregate remove "$name"
+
+context.modules = [
+  { name = libpipewire-module-combine-stream
+    args = {
+      combine.mode = $mode
+      node.name = "$node_name"
+      node.description = "$name"
+      combine.latency-compensate = true
+      combine.props = {
+        audio.position = [ $positions_out ]
+      }
+      stream.props = {
+        stream.dont-remix = $dont_remix
+      }
+      stream.rules = [$rules
+      ]
+    }
+  }
+]
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now "backline-aggregate@$slug_name.service" >/dev/null 2>&1
+
+  # The device is only made once PipeWire lists it; anything less is undone.
+  for _ in {1..20}; do
+    [[ -n $(member "$node_name") ]] && break
+    sleep 0.25
+  done
+  if [[ -z $(member "$node_name") ]]; then
+    remove_device "$name" >/dev/null
+    echo "The device did not appear in PipeWire, so it was removed again." >&2
+    return 1
+  fi
+
+  echo "Made $name ($node_name)."
+  bl_push backline.setup
+}
+
+remove_device() {
+  local slug_name config
+  slug_name=$(slug "$1")
+  config=$(host_config "$slug_name")
+
+  if [[ -z $slug_name || ! -e $config ]]; then
+    echo "No device called $1 was combined here." >&2
+    return 1
+  fi
+
+  systemctl --user disable --now "backline-aggregate@$slug_name.service" >/dev/null 2>&1
+  rm -rf "$config" "$config.d"
+  if ! compgen -G "$config_home/pipewire/backline-aggregate-*.conf" >/dev/null; then
+    rm -f "$unit"
+  fi
+  systemctl --user daemon-reload
+  echo "Removed $1."
+  bl_push backline.setup
+}
+
+# The menu's flow: pick the members, then name the device.
+create_picked() {
+  local mirror="$1" prompt rows options=() picks name members=()
+
+  if [[ $mirror == "true" ]]; then
+    prompt=$(bl_t aggregate.mirrorPick)
+    rows=$(devices_tsv | awk -F'\t' '$1 == "out"')
+  else
+    prompt=$(bl_t aggregate.pick)
+    rows=$(devices_tsv)
+  fi
+  while IFS=$'\t' read -r _ channels description node; do
+    [[ -n $node ]] && options+=("$description"$'\t'"$channels ch · $node")
+  done < <(sort -t$'\t' -k1,1r -k3,3 <<<"$rows")
+  if ((${#options[@]} < 2)); then
+    bl_notify -g 󰴸 "$(bl_t aggregate.tooFew)"
+    exit 1
+  fi
+
+  picks=$(omarchy-menu-select "$prompt" "${options[@]}" -- --multiple --width 640 --maxheight 520) || exit 1
+  mapfile -t members < <(jq -r '.[] | split("\t")[1] | split(" · ")[1]' <<<"$picks")
+  name=$(omarchy-menu-input "$(bl_t aggregate.name)") || exit 1
+
+  if create_device "$mirror" "$name" "${members[@]}"; then
+    bl_notify -g 󰴸 "$(bl_t aggregate.made "$name")"
+  else
+    bl_notify -u critical -g 󰴸 "$(bl_t aggregate.failed "$name")"
+    exit 1
+  fi
+}
+
+case "${1:-list}" in
+  list)
+    if [[ ${2:-} == "--json" ]]; then
+      print_json
+    else
+      (($# <= 1)) || usage
+      print_list
+    fi
+    ;;
+  create)
+    shift
+    mirror=false
+    if [[ ${1:-} == "--mirror" ]]; then
+      mirror=true
+      shift
+    fi
+    if (($# == 0)); then
+      create_picked "$mirror"
+    else
+      create_device "$mirror" "$@" || exit
+    fi
+    ;;
+  remove)
+    if (($# == 2)); then
+      remove_device "$2" || exit
+    elif (($# == 1)); then
+      mapfile -t made < <(made_devices | cut -f1)
+      ((${#made[@]} > 0)) || exit 1
+      picked=$(omarchy-menu-select "$(bl_t aggregate.remove)" "${made[@]}") || exit 1
+      remove_device "$picked" || exit
+    else
+      usage
+    fi
+    ;;
+  *) usage ;;
+esac

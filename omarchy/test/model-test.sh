@@ -89,3 +89,46 @@ assert.strictEqual(Model.recordHero({ state: "armed", armed: ["a"] }, 0), "ARMED
 assert.strictEqual(Model.recordHero({ state: "recording", armed: [] }, 3725), "RECORDING 01:02:05")
 assert.strictEqual(Model.recordHero({ state: "recording" }, 5, (k, e) => k === "record.heroRecording" ? "OPNAME %1" : e), "OPNAME 00:00:05")
 JS
+
+run_node_test <<'JS' && pass "pro audio: the status from the command, or none; the header, labels and where the cursor parks"
+// The status comes from a command, so anything else it prints (nothing while
+// PipeWire is down, an error) must hide the section rather than draw a zero buffer.
+const pro = Model.parseProStatus('{"enabled":true,"buffer":256,"rate":48000,"realtime":false}')
+assert.deepStrictEqual(pro, { enabled: true, buffer: 256, rate: 48000, realtime: false })
+for (const text of ['', 'PipeWire is not running', '[]', '{"enabled":true,"buffer":0,"rate":48000}'])
+  assert.strictEqual(Model.parseProStatus(text), null, text)
+assert.strictEqual(Model.proTitle({ enabled: false, buffer: 1024, rate: 48000 }), 'PRO AUDIO')
+assert.strictEqual(Model.proTitle(pro), 'PRO AUDIO · 5.3 ms')
+assert.strictEqual(Model.rateLabel(44100), '44.1')
+assert.strictEqual(Model.rateLabel(48000), '48')
+assert.strictEqual(Model.bufferTooltip(128, 48000), '128 frames, 2.7 ms')
+assert.strictEqual(Model.pillIndex(Model.PRO_BUFFERS, 256), 2)
+assert.strictEqual(Model.pillIndex(Model.PRO_BUFFERS, 2048), 0)
+JS
+
+run_node_test <<'JS' && pass "audio setup: combined devices and MIDI ports from the commands; the ports that send, devices first"
+assert.deepStrictEqual(Model.parseCombined('[{"name":"Studio","active":true,"mirror":false},{"active":true}]'), [{ name: 'Studio', active: true, mirror: false }])
+assert.deepStrictEqual(Model.parseCombined('PipeWire lists no audio devices.'), [])
+assert.strictEqual(Model.combinedCaption({ name: 'Everywhere', active: false, mirror: true }), 'Multi-output · stopped')
+const ports = Model.parseMidiPorts(JSON.stringify([
+  { address: '14:0', client: 'Midi Through', port: 'Midi Through Port-0', kind: 'virtual', protocol: 'MIDI 1.0', direction: 'both', sendsTo: [] },
+  { address: '130:0', client: 'Bitwig Studio', port: 'output', kind: 'app', protocol: 'MIDI 1.0', direction: 'source', sendsTo: [] },
+  { address: '128:0', client: 'Surge XT', port: 'input', kind: 'app', protocol: 'MIDI 1.0', direction: 'destination', sendsTo: [] },
+  { address: '24:0', client: 'Keystation', port: 'Keystation MIDI 1', kind: 'hardware', protocol: 'MIDI 2.0', direction: 'both', sendsTo: ['128:0'] },
+  { port: 'no address' }
+]))
+assert.deepStrictEqual(Model.midiSources(ports).map(p => p.address), ['24:0', '130:0'])
+assert.strictEqual(Model.portLabel(ports[3]), 'Keystation MIDI 1')
+assert.strictEqual(Model.portLabel(ports[1]), 'Bitwig Studio output')
+assert.strictEqual(Model.portCaption(ports[3], ports), 'MIDI 2.0 · to Surge XT')
+assert.strictEqual(Model.portCaption(ports[1], ports), 'MIDI 1.0 · not connected')
+assert.deepStrictEqual(Model.parseMidiPorts('The ALSA sequencer is not loaded'), [])
+JS
+
+run_node_test <<'JS' && pass "audio setup: one cursor over the switch, the pills while on, devices, add, then MIDI"
+const kinds = rows => rows.map(r => r.kind + (r.index === undefined ? '' : r.index)).join(' ')
+assert.strictEqual(kinds(Model.setupRows({ enabled: true }, [{}, {}], [{}])), 'pro buffer rate device0 device1 add midi0')
+assert.strictEqual(kinds(Model.setupRows({ enabled: false }, [], [])), 'pro add')
+// PipeWire not answering: no pro audio rows, the rest stays.
+assert.strictEqual(kinds(Model.setupRows(null, [{}], [])), 'device0 add')
+JS

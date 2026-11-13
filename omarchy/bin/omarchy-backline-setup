@@ -79,6 +79,15 @@ plugin_installed() {
 if [[ $uninstall == "true" ]]; then
   edit strip "$menu_file" "$bindings_file" | grep -v ': unchanged$'
   echo "menu rows and hotkeys: removed"
+  # Pro audio's unit runs a Backline command, so it goes with Backline. Combined
+  # devices run PipeWire itself and are the user's to keep or remove.
+  if "$BL_ROOT/bin/omarchy-backline-pro" enabled 2>/dev/null; then
+    "$BL_ROOT/bin/omarchy-backline-pro" off >/dev/null
+    echo "pro audio: turned off"
+  fi
+  if compgen -G "$config/pipewire/backline-aggregate-*.conf" >/dev/null; then
+    echo "combined audio devices are kept; remove them with: omarchy-backline-aggregate remove"
+  fi
   if plugin_installed; then
     echo "the bar plugin is still installed; to remove it: omarchy plugin remove $plugin_id"
   fi

@@ -1,6 +1,6 @@
 # Backline in Omarchy
 
-Backline's everyday jobs live inside Omarchy's own workflow. There is one Omarchy plugin, `io.github.manuaudio.backline`, holding four bar panels, `omarchy-backline-*` commands in Omarchy's command style, rows in the Omarchy menu, and `Super + Ctrl` hotkeys on the planes Omarchy gives them. Everything is built from Omarchy's shell components and theme tokens, so it follows the current theme and language the way Omarchy's own panels do.
+Backline's everyday jobs live inside Omarchy's own workflow. There is one Omarchy plugin, `io.github.manuaudio.backline`, holding five bar panels, `omarchy-backline-*` commands in Omarchy's command style, rows in the Omarchy menu, and `Super + Ctrl` hotkeys on the planes Omarchy gives them. Everything is built from Omarchy's shell components and theme tokens, so it follows the current theme and language the way Omarchy's own panels do.
 
 | Instruments | Record | Plugins | Transport |
 |---|---|---|---|
@@ -25,17 +25,29 @@ The jobs, and the fewest keystrokes for each (measured), are in [`ui/UX-FLOWS.md
 | Path | What |
 |---|---|
 | `../manifest.json` | the plugin's manifest, at the repository root, so `omarchy plugin add` takes the repository as the plugin |
-| `plugin/Backline.qml` | the bar widget: the four panels side by side, `Tab` between them |
-| `plugin/{Instruments,Record,Plugins,Transport}.qml` | the panels |
+| `plugin/Backline.qml` | the bar widget: the five panels side by side, `Tab` between them |
+| `plugin/{Instruments,Record,Plugins,Transport,Setup}.qml` | the panels; Setup is Audio Setup (below) |
 | `plugin/Model.js`, `plugin/i18n/` | the panels' pure logic (picker order, filters, grades, sources, timecode, status tones) and their catalogs |
-| `bin/omarchy-backline-*` | commands: `instrument-add`, `instrument-remove`, `instrument-midi`, `record`, `soundcheck`, `transport`, `plugins-scan`, `mixer`, `setup`, and the panels' `state` and `watch` |
+| `bin/omarchy-backline-*` | commands: `instrument-add`, `instrument-remove`, `instrument-midi`, `record`, `soundcheck`, `transport`, `plugins-scan`, `mixer`, `pro`, `aggregate`, `midi`, `setup`, and the panels' `state` and `watch` |
 | `lib/omarchy-backline.sh` | their shared D-Bus, MIDI and catalog helpers |
 | `i18n/en.json` | the commands' notification and prompt strings |
-| `extensions/omarchy-menu.jsonc` | the menu rows (Trigger › Backline) |
+| `extensions/omarchy-menu.jsonc` | the menu rows (Trigger › Backline, Trigger › Toggle › Pro Audio, Setup › Audio) |
 | `hypr/backline.lua` | the hotkeys |
 | `install` | installs it all from a checkout for the current user; `--uninstall` takes it out again |
 | `dev/` | the bench, the headless compositor and the flows (below) |
 | `test/` | tests in Omarchy's shape |
+
+## Audio Setup: pro audio, combined devices, MIDI
+
+The fifth panel is what macOS keeps in Audio MIDI Setup and Omarchy's own audio panel leaves out. Volume, outputs and the app mixer stay in Omarchy's audio panel (`Super + Ctrl + A`). This work started as Omarchy pull requests (`manuaudio/omarchy-audio`) and moved here, so Omarchy itself only gets small invisible defaults and fixes.
+
+| Command | What it does |
+|---|---|
+| `omarchy-backline-pro on [--buffer N] [--rate R]`, `off`, `toggle`, `status [--json]` | Forces a small buffer (256 frames, or 128 once PipeWire runs realtime) and locks the sample rate in PipeWire's `settings` metadata, live, with nothing restarted. A user unit sets it again each time PipeWire starts; `off` removes it and never clears a buffer something else forced. |
+| `omarchy-backline-aggregate create [--mirror] <name> <device>...`, `remove`, `list [--json]` | An aggregate device (members' channels stacked in order) or, with `--mirror`, a multi-output device (the same stereo on every output). Each is PipeWire's `combine-stream` in its own PipeWire client and user unit, so making or removing one restarts nothing. With no arguments it asks through Omarchy's menu picker. |
+| `omarchy-backline-midi list [--all] [--json]`, `connect [<source> [<destination>]]`, `disconnect` | The ALSA sequencer's ports with kind, protocol (MIDI 1.0, MIDI 2.0) and connections; `connect <source>` opens the menu picker with its destinations ticked. |
+
+The panel: the PRO AUDIO switch on its header line, with buffer and sample-rate pills while it is on; the combined devices, with Aggregate Device and Multi-Output Device; the MIDI ports that send, each with where it sends. `p` turns pro audio on or off, `x` removes a combined device, Enter on a MIDI port opens the picker, and right-clicking the bar icon turns pro audio on or off. `Super + Ctrl + Alt + A` is the quick action (pro audio on or off), and _Trigger › Toggle_ gets Pro Audio On and Off like Omarchy's own toggles.
 
 ## How it follows Omarchy
 
@@ -102,7 +114,7 @@ omarchy/install                                       # asks before the menu and
 omarchy/install --uninstall
 ```
 
-The panels sit in one slot in the bar's right section, in the order Transport, Instruments, Plugins, Record. `Tab` moves to the next of them, and past the last to the bar's next panel (around the four when the bar has no other). Move the slot with `omarchy bar move`.
+The panels sit in one slot in the bar's right section, in the order Transport, Instruments, Plugins, Record, Audio Setup. `Tab` moves to the next of them, and past the last to the bar's next panel (around the five when the bar has no other). Move the slot with `omarchy bar move`.
 
 ## Tests
 
@@ -112,6 +124,7 @@ Tests run in Omarchy's style: `pass`/`fail` TAP lines, a stubbed world, and the 
 |---|---|
 | `test/model-test.sh` | the panels' model in Node: picker order, filters, MIDI pills, plugin findings, sources, drop-frame timecode, chase status |
 | `test/commands-test.sh` | the commands against stubbed `busctl`, `pw-dump` and `backline`, in a fake HOME: MIDI matches checked as the worker's regex, picker order and ids, the fail-grade refusal, arming and re-arming, notifications in pt-BR → pt → English |
+| `test/audio-setup-test.sh` | pro audio, combined devices and MIDI against stubbed `pw-metadata`, `pw-dump`, `systemctl` and a sequencer fixture: the 256/128 defaults, choices restored after a PipeWire restart, `off` leaving a foreign buffer, channel stacking and mirroring, refused names, a device that never appears undone, the menu flows |
 | `test/i18n-test.sh` | the catalogs are current, every key is used and exists, and every `Text` has a `textFormat` |
 | `test/install-test.sh` | the installer and `omarchy-backline-setup` in a fake HOME: nothing changes without a yes, the plugin passes Omarchy's validator (installed and as the repository), an old four-plugin install is replaced, the menu is merged and parsed by Omarchy's own `MenuModel.js`, the user's rows and bindings are kept, a rerun is idempotent, and uninstall restores each file byte for byte |
 

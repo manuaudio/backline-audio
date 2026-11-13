@@ -1,0 +1,303 @@
+#!/bin/bash
+
+# omarchy:summary=Run audio at a small buffer and a locked sample rate, for recording
+# omarchy:args=[on [--buffer <frames>] [--rate <hz>]|off|toggle|enabled|status [--json]]
+# omarchy:examples=omarchy backline pro on | omarchy backline pro on --buffer 64 --rate 96000 | omarchy backline pro off
+
+# Left alone, PipeWire sizes its buffer for whatever is playing, and a player
+# that asks for nothing runs the graph at up to 2048 frames, 43 ms per cycle at
+# 48 kHz: far too late to play an instrument through. Pro audio forces the
+# buffer and locks the sample rate in PipeWire's settings metadata, the buffer
+# size and format controls of macOS's Audio MIDI Setup. The change is live:
+# nothing restarts and playback carries on.
+#
+# PipeWire forgets forced settings when it restarts, so the choice is kept in
+# Backline's state and a small user unit sets it again each time PipeWire
+# starts. Only what was asked for is saved. A buffer left to the default
+# follows realtime: 256 frames while PipeWire's audio thread runs at normal
+# priority, where smaller ones drop out, and 128 once it runs realtime.
+#
+# It never changes the power profile (Omarchy keeps one per AC and battery)
+# and never clears a buffer or rate that something else forced.
+
+set -uo pipefail
+source "$(dirname -- "$(readlink -f -- "$0")")/../lib/omarchy-backline.sh"
+bl_help "$@"
+
+state="$BL_STATE_DIR/pro-audio"
+# What this command last forced, so off never clears a buffer or rate that
+# something else (a DAW, pw-metadata by hand) forced since.
+applied="${XDG_RUNTIME_DIR:-/run/user/$UID}/backline-pro-audio"
+unit_name=backline-pro-audio.service
+unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$unit_name"
+self=$(readlink -f -- "$0")
+
+usage() {
+  echo "Usage: omarchy-backline-pro [on [--buffer <frames>] [--rate <hz>]|off|toggle|enabled|status [--json]]" >&2
+  exit 2
+}
+
+# The menu's guard: one file test, before PipeWire is asked anything.
+if [[ ${1:-} == "enabled" ]]; then
+  [[ -f $state ]]
+  exit
+fi
+
+declare -A settings=()
+
+# PipeWire's runtime clock controls, from the "settings" metadata.
+read_settings() {
+  local line key value
+  settings=()
+  while IFS= read -r line; do
+    [[ $line =~ key:\'([^\']+)\'\ value:\'([^\']*)\' ]] || continue
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    settings[$key]=$value
+  done < <(pw-metadata -n settings 0 2>/dev/null)
+  [[ -n ${settings[clock.rate]:-} ]]
+}
+
+force() {
+  pw-metadata -n settings 0 "$1" "$2" >/dev/null 2>&1
+}
+
+# PipeWire only keeps a small buffer glitch-free while its audio thread runs
+# realtime, which rtkit grants at startup. Read the way Omarchy's
+# omarchy-realtime-repair reads it.
+realtime() {
+  local pid
+  pid=$(systemctl --user show -p MainPID --value pipewire.service 2>/dev/null)
+  [[ $pid =~ ^[1-9][0-9]*$ && $(ps -L -o cls= -p "$pid" 2>/dev/null) =~ RR|FF ]]
+}
+
+valid_buffer() {
+  [[ $1 =~ ^[0-9]+$ ]] && (($1 >= 16 && $1 <= 8192 && ($1 & ($1 - 1)) == 0))
+}
+
+valid_rate() {
+  [[ $1 =~ ^(44100|48000|88200|96000|176400|192000)$ ]]
+}
+
+saved() {
+  [[ -r $state ]] && sed -n "s/^$1=//p" "$state"
+}
+
+# The quantum (buffer) or rate in force: the forced one, else PipeWire's default.
+live() {
+  local forced=${settings[clock.force-$1]:-0}
+  if ((forced > 0)); then
+    echo "$forced"
+  else
+    echo "${settings[clock.$1]}"
+  fi
+}
+
+latency_ms() {
+  awk -v b="$1" -v r="$2" 'BEGIN { printf "%.1f", b / r * 1000 }'
+}
+
+print_status() {
+  local buffer rate
+  buffer=$(live quantum)
+  rate=$(live rate)
+
+  if [[ -f $state ]]; then
+    echo "Pro audio:   on"
+  else
+    echo "Pro audio:   off"
+  fi
+  if ((${settings[clock.force-quantum]:-0} > 0)); then
+    echo "Buffer:      $buffer frames, $(latency_ms "$buffer" "$rate") ms per cycle"
+  else
+    echo "Buffer:      set by what plays (default $buffer frames)"
+  fi
+  if ((${settings[clock.force-rate]:-0} > 0)); then
+    echo "Sample rate: $rate Hz, locked"
+  else
+    echo "Sample rate: follows what plays (default $rate Hz)"
+  fi
+  if realtime; then
+    echo "Realtime:    yes"
+  else
+    echo "Realtime:    no, so buffers under 256 frames may drop out"
+  fi
+}
+
+print_status_json() {
+  local enabled=false is_realtime=false
+  [[ -f $state ]] && enabled=true
+  realtime && is_realtime=true
+  jq -cn --argjson enabled "$enabled" --argjson realtime "$is_realtime" \
+    --argjson buffer "$(live quantum)" --argjson rate "$(live rate)" \
+    '{enabled: $enabled, buffer: $buffer, rate: $rate, realtime: $realtime}'
+}
+
+# The unit runs this very command, wherever it is installed (the package or a
+# checkout), and only while the choice exists.
+unit_text() {
+  cat <<EOF
+[Unit]
+Description=Backline pro audio buffer size and sample rate
+# PipeWire forgets forced clock settings when it stops, so set them again each
+# time it starts. Installed and enabled by omarchy-backline-pro while pro audio is on.
+After=pipewire.service
+PartOf=pipewire.service
+ConditionPathExists=$state
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$self on
+
+[Install]
+WantedBy=pipewire.service
+EOF
+}
+
+enable_unit() {
+  local text
+  text=$(unit_text)
+  if [[ -r $unit && $(<"$unit") == "$text" ]] && systemctl --user is-enabled --quiet "$unit_name" 2>/dev/null; then
+    return 0
+  fi
+  mkdir -p "${unit%/*}"
+  printf '%s\n' "$text" >"$unit"
+  systemctl --user daemon-reload
+  systemctl --user enable "$unit_name" >/dev/null 2>&1
+}
+
+disable_unit() {
+  [[ -e $unit ]] || return 0
+  systemctl --user disable "$unit_name" >/dev/null 2>&1
+  rm -f "$unit"
+  systemctl --user daemon-reload
+}
+
+pro_on() {
+  local chosen_buffer="$1" chosen_rate="$2" buffer rate was_on=false
+
+  [[ -f $state ]] && was_on=true
+  [[ -n $chosen_buffer ]] || chosen_buffer=$(saved buffer)
+  [[ -n $chosen_rate ]] || chosen_rate=$(saved rate)
+  buffer=$chosen_buffer
+  rate=$chosen_rate
+
+  # Realtime is read after PipeWire answered read_settings, by which time it
+  # has asked rtkit for its priority, so the unit's run at startup sees it too.
+  if [[ -z $buffer ]]; then
+    if realtime; then
+      buffer=128
+    else
+      buffer=256
+    fi
+  fi
+  [[ -n $rate ]] || rate=${settings[clock.rate]}
+
+  if ! force clock.force-rate "$rate" || ! force clock.force-quantum "$buffer"; then
+    echo "Could not change PipeWire's clock settings." >&2
+    exit 1
+  fi
+  echo "$buffer $rate" >"$applied"
+
+  # Save what was chosen, not what was applied, so an unchosen buffer keeps
+  # following realtime.
+  mkdir -p "$BL_STATE_DIR"
+  {
+    [[ -n $chosen_buffer ]] && echo "buffer=$chosen_buffer"
+    [[ -n $chosen_rate ]] && echo "rate=$chosen_rate"
+  } >"$state"
+  enable_unit
+
+  echo "Pro audio on: $buffer frames at $rate Hz, $(latency_ms "$buffer" "$rate") ms per cycle."
+  if ! realtime; then
+    echo "PipeWire is not running realtime, so buffers under 256 frames may drop out." >&2
+  fi
+  if [[ $was_on == "false" ]]; then
+    bl_notify -g 󰝚 "$(bl_t pro.on)" \
+      "$(bl_t pro.summary "$buffer" "$(awk -v r="$rate" 'BEGIN { print r / 1000 }')" "$(latency_ms "$buffer" "$rate")")"
+  fi
+  bl_push backline.setup
+}
+
+pro_off() {
+  local buffer="" rate=""
+
+  if [[ ! -f $state ]]; then
+    echo "Pro audio is not on."
+    return 0
+  fi
+
+  # With PipeWire down there is nothing forced to clear, but the choice and
+  # the unit still go.
+  [[ -r $applied ]] && read -r buffer rate <"$applied"
+  [[ -n $buffer && ${settings[clock.force-quantum]:-0} == "$buffer" ]] && force clock.force-quantum 0
+  [[ -n $rate && ${settings[clock.force-rate]:-0} == "$rate" ]] && force clock.force-rate 0
+  rm -f "$state" "$applied"
+  disable_unit
+
+  echo "Pro audio off: the buffer and sample rate are back on PipeWire's defaults."
+  bl_notify -g 󰝚 "$(bl_t pro.off)"
+  bl_push backline.setup
+}
+
+action="${1:-status}"
+(($# > 0)) && shift
+
+buffer=""
+rate=""
+json=false
+while (($# > 0)); do
+  case "$1" in
+    --buffer)
+      [[ $action == "on" && -n ${2:-} ]] || usage
+      buffer="$2"
+      shift 2
+      ;;
+    --rate)
+      [[ $action == "on" && -n ${2:-} ]] || usage
+      rate="$2"
+      shift 2
+      ;;
+    --json)
+      [[ $action == "status" ]] || usage
+      json=true
+      shift
+      ;;
+    *) usage ;;
+  esac
+done
+
+if [[ -n $buffer ]] && ! valid_buffer "$buffer"; then
+  echo "The buffer must be a power of two from 16 to 8192 frames, not $buffer." >&2
+  exit 2
+fi
+if [[ -n $rate ]] && ! valid_rate "$rate"; then
+  echo "The sample rate must be 44100, 48000, 88200, 96000, 176400 or 192000 Hz, not $rate." >&2
+  exit 2
+fi
+
+if ! read_settings && [[ $action != "off" ]]; then
+  echo "PipeWire is not running, so there is no audio graph to change." >&2
+  exit 1
+fi
+
+case "$action" in
+  on) pro_on "$buffer" "$rate" ;;
+  off) pro_off ;;
+  toggle)
+    if [[ -f $state ]]; then
+      pro_off
+    else
+      pro_on "" ""
+    fi
+    ;;
+  status)
+    if [[ $json == "true" ]]; then
+      print_status_json
+    else
+      print_status
+    fi
+    ;;
+  *) usage ;;
+esac

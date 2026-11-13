@@ -1,7 +1,9 @@
 // Backline's rows for the Omarchy menu (Super+Space), merged into
 // ~/.config/omarchy/extensions/omarchy-menu.jsonc by omarchy-backline-setup between
 // the backline:begin and backline:end lines. Guards are single cheap reads:
-// a process check, or one D-Bus property that never starts a service.
+// a process check, a file test, or one D-Bus property that never starts a
+// service. Pro audio is an on/off pair under Trigger > Toggle, like Omarchy's
+// own toggles; combined devices and MIDI are under Setup > Audio.
 // backline:begin
   "trigger.backline": {"icon":"󰌌","label":"Backline","description":"instruments recording plugins transport mixer"},
   "trigger.backline.instruments": {"icon":"󰌌","label":"Instruments","action":"omarchy-shell -q backline.instruments toggle"},
@@ -17,4 +19,12 @@
   "trigger.backline.transport": {"icon":"󰔛","label":"Transport","action":"omarchy-shell -q backline.transport toggle"},
   "trigger.backline.play": {"icon":"󰐎","label":"Play or Stop","action":"omarchy-backline-transport toggle"},
   "trigger.backline.mixer": {"icon":"󰕾","label":"Backline Mixer","action":"omarchy-backline-mixer"},
+  "trigger.toggle.backline-pro-audio-on": {"icon":"󰝚","label":"Pro Audio On","when":"! omarchy-backline-pro enabled","action":"omarchy-backline-pro toggle"},
+  "trigger.toggle.backline-pro-audio-off": {"icon":"󰝚","label":"Pro Audio Off","when":"omarchy-backline-pro enabled","action":"omarchy-backline-pro toggle"},
+  "setup.audio": {"icon":"󰕾","label":"Audio"},
+  "setup.audio.backline-setup": {"icon":"󰝚","label":"Audio Setup","action":"omarchy-shell -q backline.setup toggle"},
+  "setup.audio.backline-aggregate": {"icon":"󰴸","label":"Aggregate Device","action":"omarchy-backline-aggregate create"},
+  "setup.audio.backline-multi-output": {"icon":"󰓃","label":"Multi-Output Device","action":"omarchy-backline-aggregate create --mirror"},
+  "setup.audio.backline-remove": {"icon":"󰭌","label":"Remove Combined Device","when":"compgen -G \"${XDG_CONFIG_HOME:-$HOME/.config}/pipewire/backline-aggregate-*.conf\" >/dev/null","action":"omarchy-backline-aggregate remove"},
+  "setup.audio.backline-midi": {"icon":"󰣱","label":"MIDI Connections","action":"omarchy-backline-midi connect"},
 // backline:end

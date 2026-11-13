@@ -30,5 +30,20 @@
   "plugins.scanning": "Scanning plugins",
   "plugins.scanned": "%1 plugins indexed",
   "plugins.scannedBody": "%1 with warnings, %2 failing",
-  "plugins.scanFailed": "The plugin scan failed"
+  "plugins.scanFailed": "The plugin scan failed",
+  "pro.on": "Pro audio on",
+  "pro.off": "Pro audio off",
+  "pro.summary": "%1 frames at %2 kHz, %3 ms",
+  "aggregate.failed": "Could not combine the devices into %1",
+  "aggregate.made": "%1 is ready",
+  "aggregate.mirrorPick": "Outputs to play on at once",
+  "aggregate.name": "Name the new device",
+  "aggregate.pick": "Devices to combine; channels follow this order",
+  "aggregate.remove": "Remove which combined device?",
+  "aggregate.tooFew": "Combining takes two or more audio devices",
+  "midi.connectFailed": "Some MIDI connections could not be changed",
+  "midi.noDestinations": "No MIDI port can receive from it",
+  "midi.noSources": "No MIDI port is sending",
+  "midi.sendFrom": "Send MIDI from",
+  "midi.sendTo": "Send MIDI to"
 }

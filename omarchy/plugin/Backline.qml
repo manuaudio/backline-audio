@@ -2,19 +2,19 @@ import QtQuick
 import qs.Ui
 
 // Backline's one Omarchy plugin (io.github.manuaudio.backline): a bar widget
-// that holds the four Backline panels side by side, each with its own bar
-// icon, popup and IPC target (backline.transport, backline.instruments,
-// backline.plugins, backline.record), so hotkeys and the commands' refresh
-// pushes reach each panel by name.
+// that holds the Backline panels side by side, each with its own bar icon,
+// popup and IPC target (backline.transport, backline.instruments,
+// backline.plugins, backline.record, backline.setup), so hotkeys and the
+// commands' refresh pushes reach each panel by name.
 //
 // Tab inside a panel moves to its neighbour here; past the last (or before
 // the first) it goes to the bar's next panel, and when the bar has no other
-// panel it wraps around these four.
+// panel it wraps around these.
 BarWidget {
   id: root
 
-  readonly property var panels: [transport, instruments, plugins, record]
-  readonly property bool opened: transport.opened || instruments.opened || plugins.opened || record.opened
+  readonly property var panels: [transport, instruments, plugins, record, setup]
+  readonly property bool opened: transport.opened || instruments.opened || plugins.opened || record.opened || setup.opened
 
   // The shell's summon/hide/toggle for this plugin id, and the bar's own
   // Tab from a neighbouring widget, open the first panel.
@@ -50,11 +50,12 @@ BarWidget {
   Grid {
     id: row
     anchors.centerIn: parent
-    columns: root.vertical ? 1 : 4
+    columns: root.vertical ? 1 : 5
     spacing: 2
     Transport { id: transport; bar: root.bar; host: root }
     Instruments { id: instruments; bar: root.bar; host: root }
     Plugins { id: plugins; bar: root.bar; host: root }
     Record { id: record; bar: root.bar; host: root }
+    Setup { id: setup; bar: root.bar; host: root }
   }
 }

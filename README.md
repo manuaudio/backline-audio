@@ -1,9 +1,28 @@
 # Backline
 
-**Mac-style pro audio for Omarchy Linux.** System instruments from any MIDI
-keyboard, sample-aligned multitrack recording, files played on one shared
-transport, an index of every installed plugin, and OSC/MIDI control of all
-of it, as small PipeWire services with panels in the Omarchy bar.
+**Mac-style pro audio for Omarchy Linux.** Backline is an Omarchy plugin
+and a set of small PipeWire services. Omarchy already gives every user a good
+audio core: PipeWire, realtime through rtkit, the audio panel for volume,
+outputs and the app mixer. Backline adds what a Mac's Audio MIDI Setup,
+AudioUnits and a studio's backline add on top of that:
+
+- **Pro audio:** a small buffer and a locked sample rate for recording, live,
+  from a switch in the bar, the menu or `Super + Ctrl + Alt + A`.
+- **Aggregate and multi-output devices:** several interfaces as one device,
+  or the same sound on speakers and headphones at once, with no audio restart.
+- **A MIDI manager:** every MIDI port with its protocol (MIDI 1.0 or 2.0) and
+  where it sends, connected from a picker.
+- **System instruments** from any MIDI keyboard, hosted CLAP, VST3 and LV2
+  plugins that survive crashes, and an **index of every installed plugin**,
+  each one graded.
+- **Sample-aligned multitrack recording** with a virtual soundcheck, **one
+  transport** with LTC, MTC and Ableton Link, and **control surfaces** with
+  motor faders.
+- **Coming:** a mixing console built on the same services.
+
+All of it lives in Omarchy's own workflow: five bar panels built from
+Omarchy's shell components and theme tokens, `omarchy-backline-*` commands,
+rows in the Omarchy menu, and `Super + Ctrl` hotkeys.
 
 > **Preview, not yet tested by the author on real hardware.** Everything here was proven with automated, measured tests on virtual devices (see `docs/proofs/`), but has not yet been run on real audio interfaces, MIDI controllers or a live session. Expect rough edges.
 
@@ -86,7 +105,7 @@ The choices that shape the project are in [docs/DECISIONS.md](docs/DECISIONS.md)
 
 On [Omarchy](https://omarchy.org), Backline lives in the desktop's own workflow:
 
-- **One Omarchy plugin, four bar panels:** Instruments, Record, Plugins and Transport, side by side in one bar slot, installed with `omarchy plugin add`. They're built from Omarchy's own shell components and theme tokens.
+- **One Omarchy plugin, five bar panels:** Instruments, Record, Plugins, Transport and Audio Setup (pro audio, aggregate and multi-output devices, MIDI), side by side in one bar slot, installed with `omarchy plugin add`. They're built from Omarchy's own shell components and theme tokens.
 - **`omarchy-backline-*` commands.**
 - **Menu rows** in the Omarchy menu and **`Super + Ctrl` hotkeys**, added by `omarchy-backline-setup` when you agree.
 
